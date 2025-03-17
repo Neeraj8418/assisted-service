@@ -907,6 +907,7 @@ func (b *bareMetalInventory) getNewClusterCPUArchitecture(newClusterParams *mode
 
 	cpuArchitectures := b.osImages.GetCPUArchitectures(*newClusterParams.OpenshiftVersion)
 	for _, cpuArchitecture := range cpuArchitectures {
+		fmt.Println("######CPU Architecture#########:", cpuArchitecture)
 		if cpuArchitecture == newClusterParams.CPUArchitecture {
 			return cpuArchitecture, nil
 		}
