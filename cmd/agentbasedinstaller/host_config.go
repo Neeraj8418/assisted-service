@@ -127,6 +127,15 @@ func applyHostConfig(ctx context.Context, log *log.Logger, bmInventory *client.A
 
 func applyRootDeviceHints(log *log.Logger, host *models.Host, inventory *models.Inventory, rdh *bmh_v1alpha1.RootDeviceHints, updateParams *models.HostUpdateParams) bool {
 	acceptableDisks := hostutil.GetAcceptableDisksWithHints(inventory.Disks, rdh)
+        // Debug prints for all key variables
+	log.Infof("=== Debug: applyRootDeviceHints Variables ===")
+	log.Infof("Host: %+v", host)
+	log.Infof("Inventory: %+v", inventory)
+	log.Infof("Root Device Hints: %+v", rdh)
+	log.Infof("Update Params: %+v", updateParams)
+	log.Infof("Acceptable Disks: %+v", acceptableDisks)
+	log.Infof("InstallationDiskID: %s", host.InstallationDiskID)
+	log.Infof("============================================")
 	if host.InstallationDiskID != "" {
 		for _, disk := range acceptableDisks {
 			if disk.ID == host.InstallationDiskID {
