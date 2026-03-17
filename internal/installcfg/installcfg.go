@@ -111,37 +111,37 @@ type VsphereInstallConfigPlatform struct {
 }
 
 type NutanixInstallConfigPlatform struct {
-	ID                   int                   `yaml:"-"`
-	APIVIPs              []string              `yaml:"apiVIPs,omitempty"`
-	DeprecatedAPIVIP     string                `yaml:"apiVIP,omitempty"`
-	IngressVIPs          []string              `yaml:"ingressVIPs,omitempty"`
-	DeprecatedIngressVIP string                `yaml:"ingressVIP,omitempty"`
-	PrismCentral         NutanixPrismCentral   `yaml:"prismCentral"`
-	PrismElements        []NutanixPrismElement `yaml:"prismElements"`
-	SubnetUUIDs          []strfmt.UUID         `yaml:"subnetUUIDs"`
+	ID                   int                   `json:"-"`
+	APIVIPs              []string              `json:"apiVIPs,omitempty"`
+	DeprecatedAPIVIP     string                `json:"apiVIP,omitempty"`
+	IngressVIPs          []string              `json:"ingressVIPs,omitempty"`
+	DeprecatedIngressVIP string                `json:"ingressVIP,omitempty"`
+	PrismCentral         NutanixPrismCentral   `json:"prismCentral"`
+	PrismElements        []NutanixPrismElement `json:"prismElements"`
+	SubnetUUIDs          []strfmt.UUID         `json:"subnetUUIDs"`
 }
 
 type NutanixPrismCentral struct {
-	ID                             int             `yaml:"-"`
-	NutanixInstallConfigPlatformID int             `yaml:"-"`
-	Endpoint                       NutanixEndpoint `yaml:"endpoint"`
-	Username                       string          `yaml:"username"`
-	Password                       strfmt.Password `yaml:"password"`
+	ID                             int             `json:"-"`
+	NutanixInstallConfigPlatformID int             `json:"-"`
+	Endpoint                       NutanixEndpoint `json:"endpoint"`
+	Username                       string          `json:"username"`
+	Password                       strfmt.Password `json:"password"`
 }
 
 type NutanixEndpoint struct {
-	ID                    int    `yaml:"-"`
-	NutanixPrismCentralID int    `yaml:"-"`
-	Address               string `yaml:"address"`
-	Port                  int32  `yaml:"port"`
+	ID                    int    `json:"-"`
+	NutanixPrismCentralID int    `json:"-"`
+	Address               string `json:"address"`
+	Port                  int32  `json:"port"`
 }
 
 type NutanixPrismElement struct {
-	ID                             int             `yaml:"-"`
-	NutanixInstallConfigPlatformID int             `yaml:"-"`
-	Endpoint                       NutanixEndpoint `yaml:"endpoint"`
-	UUID                           strfmt.UUID     `yaml:"uuid"`
-	Name                           string          `yaml:"name"`
+	ID                             int             `json:"-"`
+	NutanixInstallConfigPlatformID int             `json:"-"`
+	Endpoint                       NutanixEndpoint `json:"endpoint"`
+	UUID                           strfmt.UUID     `json:"uuid"`
+	Name                           string          `json:"name"`
 }
 
 // CloudControllerManager describes the type of cloud controller manager to be enabled.
@@ -210,6 +210,35 @@ const (
 	CPUPartitioningAllNodes CPUPartitioningMode = "AllNodes"
 )
 
+// PolicyType is for usage polices that are applied to additionalTrustBundle.
+type PolicyType string
+
+const (
+	// PolicyProxyOnly  enables use of AdditionalTrustBundle when http/https proxy is configured.
+	PolicyProxyOnly PolicyType = "Proxyonly"
+	// PolicyAlways ignores all conditions and uses AdditionalTrustBundle.
+	PolicyAlways PolicyType = "Always"
+)
+
+type Fencing struct {
+	Credentials []FencingCredential `json:"credentials,omitempty"`
+}
+
+type FencingCredential struct {
+	Hostname                string                   `json:"hostname"`
+	Address                 string                   `json:"address"`
+	Username                string                   `json:"username"`
+	Password                string                   `json:"password"`
+	CertificateVerification *CertificateVerification `json:"certificateVerification,omitempty"`
+}
+
+type CertificateVerification string
+
+const (
+	CertificateVerificationEnabled  CertificateVerification = "Enabled"
+	CertificateVerificationDisabled CertificateVerification = "Disabled"
+)
+
 type InstallerConfigBaremetal struct {
 	APIVersion string `json:"apiVersion"`
 	BaseDomain string `json:"baseDomain"`
@@ -229,10 +258,16 @@ type InstallerConfigBaremetal struct {
 		Replicas       int    `json:"replicas"`
 	} `json:"compute"`
 	ControlPlane struct {
+		Hyperthreading string   `json:"hyperthreading,omitempty"`
+		Name           string   `json:"name"`
+		Replicas       int      `json:"replicas"`
+		Fencing        *Fencing `json:"fencing,omitempty"`
+	} `json:"controlPlane"`
+	Arbiter *struct {
 		Hyperthreading string `json:"hyperthreading,omitempty"`
 		Name           string `json:"name"`
 		Replicas       int    `json:"replicas"`
-	} `json:"controlPlane"`
+	} `json:"arbiter,omitempty"`
 	Platform              Platform            `json:"platform"`
 	BootstrapInPlace      *BootstrapInPlace   `json:"bootstrapInPlace,omitempty"`
 	FIPS                  bool                `json:"fips"`
@@ -240,11 +275,14 @@ type InstallerConfigBaremetal struct {
 	PullSecret            string              `json:"pullSecret"`
 	SSHKey                string              `json:"sshKey"`
 	AdditionalTrustBundle string              `json:"additionalTrustBundle,omitempty"`
+	// This field is only needed for installConfig overrides. It defaults to Proxyonly.
+	AdditionalTrustBundlePolicy PolicyType `json:"additionalTrustBundlePolicy,omitempty"`
 	// The ImageContentSources field is deprecated. Please use ImageDigestSources.
 	DeprecatedImageContentSources []ImageContentSource `json:"imageContentSources,omitempty"`
 	ImageDigestSources            []ImageDigestSource  `json:"imageDigestSources,omitempty"`
 	Capabilities                  *Capabilities        `json:"capabilities,omitempty"`
 	FeatureSet                    configv1.FeatureSet  `json:"featureSet,omitempty"`
+	FeatureGates                  []string             `json:"featureGates,omitempty"`
 }
 
 func (c *InstallerConfigBaremetal) Validate() error {

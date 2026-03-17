@@ -9,6 +9,7 @@ import (
 	"github.com/go-openapi/swag"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
+	"github.com/openshift/assisted-service/internal/common"
 	"github.com/openshift/assisted-service/internal/network"
 	"github.com/openshift/assisted-service/models"
 	auth "github.com/openshift/assisted-service/pkg/auth"
@@ -25,6 +26,7 @@ const (
 	// dXNlcjpwYXNzOndvcmQK <-> user:pass:word
 	validPullSecretWithCIToken = "{\"auths\":{\"cloud.openshift.com\":{\"auth\":\"dXNlcjpwYXNzd29yZAo=\",\"email\":\"r@r.com\"},\"quay.io\":{\"auth\":\"dXNlcjpwYXNzd29yZAo=\",\"email\":\"r@r.com\"},\"registry.connect.redhat.com\":{\"auth\":\"dXNlcjpwYXNzd29yZAo=\",\"email\":\"r@r.com\"},\"registry.redhat.io\":{\"auth\":\"dXNlcjpwYXNzd29yZAo=\",\"email\":\"r@r.com\"}, \"registry.ci\":{\"auth\":\"dXNlcjpwYXNzd29yZAo=\",\"email\":\"r@r.com\"}}}"
 	validSecretFormat          = "{\"auths\":{\"cloud.openshift.com\":{\"auth\":\"dXNlcjpwYXNzd29yZAo=\",\"email\":\"r@r.com\"},\"quay.io\":{\"auth\":\"dXNlcjpwYXNzOndvcmQK\",\"email\":\"r@r.com\"},\"registry.connect.redhat.com\":{\"auth\":\"dXNlcjpwYXNzd29yZAo=\",\"email\":\"r@r.com\"},\"registry.redhat.io\":{\"auth\":\"dXNlcjpwYXNzd29yZAo=\",\"email\":\"r@r.com\"}}}"
+	validSecretWithRepo        = "{\"auths\":{\"cloud.openshift.com\":{\"auth\":\"dXNlcjpwYXNzd29yZAo=\",\"email\":\"r@r.com\"},\"quay.io/testing\":{\"auth\":\"dXNlcjpwYXNzd29yZAo=\",\"email\":\"r@r.com\"},\"registry.connect.redhat.com\":{\"auth\":\"dXNlcjpwYXNzd29yZAo=\",\"email\":\"r@r.com\"},\"registry.redhat.io\":{\"auth\":\"dXNlcjpwYXNzd29yZAo=\",\"email\":\"r@r.com\"}, \"registry.ci\":{\"auth\":\"dXNlcjpwYXNzd29yZAo=\",\"email\":\"r@r.com\"}}}"
 	invalidAuthFormat          = "{\"auths\":{\"cloud.openshift.com\":{\"auth\":\"dXNlcjpwYXNzd29yZAo=\",\"email\":\"r@r.com\"},\"quay.io\":{\"auth\":\"dXNlcjpwYXNzd29yZAo=\",\"email\":\"r@r.com\"},\"registry.connect.redhat.com\":{\"auth\":\"dXNlcjpwYXNzd29yZAo=\",\"email\":\"r@r.com\"},\"registry.redhat.io\":{\"auth\":\"afsdfasf==\",\"email\":\"r@r.com\"}}}"
 	invalidSecretFormat        = "{\"auths\":{\"cloud.openshift.com\":{\"key\":\"abcdef=\",\"email\":\"r@r.com\"},\"quay.io\":{\"auth\":\"adasfsdf=\",\"email\":\"r@r.com\"},\"registry.connect.redhat.com\":{\"auth\":\"tatastata==\",\"email\":\"r@r.com\"},\"registry.redhat.io\":{\"auth\":\"afsdfasf==\",\"email\":\"r@r.com\"}}}"
 	invalidStrSecretFormat     = "{\"auths\":{\"cloud.openshift.com\":{\"auth\":null,\"email\":null},\"quay.io\":{\"auth\":\"adasfsdf=\",\"email\":\"r@r.com\"},\"registry.connect.redhat.com\":{\"auth\":\"tatastata==\",\"email\":\"r@r.com\"},\"registry.redhat.io\":{\"auth\":\"afsdfasf==\",\"email\":\"r@r.com\"}}}"
@@ -152,7 +154,23 @@ var _ = Describe("Pull secret validation", func() {
 			Expect(err).ShouldNot(HaveOccurred())
 		})
 
-		It("pull secret is not accepted when release image is specified bit its registry credentials missing", func() {
+		It("pull secret accepted when release image is specified and the full path for the registry credentials exists", func() {
+			publicRegistries := map[string]bool{}
+			validator, err := NewPullSecretValidator(publicRegistries, authHandlerDisabled, "quay.io/testing/image-name:latest")
+			Expect(err).ShouldNot(HaveOccurred())
+			err = validator.ValidatePullSecret(additionalIgnoredRegistries, validSecretWithRepo, "", "registry.ci/test:latest")
+			Expect(err).ShouldNot(HaveOccurred())
+		})
+
+		It("pull secret is not accepted when release image specified is in a different repo than the registry credentials", func() {
+			publicRegistries := map[string]bool{}
+			validator, err := NewPullSecretValidator(publicRegistries, authHandlerDisabled, "quay.io/not-testing/image-name:latest")
+			Expect(err).ShouldNot(HaveOccurred())
+			err = validator.ValidatePullSecret(additionalIgnoredRegistries, validSecretWithRepo, "", "registry.ci/test:latest")
+			Expect(err).Should(HaveOccurred())
+		})
+
+		It("pull secret is not accepted when release image is specified but its registry credentials missing", func() {
 			publicRegistries := map[string]bool{}
 			validator, err := NewPullSecretValidator(publicRegistries, authHandlerDisabled, "quay.io/testing:latest")
 			Expect(err).ShouldNot(HaveOccurred())
@@ -195,6 +213,7 @@ var _ = Describe("Pull secret validation", func() {
 			Expect(err).Should(HaveOccurred())
 			Expect(err).Should(BeAssignableToTypeOf(&PullSecretError{}))
 		})
+
 	})
 })
 
@@ -406,8 +425,8 @@ var _ = Describe("Get registries", func() {
 		registries, err := getRegistriesWithAuth(ignorableImages, images...)
 		Expect(err).ShouldNot(HaveOccurred())
 		Expect(*registries).Should(HaveLen(2))
-		Expect(*registries).Should(HaveKey("registry.redhat.io"))
-		Expect(*registries).Should(HaveKey("quay.io"))
+		Expect(*registries).Should(HaveKey("registry.redhat.io/fedora"))
+		Expect(*registries).Should(HaveKey("quay.io/example/assisted-service"))
 	})
 
 	It("multiple images with same registry result in one auth entry", func() {
@@ -415,7 +434,7 @@ var _ = Describe("Get registries", func() {
 		registries, err := getRegistriesWithAuth(ignorableImages, images...)
 		Expect(err).ShouldNot(HaveOccurred())
 		Expect(*registries).Should(HaveLen(1))
-		Expect(*registries).Should(HaveKey("quay.io"))
+		Expect(*registries).Should(HaveKey("quay.io/example/assisted-service"))
 	})
 
 	It("port preserved in image registry", func() {
@@ -423,7 +442,7 @@ var _ = Describe("Get registries", func() {
 		registries, err := getRegistriesWithAuth(ignorableImages, images...)
 		Expect(err).ShouldNot(HaveOccurred())
 		Expect(*registries).Should(HaveLen(1))
-		Expect(*registries).Should(HaveKey("localhost:5000"))
+		Expect(*registries).Should(HaveKey("localhost:5000/private/service"))
 	})
 
 	It("empty registry is replaced with official docker registry", func() {
@@ -431,7 +450,7 @@ var _ = Describe("Get registries", func() {
 		registries, err := getRegistriesWithAuth(ignorableImages, images...)
 		Expect(err).ShouldNot(HaveOccurred())
 		Expect(*registries).Should(HaveLen(1))
-		Expect(*registries).Should(HaveKey(dockerHubRegistry))
+		Expect(*registries).Should(HaveKey(fmt.Sprintf("%s/private/service", dockerHubRegistry)))
 	})
 
 	It("registries omitted when in ignore list with comma (,) separator", func() {
@@ -443,7 +462,7 @@ var _ = Describe("Get registries", func() {
 		registries, err := getRegistriesWithAuth(ignorableImages, images...)
 		Expect(err).ShouldNot(HaveOccurred())
 		Expect(*registries).Should(HaveLen(1))
-		Expect(*registries).Should(HaveKey("registry.redhat.io"))
+		Expect(*registries).Should(HaveKey("registry.redhat.io/fedora"))
 	})
 
 	It("all multiple entries from the same registries omitted when in ingore list", func() {
@@ -510,6 +529,214 @@ var _ = Describe("Get registries", func() {
 	})
 })
 
+var _ = Describe("VIP Dual-Stack Validation", func() {
+	var cluster common.Cluster
+
+	BeforeEach(func() {
+		cluster = common.Cluster{
+			Cluster: models.Cluster{
+				OpenshiftVersion: "4.12.0",
+				MachineNetworks: []*models.MachineNetwork{
+					{Cidr: "192.168.1.0/24"},
+					{Cidr: "2001:db8::/32"},
+				},
+			},
+		}
+	})
+
+	Describe("validateVIPAddressFamily - Dual Stack API VIPs", func() {
+		Context("OCP 4.12+ (IPv6-primary allowed)", func() {
+			It("accepts IPv4-first, IPv6-second API VIPs", func() {
+				cluster.APIVips = []*models.APIVip{
+					{IP: "192.168.1.100"},
+					{IP: "2001:db8::100"},
+				}
+				errors, err := validateVIPAddressFamily(true, cluster)
+				Expect(err).To(BeNil())
+				Expect(errors).To(HaveLen(2))
+				Expect(*errors[0]).To(Equal("192.168.1.100"))
+				Expect(*errors[1]).To(Equal("2001:db8::100"))
+			})
+
+			It("accepts IPv6-first, IPv4-second API VIPs", func() {
+				cluster.APIVips = []*models.APIVip{
+					{IP: "2001:db8::100"},
+					{IP: "192.168.1.100"},
+				}
+				errors, err := validateVIPAddressFamily(true, cluster)
+				Expect(err).To(BeNil())
+				Expect(errors).To(HaveLen(2))
+				Expect(*errors[0]).To(Equal("2001:db8::100"))
+				Expect(*errors[1]).To(Equal("192.168.1.100"))
+			})
+
+			It("accepts single IPv4 API VIP in dual-stack cluster", func() {
+				cluster.APIVips = []*models.APIVip{
+					{IP: "192.168.1.100"},
+				}
+				errors, err := validateVIPAddressFamily(true, cluster)
+				Expect(err).To(BeNil())
+				Expect(errors).To(HaveLen(1))
+				Expect(*errors[0]).To(Equal("192.168.1.100"))
+			})
+
+			It("accepts single IPv6 API VIP in dual-stack cluster", func() {
+				cluster.APIVips = []*models.APIVip{
+					{IP: "2001:db8::100"},
+				}
+				errors, err := validateVIPAddressFamily(true, cluster)
+				Expect(err).To(BeNil())
+				Expect(errors).To(HaveLen(1))
+				Expect(*errors[0]).To(Equal("2001:db8::100"))
+			})
+		})
+
+		Context("OCP 4.11 and below (IPv4-primary only)", func() {
+			BeforeEach(func() {
+				cluster.OpenshiftVersion = "4.11.0"
+			})
+
+			It("rejects IPv6-first API VIPs", func() {
+				cluster.APIVips = []*models.APIVip{
+					{IP: "2001:db8::100"},
+					{IP: "192.168.1.100"},
+				}
+				errors, err := validateVIPAddressFamily(false, cluster)
+				Expect(err).ToNot(BeNil())
+				Expect(errors).To(BeNil())
+				Expect(err.Error()).To(ContainSubstring("IPv6-primary dual-stack requires OpenShift 4.12+"))
+			})
+
+			It("accepts IPv4-first API VIPs", func() {
+				cluster.APIVips = []*models.APIVip{
+					{IP: "192.168.1.100"},
+					{IP: "2001:db8::100"},
+				}
+				errors, err := validateVIPAddressFamily(false, cluster)
+				Expect(err).To(BeNil())
+				Expect(errors).To(HaveLen(2))
+				Expect(*errors[0]).To(Equal("192.168.1.100"))
+				Expect(*errors[1]).To(Equal("2001:db8::100"))
+			})
+		})
+	})
+
+	Describe("validateVIPAddressFamily - Dual Stack Ingress VIPs", func() {
+		Context("OCP 4.12+ (IPv6-primary allowed)", func() {
+			It("accepts IPv4-first, IPv6-second Ingress VIPs", func() {
+				cluster.IngressVips = []*models.IngressVip{
+					{IP: "192.168.1.101"},
+					{IP: "2001:db8::101"},
+				}
+				errors, err := validateVIPAddressFamily(true, cluster)
+				Expect(err).To(BeNil())
+				Expect(errors).To(HaveLen(2))
+				Expect(*errors[0]).To(Equal("192.168.1.101"))
+				Expect(*errors[1]).To(Equal("2001:db8::101"))
+			})
+
+			It("accepts IPv6-first, IPv4-second Ingress VIPs", func() {
+				cluster.IngressVips = []*models.IngressVip{
+					{IP: "2001:db8::101"},
+					{IP: "192.168.1.101"},
+				}
+				errors, err := validateVIPAddressFamily(true, cluster)
+				Expect(err).To(BeNil())
+				Expect(errors).To(HaveLen(2))
+				Expect(*errors[0]).To(Equal("2001:db8::101"))
+				Expect(*errors[1]).To(Equal("192.168.1.101"))
+			})
+
+			It("accepts single IPv4 Ingress VIP in dual-stack cluster", func() {
+				cluster.IngressVips = []*models.IngressVip{
+					{IP: "192.168.1.101"},
+				}
+				errors, err := validateVIPAddressFamily(true, cluster)
+				Expect(err).To(BeNil())
+				Expect(errors).To(HaveLen(1))
+				Expect(*errors[0]).To(Equal("192.168.1.101"))
+			})
+
+			It("accepts single IPv6 Ingress VIP in dual-stack cluster", func() {
+				cluster.IngressVips = []*models.IngressVip{
+					{IP: "2001:db8::101"},
+				}
+				errors, err := validateVIPAddressFamily(true, cluster)
+				Expect(err).To(BeNil())
+				Expect(errors).To(HaveLen(1))
+				Expect(*errors[0]).To(Equal("2001:db8::101"))
+			})
+		})
+
+		Context("OCP 4.11 and below (IPv4-primary only)", func() {
+			BeforeEach(func() {
+				cluster.OpenshiftVersion = "4.11.0"
+			})
+
+			It("rejects IPv6-first Ingress VIPs", func() {
+				cluster.IngressVips = []*models.IngressVip{
+					{IP: "2001:db8::101"},
+					{IP: "192.168.1.101"},
+				}
+				errors, err := validateVIPAddressFamily(false, cluster)
+				Expect(err).ToNot(BeNil())
+				Expect(errors).To(BeNil())
+				Expect(err.Error()).To(ContainSubstring("IPv6-primary dual-stack requires OpenShift 4.12+"))
+			})
+
+			It("accepts IPv4-first Ingress VIPs", func() {
+				cluster.IngressVips = []*models.IngressVip{
+					{IP: "192.168.1.101"},
+					{IP: "2001:db8::101"},
+				}
+				errors, err := validateVIPAddressFamily(false, cluster)
+				Expect(err).To(BeNil())
+				Expect(errors).To(HaveLen(2))
+				Expect(*errors[0]).To(Equal("192.168.1.101"))
+				Expect(*errors[1]).To(Equal("2001:db8::101"))
+			})
+		})
+	})
+
+	Describe("validateVIPAddressFamily - Mixed VIP types", func() {
+		It("validates both API and Ingress VIPs together", func() {
+			cluster.APIVips = []*models.APIVip{
+				{IP: "192.168.1.100"},
+				{IP: "2001:db8::100"},
+			}
+			cluster.IngressVips = []*models.IngressVip{
+				{IP: "192.168.1.101"},
+				{IP: "2001:db8::101"},
+			}
+			errors, err := validateVIPAddressFamily(true, cluster)
+			Expect(err).To(BeNil())
+			Expect(errors).To(HaveLen(4))
+			Expect(*errors[0]).To(Equal("192.168.1.100"))
+			Expect(*errors[1]).To(Equal("2001:db8::100"))
+			Expect(*errors[2]).To(Equal("192.168.1.101"))
+			Expect(*errors[3]).To(Equal("2001:db8::101"))
+		})
+
+		It("accepts mixed IPv4-first and IPv6-first VIPs (each type validated independently)", func() {
+			cluster.APIVips = []*models.APIVip{
+				{IP: "192.168.1.100"},
+				{IP: "2001:db8::100"},
+			}
+			cluster.IngressVips = []*models.IngressVip{
+				{IP: "2001:db8::101"},
+				{IP: "192.168.1.101"},
+			}
+			errors, err := validateVIPAddressFamily(true, cluster)
+			Expect(err).To(BeNil())
+			Expect(errors).To(HaveLen(4))
+			Expect(*errors[0]).To(Equal("192.168.1.100"))
+			Expect(*errors[1]).To(Equal("2001:db8::100"))
+			Expect(*errors[2]).To(Equal("2001:db8::101"))
+			Expect(*errors[3]).To(Equal("192.168.1.101"))
+		})
+	})
+})
+
 var _ = Describe("vip dhcp allocation", func() {
 	tests := []struct {
 		vipDHCPAllocation  bool
@@ -548,7 +775,6 @@ var _ = Describe("vip dhcp allocation", func() {
 		},
 	}
 	for _, t := range tests {
-		t := t
 		It(fmt.Sprintf("VIP DHCP allocation: %t, machine network: %s", t.vipDHCPAllocation, t.machineNetworkCIDR), func() {
 			if t.valid {
 				Expect(ValidateVipDHCPAllocationWithIPv6(t.vipDHCPAllocation, t.machineNetworkCIDR)).ToNot(HaveOccurred())
@@ -560,99 +786,184 @@ var _ = Describe("vip dhcp allocation", func() {
 })
 
 var _ = Describe("IPv6 support", func() {
+	v6 := common.PrimaryIPStackV6
+	v4 := common.PrimaryIPStackV4
+
 	tests := []struct {
-		ipV6Supported bool
-		element       []*string
-		valid         bool
+		ipV6Supported  bool
+		element        []*string
+		valid          bool
+		primaryIPStack *common.PrimaryIPStack
 	}{
 		{
-			ipV6Supported: true,
-			element:       []*string{swag.String("1001:db8::/120")},
-			valid:         true,
+			ipV6Supported:  true,
+			element:        []*string{swag.String("1001:db8::/120")},
+			primaryIPStack: &v6,
+			valid:          true,
 		},
 		{
-			ipV6Supported: false,
-			element:       []*string{swag.String("1001:db8::/120")},
-			valid:         false,
+			ipV6Supported:  true,
+			element:        []*string{swag.String("1001:db8::/120")},
+			primaryIPStack: nil,
+			valid:          true,
 		},
 		{
-			ipV6Supported: true,
-			element:       []*string{swag.String("10.56.20.0/24")},
-			valid:         true,
+			ipV6Supported:  false,
+			element:        []*string{swag.String("1001:db8::/120")},
+			valid:          false,
+			primaryIPStack: nil,
 		},
 		{
-			ipV6Supported: false,
-			element:       []*string{swag.String("10.56.20.0/24")},
-			valid:         true,
+			ipV6Supported:  false,
+			element:        []*string{swag.String("1001:db8::/120")},
+			valid:          true,
+			primaryIPStack: &v6,
 		},
 		{
-			ipV6Supported: true,
-			element:       []*string{swag.String("1001:db8::1")},
-			valid:         true,
+			ipV6Supported:  true,
+			element:        []*string{swag.String("10.56.20.0/24")},
+			valid:          true,
+			primaryIPStack: nil,
 		},
 		{
-			ipV6Supported: false,
-			element:       []*string{swag.String("1001:db8::1")},
-			valid:         false,
+			ipV6Supported:  true,
+			element:        []*string{swag.String("10.56.20.0/24")},
+			valid:          true,
+			primaryIPStack: &v4,
 		},
 		{
-			ipV6Supported: true,
-			element:       []*string{swag.String("10.56.20.70")},
-			valid:         true,
+			ipV6Supported:  false,
+			element:        []*string{swag.String("10.56.20.0/24")},
+			valid:          true,
+			primaryIPStack: nil,
 		},
 		{
-			ipV6Supported: false,
-			element:       []*string{swag.String("10.56.20.70")},
-			valid:         true,
+			ipV6Supported:  false,
+			element:        []*string{swag.String("10.56.20.0/24")},
+			valid:          true,
+			primaryIPStack: &v4,
 		},
 		{
-			ipV6Supported: false,
-			element:       []*string{swag.String("")},
-			valid:         true,
+			ipV6Supported:  true,
+			element:        []*string{swag.String("1001:db8::1")},
+			valid:          true,
+			primaryIPStack: nil,
 		},
 		{
-			ipV6Supported: false,
-			element:       []*string{nil},
-			valid:         true,
+			ipV6Supported:  true,
+			element:        []*string{swag.String("1001:db8::1")},
+			valid:          true,
+			primaryIPStack: &v6,
 		},
 		{
-			ipV6Supported: false,
-			element:       []*string{nil, swag.String("1001:db8::1")},
-			valid:         false,
+			ipV6Supported:  false,
+			element:        []*string{swag.String("1001:db8::1")},
+			valid:          false,
+			primaryIPStack: nil,
 		},
 		{
-			ipV6Supported: false,
-			element:       []*string{swag.String("10.56.20.70"), swag.String("1001:db8::1")},
-			valid:         true,
+			ipV6Supported:  false,
+			element:        []*string{swag.String("1001:db8::1")},
+			valid:          true,
+			primaryIPStack: &v6,
 		},
 		{
-			ipV6Supported: false,
-			element:       []*string{swag.String("1001:db8::/64"), swag.String("10.56.20.0/24")},
-			valid:         true,
+			ipV6Supported:  true,
+			element:        []*string{swag.String("10.56.20.70")},
+			valid:          true,
+			primaryIPStack: nil,
 		},
 		{
-			ipV6Supported: false,
-			element:       []*string{swag.String("10.56.20.70"), swag.String("10.56.20.0/24")},
-			valid:         true,
+			ipV6Supported:  true,
+			element:        []*string{swag.String("10.56.20.70")},
+			valid:          true,
+			primaryIPStack: &v4,
 		},
 		{
-			ipV6Supported: true,
-			element:       []*string{swag.String("10.56.20.70"), swag.String("1001:db8::1")},
-			valid:         true,
+			ipV6Supported:  false,
+			element:        []*string{swag.String("10.56.20.70")},
+			valid:          true,
+			primaryIPStack: nil,
 		},
 		{
-			ipV6Supported: true,
-			element:       []*string{swag.String("1001:db8::1"), swag.String("10.56.20.70")},
-			valid:         true,
+			ipV6Supported:  false,
+			element:        []*string{swag.String("10.56.20.70")},
+			valid:          true,
+			primaryIPStack: &v4,
+		},
+		{
+			ipV6Supported:  false,
+			element:        []*string{swag.String("")},
+			valid:          true,
+			primaryIPStack: nil,
+		},
+		{
+			ipV6Supported:  false,
+			element:        []*string{swag.String("")},
+			valid:          true,
+			primaryIPStack: &v4,
+		},
+		{
+			ipV6Supported:  false,
+			element:        []*string{swag.String("")},
+			valid:          true,
+			primaryIPStack: &v6,
+		},
+		{
+			ipV6Supported:  false,
+			element:        []*string{nil},
+			valid:          true,
+			primaryIPStack: nil,
+		},
+		{
+			ipV6Supported:  false,
+			element:        []*string{nil},
+			valid:          true,
+			primaryIPStack: &v4,
+		},
+		{
+			ipV6Supported:  false,
+			element:        []*string{nil},
+			valid:          true,
+			primaryIPStack: &v6,
+		},
+		{
+			ipV6Supported:  false,
+			element:        []*string{swag.String("10.56.20.70"), swag.String("1001:db8::1")},
+			valid:          true,
+			primaryIPStack: &v4,
+		},
+		{
+			ipV6Supported:  false,
+			element:        []*string{swag.String("1001:db8::/64"), swag.String("10.56.20.0/24")},
+			valid:          true,
+			primaryIPStack: &v6,
+		},
+		{
+			ipV6Supported:  false,
+			element:        []*string{swag.String("10.56.20.70"), swag.String("10.56.20.0/24")},
+			valid:          true,
+			primaryIPStack: &v4,
+		},
+		{
+			ipV6Supported:  true,
+			element:        []*string{swag.String("10.56.20.70"), swag.String("1001:db8::1")},
+			valid:          true,
+			primaryIPStack: &v4,
+		},
+		{
+			ipV6Supported:  true,
+			element:        []*string{swag.String("1001:db8::1"), swag.String("10.56.20.70")},
+			valid:          true,
+			primaryIPStack: &v6,
 		},
 	}
 	for _, t := range tests {
-		t := t
 		It(fmt.Sprintf("IPv6 support validation. Supported: %t, IP addresses/CIDRs: %v", t.ipV6Supported, t.element), func() {
 			if t.valid {
-				Expect(ValidateIPAddressFamily(t.ipV6Supported, t.element...)).ToNot(HaveOccurred())
+				Expect(ValidateIPAddressFamily(t.ipV6Supported, "networks", t.primaryIPStack, t.element...)).ToNot(HaveOccurred())
 			} else {
-				Expect(ValidateIPAddressFamily(t.ipV6Supported, t.element...)).To(HaveOccurred())
+				Expect(ValidateIPAddressFamily(t.ipV6Supported, "networks", t.primaryIPStack, t.element...)).To(HaveOccurred())
 			}
 		})
 	}
@@ -660,36 +971,70 @@ var _ = Describe("IPv6 support", func() {
 
 var _ = Describe("Machine Network amount and order", func() {
 	tests := []struct {
-		element []*models.MachineNetwork
-		valid   bool
+		element          []*models.MachineNetwork
+		valid            bool
+		description      string
+		openshiftVersion string
 	}{
 		{
-			element: []*models.MachineNetwork{{Cidr: "1.2.5.0/24"}, {Cidr: "1002:db8::/119"}},
-			valid:   true,
+			element:          []*models.MachineNetwork{{Cidr: "1.2.5.0/24"}, {Cidr: "1002:db8::/119"}},
+			valid:            true,
+			description:      "IPv4-primary dual-stack (all versions)",
+			openshiftVersion: "4.12.0",
 		},
 		{
-			// Invalid because violates the "IPv4 subnet as the first one" constraint
-			element: []*models.MachineNetwork{{Cidr: "1002:db8::/119"}, {Cidr: "1.2.5.0/24"}},
-			valid:   false,
+			element:          []*models.MachineNetwork{{Cidr: "1.2.5.0/24"}, {Cidr: "1002:db8::/119"}},
+			valid:            true,
+			description:      "IPv4-primary dual-stack (4.13+)",
+			openshiftVersion: "4.13.0",
+		},
+		{
+			element:          []*models.MachineNetwork{{Cidr: "1002:db8::/119"}, {Cidr: "1.2.5.0/24"}},
+			valid:            false,
+			description:      "IPv6-primary dual-stack (not supported in 4.11)",
+			openshiftVersion: "4.11.0",
+		},
+		{
+			element:          []*models.MachineNetwork{{Cidr: "1002:db8::/119"}, {Cidr: "1.2.5.0/24"}},
+			valid:            true,
+			description:      "IPv6-primary dual-stack (supported in 4.13+)",
+			openshiftVersion: "4.13.0",
+		},
+		{
+			element:          []*models.MachineNetwork{{Cidr: "1002:db8::/119"}, {Cidr: "1.2.5.0/24"}},
+			valid:            true,
+			description:      "IPv6-primary dual-stack (supported in 4.14+)",
+			openshiftVersion: "4.14.0",
 		},
 		{
 			// Invalid because violates the "exactly 2 networks" constraint
-			element: []*models.MachineNetwork{{Cidr: "1.2.5.0/24"}, {Cidr: "1002:db8::/119"}, {Cidr: "1.2.6.0/24"}, {Cidr: "1.2.7.0/24"}},
-			valid:   false,
+			element:          []*models.MachineNetwork{{Cidr: "1.2.5.0/24"}, {Cidr: "1002:db8::/119"}, {Cidr: "1.2.6.0/24"}, {Cidr: "1.2.7.0/24"}},
+			valid:            false,
+			description:      "too many networks",
+			openshiftVersion: "4.13.0",
 		},
 		{
-			// Invalid because violates the "exactly 2 networks" constraint
-			element: []*models.MachineNetwork{{Cidr: "1002:db8::/119"}, {Cidr: "1.2.5.0/24"}, {Cidr: "1.2.6.0/24"}, {Cidr: "1.2.7.0/24"}},
-			valid:   false,
+			// Invalid because missing IPv4 network
+			element:          []*models.MachineNetwork{{Cidr: "1002:db8::/119"}, {Cidr: "1003:db8::/119"}},
+			valid:            false,
+			description:      "dual IPv6 without IPv4",
+			openshiftVersion: "4.13.0",
+		},
+		{
+			// Invalid because missing IPv6 network
+			element:          []*models.MachineNetwork{{Cidr: "1.2.5.0/24"}, {Cidr: "1.2.6.0/24"}},
+			valid:            false,
+			description:      "dual IPv4 without IPv6",
+			openshiftVersion: "4.13.0",
 		},
 	}
 	for _, test := range tests {
 		t := test
-		It(fmt.Sprintf("Dual-stack machine network order validation. IP addresses/CIDRs: %v", t.element), func() {
+		It(fmt.Sprintf("Dual-stack machine network validation: %s (OCP %s). Networks: %v", t.description, t.openshiftVersion, t.element), func() {
 			if t.valid {
-				Expect(network.VerifyMachineNetworksDualStack(t.element, true)).ToNot(HaveOccurred())
+				Expect(network.VerifyMachineNetworksDualStack(t.element, true, t.openshiftVersion)).ToNot(HaveOccurred())
 			} else {
-				Expect(network.VerifyMachineNetworksDualStack(t.element, true)).To(HaveOccurred())
+				Expect(network.VerifyMachineNetworksDualStack(t.element, true, t.openshiftVersion)).To(HaveOccurred())
 			}
 		})
 	}
@@ -713,6 +1058,109 @@ var _ = Describe("Parse functions", func() {
 			ParseMirrorRegistries(log, registries, []mirrorregistries.RegistriesConf{{Location: "test.com"}})
 			Expect(registries).To(Equal(map[string]bool{"test.com": true, "example.com": true}))
 		})
+	})
+})
+
+var _ = Describe("ValidateNetworkCIDRs", func() {
+
+	It("should return an error if the Machine Network CIDR is invalid", func() {
+		err := ValidateNetworkCIDRs([]*models.MachineNetwork{{Cidr: "invalid"}}, nil, nil)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("Could not parse Machine Network CIDR invalid (index 0): invalid CIDR address: invalid"))
+	})
+	It("should return an error if the Cluster Network CIDR is invalid", func() {
+		err := ValidateNetworkCIDRs(nil, nil, []*models.ClusterNetwork{{Cidr: "invalid"}})
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("Could not parse Cluster Network CIDR invalid (index 0): invalid CIDR address: invalid"))
+	})
+	It("should return an error if the Service Network CIDR is invalid", func() {
+		err := ValidateNetworkCIDRs(nil, []*models.ServiceNetwork{{Cidr: "invalid"}}, nil)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("Could not parse Service Network CIDR invalid (index 0): invalid CIDR address: invalid"))
+	})
+	It("should return an error if the Machine Network CIDR is empty", func() {
+		err := ValidateNetworkCIDRs([]*models.MachineNetwork{{Cidr: ""}}, nil, nil)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("Machine Network CIDR cannot be empty (index 0)"))
+	})
+	It("should return an error if the Cluster Network CIDR is empty", func() {
+		err := ValidateNetworkCIDRs(nil, nil, []*models.ClusterNetwork{{Cidr: ""}})
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("Cluster Network CIDR cannot be empty (index 0)"))
+	})
+	It("should return an error if the Service Network CIDR is empty", func() {
+		err := ValidateNetworkCIDRs(nil, []*models.ServiceNetwork{{Cidr: ""}}, nil)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("Service Network CIDR cannot be empty (index 0)"))
+	})
+	It("should not return an error if the Machine Network CIDR is valid", func() {
+		err := ValidateNetworkCIDRs([]*models.MachineNetwork{{Cidr: "1.2.3.0/24"}}, nil, nil)
+		Expect(err).ToNot(HaveOccurred())
+	})
+	It("should not return an error if the Cluster Network CIDR is valid", func() {
+		err := ValidateNetworkCIDRs(nil, nil, []*models.ClusterNetwork{{Cidr: "1.2.3.0/24"}})
+		Expect(err).ToNot(HaveOccurred())
+	})
+	It("should not return an error if the Service Network CIDR is valid", func() {
+		err := ValidateNetworkCIDRs(nil, []*models.ServiceNetwork{{Cidr: "1.2.3.0/24"}}, nil)
+		Expect(err).ToNot(HaveOccurred())
+	})
+})
+
+var _ = Describe("ValidateClusterUpdateVIPAddresses - partial network updates", func() {
+	var cluster common.Cluster
+
+	BeforeEach(func() {
+		cluster = common.Cluster{
+			Cluster: models.Cluster{
+				OpenshiftVersion: "4.14.0",
+				CPUArchitecture:  "x86_64",
+				MachineNetworks: []*models.MachineNetwork{
+					{Cidr: "192.168.1.0/24"},
+					{Cidr: "2001:db8::/64"},
+				},
+				ServiceNetworks: []*models.ServiceNetwork{
+					{Cidr: "172.30.0.0/16"},
+					{Cidr: "fd02::/112"},
+				},
+				ClusterNetworks: []*models.ClusterNetwork{
+					{Cidr: "10.128.0.0/14", HostPrefix: 23},
+					{Cidr: "fd01::/48", HostPrefix: 64},
+				},
+				APIVips: []*models.APIVip{
+					{IP: "192.168.1.100"},
+					{IP: "2001:db8::100"},
+				},
+				IngressVips: []*models.IngressVip{
+					{IP: "192.168.1.101"},
+					{IP: "2001:db8::101"},
+				},
+			},
+		}
+	})
+
+	It("preserves MachineNetworks when only updating ClusterNetworks in dual-stack cluster", func() {
+		params := &models.V2ClusterUpdateParams{
+			ClusterNetworks: []*models.ClusterNetwork{
+				{Cidr: "10.128.0.0/15", HostPrefix: 22},
+				{Cidr: "fd01::/48", HostPrefix: 66},
+			},
+		}
+
+		err := ValidateClusterUpdateVIPAddresses(true, &cluster, params, nil)
+		Expect(err).ShouldNot(HaveOccurred())
+	})
+
+	It("allows updating only APIVips in dual-stack cluster", func() {
+		params := &models.V2ClusterUpdateParams{
+			APIVips: []*models.APIVip{
+				{IP: "192.168.1.102"},
+				{IP: "2001:db8::102"},
+			},
+		}
+
+		err := ValidateClusterUpdateVIPAddresses(true, &cluster, params, nil)
+		Expect(err).ShouldNot(HaveOccurred())
 	})
 })
 

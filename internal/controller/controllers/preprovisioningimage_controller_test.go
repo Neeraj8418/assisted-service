@@ -24,6 +24,7 @@ import (
 	conditionsv1 "github.com/openshift/custom-resource-status/conditions/v1"
 	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -52,6 +53,7 @@ func newPreprovisioningImage(name, namespace, labelKey, labelValue, bmhName stri
 				Kind:       "BareMetalHost",
 				Name:       bmhName,
 			}},
+			Finalizers: []string{PreprovisioningImageFinalizerName},
 		},
 		Spec: metal3_v1alpha1.PreprovisioningImageSpec{
 			AcceptFormats: []metal3_v1alpha1.ImageFormat{
@@ -107,7 +109,7 @@ var _ = Describe("PreprovisioningImage reconcile", func() {
 		Expect(metal3_v1alpha1.AddToScheme(schemes)).To(Succeed())
 		Expect(aiv1beta1.AddToScheme(schemes)).To(Succeed())
 		c = fakeclient.NewClientBuilder().WithScheme(schemes).
-			WithStatusSubresource(&metal3_v1alpha1.PreprovisioningImage{}).Build()
+			WithStatusSubresource(&metal3_v1alpha1.PreprovisioningImage{}, &aiv1beta1.InfraEnv{}).Build()
 		mockCtrl = gomock.NewController(GinkgoT())
 		mockInstallerInternal = bminventory.NewMockInstallerInternals(mockCtrl)
 		mockCRDEventsHandler = NewMockCRDEventsHandler(mockCtrl)
@@ -134,8 +136,11 @@ var _ = Describe("PreprovisioningImage reconcile", func() {
 			CRDEventsHandler: mockCRDEventsHandler,
 			VersionsHandler:  mockVersionHandler,
 			OcRelease:        mockOcRelease,
-			Config:           PreprovisioningImageControllerConfig{BaremetalIronicAgentImage: defaultIronicImage},
-			BMOUtils:         mockBMOUtils,
+			Config: PreprovisioningImageControllerConfig{
+				BaremetalIronicAgentImage:       defaultIronicImage,
+				BaremetalIronicAgentImageForArm: "ironic-agent-arm64:latest",
+			},
+			BMOUtils: mockBMOUtils,
 		}
 		clusterVersion = &configv1.ClusterVersion{
 			ObjectMeta: metav1.ObjectMeta{Name: "version"},
@@ -258,6 +263,113 @@ var _ = Describe("PreprovisioningImage reconcile", func() {
 			Expect(c.Get(ctx, key, infraEnv)).To(BeNil())
 			Expect(infraEnv.ObjectMeta.Annotations[EnableIronicAgentAnnotation]).To(Equal("true"))
 		})
+
+		It("uses ICC config URLs when ICC contains URLs and user override annotation", func() {
+			overrideAgentImage := "ironic-agent-override:latest"
+			iccConfig := &ICCConfig{
+				IronicAgentImage: "ironic-agent-image",
+				IronicBaseURL:    "ironic-base-url",
+			}
+			setAnnotation(&infraEnv.ObjectMeta, ironicAgentImageOverrideAnnotation, overrideAgentImage)
+			Expect(c.Create(ctx, infraEnv)).To(BeNil())
+			backendInfraEnv.CPUArchitecture = "x86_64"
+			backendInfraEnv.PullSecret = "secret"
+			mockInstallerInternal.EXPECT().GetInfraEnvByKubeKey(gomock.Any()).Return(backendInfraEnv, nil)
+			mockBMOUtils.EXPECT().getICCConfig(gomock.Any()).Times(1).Return(iccConfig, nil)
+
+			mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+				Do(func(ctx context.Context, params installer.UpdateInfraEnvParams, internalIgnitionConfig *string, _ *common.MirrorRegistryConfiguration) {
+					Expect(*internalIgnitionConfig).To(ContainSubstring(iccConfig.IronicBaseURL))
+					Expect(*internalIgnitionConfig).To(ContainSubstring(overrideAgentImage))
+					Expect(url.QueryUnescape(*internalIgnitionConfig)).To(MatchRegexp(`(?m)^inspection_callback_url\s=\s$`)) // matches inspection_callback_url = <empty>
+				}).Return(
+				&common.InfraEnv{InfraEnv: models.InfraEnv{ID: &infraEnvID, CPUArchitecture: infraEnvArch}, GeneratedAt: strfmt.DateTime(time.Now())}, nil).Times(1)
+
+			mockCRDEventsHandler.EXPECT().NotifyInfraEnvUpdates(infraEnv.Name, infraEnv.Namespace).Times(1)
+			res, err := pr.Reconcile(ctx, newPreprovisioningImageRequest(ppi))
+			Expect(err).To(BeNil())
+			Expect(res).To(Equal(ctrl.Result{}))
+		})
+
+		It("sets ironic URLs from cluster when ICC config is unavailable and ironic image annotation override is set", func() {
+			overrideAgentImage := "ironic-agent-override:latest"
+			setAnnotation(&infraEnv.ObjectMeta, ironicAgentImageOverrideAnnotation, overrideAgentImage)
+			Expect(c.Create(ctx, infraEnv)).To(BeNil())
+			backendInfraEnv.CPUArchitecture = "x86_64"
+			backendInfraEnv.PullSecret = "secret"
+			mockInstallerInternal.EXPECT().GetInfraEnvByKubeKey(gomock.Any()).Return(backendInfraEnv, nil)
+			mockBMOUtils.EXPECT().getICCConfig(gomock.Any()).Times(1).Return(nil, errors.Errorf("ICC configuration is not available"))
+			mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+				Do(func(ctx context.Context, params installer.UpdateInfraEnvParams, internalIgnitionConfig *string, _ *common.MirrorRegistryConfiguration) {
+					Expect(*internalIgnitionConfig).To(ContainSubstring(url.QueryEscape(ironicServiceIPs[0])))
+					Expect(*internalIgnitionConfig).To(ContainSubstring(url.QueryEscape(ironicInspectorIPs[0])))
+					Expect(*internalIgnitionConfig).To(ContainSubstring(overrideAgentImage))
+				}).Return(
+				&common.InfraEnv{InfraEnv: models.InfraEnv{ID: &infraEnvID, CPUArchitecture: infraEnvArch}, GeneratedAt: strfmt.DateTime(time.Now())}, nil).Times(1)
+			mockCRDEventsHandler.EXPECT().NotifyInfraEnvUpdates(infraEnv.Name, infraEnv.Namespace).Times(1)
+			res, err := pr.Reconcile(ctx, newPreprovisioningImageRequest(ppi))
+			Expect(err).To(BeNil())
+			Expect(res).To(Equal(ctrl.Result{}))
+		})
+
+		It("preserves ironic urls from ICC config with user override regardless of architecture mismatch", func() {
+			overrideAgentImage := "ironic-agent-override:latest"
+			iccConfig := &ICCConfig{
+				IronicAgentImage:       "ironic-agent-image",
+				IronicBaseURL:          "ironic-base-url",
+				IronicInspectorBaseUrl: "",
+			}
+			setAnnotation(&infraEnv.ObjectMeta, ironicAgentImageOverrideAnnotation, overrideAgentImage)
+			Expect(c.Create(ctx, infraEnv)).To(BeNil())
+			backendInfraEnv.CPUArchitecture = "aarch64" // spoke is ARM64
+			backendInfraEnv.PullSecret = "secret"
+			mockInstallerInternal.EXPECT().GetInfraEnvByKubeKey(gomock.Any()).Return(backendInfraEnv, nil)
+			mockBMOUtils.EXPECT().getICCConfig(gomock.Any()).Times(1).Return(iccConfig, nil)
+
+			mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+				Do(func(ctx context.Context, params installer.UpdateInfraEnvParams, internalIgnitionConfig *string, _ *common.MirrorRegistryConfiguration) {
+					Expect(*internalIgnitionConfig).To(ContainSubstring(url.QueryEscape(iccConfig.IronicBaseURL)))
+					Expect(*internalIgnitionConfig).To(ContainSubstring(overrideAgentImage))
+					Expect(url.QueryUnescape(*internalIgnitionConfig)).To(MatchRegexp(`(?m)^inspection_callback_url\s=\s$`)) // matches inspection_callback_url = <empty>
+				}).Return(
+				&common.InfraEnv{InfraEnv: models.InfraEnv{ID: &infraEnvID, CPUArchitecture: infraEnvArch}, GeneratedAt: strfmt.DateTime(time.Now())}, nil).Times(1)
+
+			mockCRDEventsHandler.EXPECT().NotifyInfraEnvUpdates(infraEnv.Name, infraEnv.Namespace).Times(1)
+			res, err := pr.Reconcile(ctx, newPreprovisioningImageRequest(ppi))
+			Expect(err).To(BeNil())
+			Expect(res).To(Equal(ctrl.Result{}))
+		})
+
+		It("preserves ironic urls from ICC config regardless of architecture mismatch", func() {
+			Expect(c.Create(ctx, clusterVersion)).To(Succeed())
+			iccConfig := &ICCConfig{
+				IronicAgentImage:       "ironic-agent-image",
+				IronicBaseURL:          "ironic-base-url",
+				IronicInspectorBaseUrl: "",
+			}
+			Expect(c.Create(ctx, infraEnv)).To(BeNil())
+			backendInfraEnv.CPUArchitecture = "aarch64"
+			backendInfraEnv.PullSecret = "secret"
+			mockInstallerInternal.EXPECT().GetInfraEnvByKubeKey(gomock.Any()).Return(backendInfraEnv, nil)
+			mockBMOUtils.EXPECT().getICCConfig(gomock.Any()).Times(1).Return(iccConfig, nil)
+			mockOcRelease.EXPECT().GetImageArchitecture(gomock.Any(), iccConfig.IronicAgentImage, backendInfraEnv.PullSecret).Return([]string{"x86_64"}, nil)
+			mockOcRelease.EXPECT().GetReleaseArchitecture(gomock.Any(), hubReleaseImage, "", backendInfraEnv.PullSecret).Return([]string{"aarch64"}, nil)
+			mockOcRelease.EXPECT().GetIronicAgentImage(gomock.Any(), hubReleaseImage, "", backendInfraEnv.PullSecret).Return("hub-ironic-aarch64-image", nil)
+
+			mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+				Do(func(ctx context.Context, params installer.UpdateInfraEnvParams, internalIgnitionConfig *string, _ *common.MirrorRegistryConfiguration) {
+					Expect(*internalIgnitionConfig).To(ContainSubstring(url.QueryEscape(iccConfig.IronicBaseURL)))
+					Expect(*internalIgnitionConfig).To(ContainSubstring("hub-ironic-aarch64-image"))
+					Expect(url.QueryUnescape(*internalIgnitionConfig)).To(MatchRegexp(`(?m)^inspection_callback_url\s=\s$`))
+				}).Return(
+				&common.InfraEnv{InfraEnv: models.InfraEnv{ID: &infraEnvID, CPUArchitecture: infraEnvArch}, GeneratedAt: strfmt.DateTime(time.Now())}, nil).Times(1)
+
+			mockCRDEventsHandler.EXPECT().NotifyInfraEnvUpdates(infraEnv.Name, infraEnv.Namespace).Times(1)
+			res, err := pr.Reconcile(ctx, newPreprovisioningImageRequest(ppi))
+			Expect(err).To(BeNil())
+			Expect(res).To(Equal(ctrl.Result{}))
+		})
+
 		It("Wait for InfraEnv cool down", func() {
 			infraEnv.Status.ISODownloadURL = downloadURL
 			infraEnv.Status.CreatedTime = &metav1.Time{Time: time.Now()}
@@ -285,6 +397,64 @@ var _ = Describe("PreprovisioningImage reconcile", func() {
 					Status:  corev1.ConditionFalse},
 				ppi,
 			)
+		})
+
+		It("Should update the status after cool down and not reboot the host if the image didn't change", func() {
+			ppi.Status.ImageUrl = downloadURL
+			Expect(c.Status().Update(ctx, ppi)).To(BeNil())
+
+			infraEnv.Status.ISODownloadURL = downloadURL
+			infraEnv.Status.CreatedTime = &metav1.Time{Time: time.Now()}
+			infraEnv.Status.Conditions = []conditionsv1.Condition{{Type: aiv1beta1.ImageCreatedCondition,
+				Status:  corev1.ConditionTrue,
+				Reason:  "some reason",
+				Message: "Some message",
+			}}
+			Expect(c.Create(ctx, infraEnv)).To(BeNil())
+			setInfraEnvIronicConfig()
+			mockBMOUtils.EXPECT().getICCConfig(gomock.Any()).Times(2).Return(nil, errors.Errorf("ICC configuration is not available"))
+
+			By("initially reconciling the preprovisioningimage during cooldown")
+			res, err := pr.Reconcile(ctx, newPreprovisioningImageRequest(ppi))
+			Expect(err).To(BeNil())
+			Expect(res.Requeue).To(Equal(true))
+
+			By("verifying the preprovisioningimage has wait for cooldown status")
+			key := types.NamespacedName{
+				Namespace: testNamespace,
+				Name:      "testPPI",
+			}
+			Expect(c.Get(ctx, key, ppi)).To(BeNil())
+			validateStatus("",
+				&conditionsv1.Condition{
+					Reason:  "WaitingForInfraEnvImageToCoolDown",
+					Message: "Waiting for InfraEnv image to cool down",
+					Status:  corev1.ConditionFalse},
+				ppi,
+			)
+
+			By("modifying the infraenv creation time to make it seem like it's after the cooldown period")
+			Expect(c.Get(ctx, types.NamespacedName{Name: infraEnv.Name, Namespace: infraEnv.Namespace}, infraEnv)).To(BeNil())
+			infraEnv.Status.CreatedTime = &metav1.Time{Time: metav1.Now().Add(-InfraEnvImageCooldownPeriod)}
+			Expect(c.Status().Update(ctx, infraEnv)).To(BeNil())
+			setInfraEnvIronicConfig()
+
+			By("reconciling the preprovisioningimage after the cooldown period")
+			res, err = pr.Reconcile(ctx, newPreprovisioningImageRequest(ppi))
+			Expect(err).To(BeNil())
+			Expect(res).To(Equal(ctrl.Result{}))
+
+			By("verifying the preprovisioningimage status has updated")
+			Expect(c.Get(ctx, key, ppi)).To(BeNil())
+			validateStatus(downloadURL, conditionsv1.FindStatusCondition(infraEnv.Status.Conditions, aiv1beta1.ImageCreatedCondition), ppi)
+
+			By("verifying the BMH does not have the reboot annotation")
+			bmhKey := types.NamespacedName{
+				Namespace: bmh.Namespace,
+				Name:      bmh.Name,
+			}
+			Expect(c.Get(ctx, bmhKey, bmh)).To(BeNil())
+			Expect(bmh.Annotations).ToNot(HaveKey("reboot.metal3.io"))
 		})
 
 		It("sets the image on the PPI to the ISO URL and doesn't force a reboot", func() {
@@ -315,6 +485,36 @@ var _ = Describe("PreprovisioningImage reconcile", func() {
 			}
 			Expect(c.Get(ctx, bmhKey, bmh)).To(BeNil())
 			Expect(bmh.Annotations).ToNot(HaveKey("reboot.metal3.io"))
+		})
+
+		It("sets the velero exclude label on PreprovisioningImage", func() {
+			createdAt := metav1.Now().Add(-InfraEnvImageCooldownPeriod)
+			infraEnv.Status.CreatedTime = &metav1.Time{Time: createdAt}
+			infraEnv.Status.Conditions = []conditionsv1.Condition{{Type: aiv1beta1.ImageCreatedCondition,
+				Status:  corev1.ConditionTrue,
+				Reason:  "some reason",
+				Message: "Some message",
+			}}
+			Expect(c.Create(ctx, infraEnv)).To(BeNil())
+			setInfraEnvIronicConfig()
+			mockBMOUtils.EXPECT().getICCConfig(gomock.Any()).Times(1).Return(nil, errors.Errorf("ICC configuration is not available"))
+
+			// Verify the label is not set initially
+			key := types.NamespacedName{
+				Namespace: testNamespace,
+				Name:      "testPPI",
+			}
+			Expect(c.Get(ctx, key, ppi)).To(BeNil())
+			Expect(ppi.Labels).ToNot(HaveKey(VeleroExcludeBackupLabel))
+
+			res, err := pr.Reconcile(ctx, newPreprovisioningImageRequest(ppi))
+			Expect(err).To(BeNil())
+			Expect(res).To(Equal(ctrl.Result{}))
+
+			// Verify the label is set after reconcile
+			Expect(c.Get(ctx, key, ppi)).To(BeNil())
+			Expect(ppi.Labels).To(HaveKey(VeleroExcludeBackupLabel))
+			Expect(ppi.Labels[VeleroExcludeBackupLabel]).To(Equal("true"))
 		})
 
 		It("reboots the host when the image is updated", func() {
@@ -351,6 +551,46 @@ var _ = Describe("PreprovisioningImage reconcile", func() {
 			}
 			Expect(c.Get(ctx, bmhKey, bmh)).To(BeNil())
 			Expect(bmh.Annotations).To(HaveKey("reboot.metal3.io"))
+		})
+
+		It("doesn't reboot and sets a condition when an image is updated for a provisioned BMH", func() {
+			bmh.Status.Provisioning.State = metal3_v1alpha1.StateProvisioned
+			Expect(c.Update(ctx, bmh)).To(Succeed())
+
+			oldURL := "https://example.com/images/4b495e3f-6a3d-4742-aedd-7db57912c819?api_key=myotherkey&arch=x86_64&type=minimal-iso&version=4.13"
+			infraEnv.Status.ISODownloadURL = oldURL
+			infraEnv.Status.CreatedTime = &metav1.Time{Time: metav1.Now().Add(-InfraEnvImageCooldownPeriod)}
+			infraEnv.Status.Conditions = []conditionsv1.Condition{{Type: aiv1beta1.ImageCreatedCondition,
+				Status:  corev1.ConditionTrue,
+				Reason:  "some reason",
+				Message: "Some message",
+			}}
+			SetImageUrl(ppi, *infraEnv)
+			Expect(c.Status().Update(ctx, ppi)).To(BeNil())
+
+			newURL := "https://example.com/images/4b495e3f-6a3d-4742-aedd-7db57912c819?api_key=mykey&arch=x86_64&type=minimal-iso&version=4.13"
+			infraEnv.Status.ISODownloadURL = newURL
+			Expect(c.Create(ctx, infraEnv)).To(BeNil())
+
+			setInfraEnvIronicConfig()
+			mockBMOUtils.EXPECT().getICCConfig(gomock.Any()).Times(1).Return(nil, errors.Errorf("ICC configuration is not available"))
+
+			res, err := pr.Reconcile(ctx, newPreprovisioningImageRequest(ppi))
+			Expect(err).To(BeNil())
+			Expect(res).To(Equal(ctrl.Result{}))
+			key := types.NamespacedName{
+				Namespace: testNamespace,
+				Name:      "testPPI",
+			}
+			Expect(c.Get(ctx, key, ppi)).To(BeNil())
+
+			Expect(ppi.Status.ImageUrl).To(Equal(newURL))
+			bmhKey := types.NamespacedName{
+				Namespace: bmh.Namespace,
+				Name:      bmh.Name,
+			}
+			Expect(c.Get(ctx, bmhKey, bmh)).To(BeNil())
+			Expect(bmh.Annotations).ToNot(HaveKey("reboot.metal3.io"))
 		})
 
 		It("sets the image on the PPI to the initrd when the PPI doesn't accept ISO format", func() {
@@ -497,6 +737,7 @@ var _ = Describe("PreprovisioningImage reconcile", func() {
 			mockOcRelease.EXPECT().GetImageArchitecture(gomock.Any(), iccConfig.IronicAgentImage, backendInfraEnv.PullSecret).Times(1).Return([]string{"arm64"}, nil)
 			mockOcRelease.EXPECT().GetReleaseArchitecture(gomock.Any(), hubReleaseImage, "", backendInfraEnv.PullSecret).Times(1).Return([]string{"arm64"}, nil)
 			mockOcRelease.EXPECT().GetIronicAgentImage(gomock.Any(), hubReleaseImage, "", backendInfraEnv.PullSecret).Return("ironic-image:4.12.0", nil)
+			mockVersionHandler.EXPECT().GetReleaseImage(gomock.Any(), "4.12.0-rc.3", "x86_64", backendInfraEnv.PullSecret).Return(nil, errors.Errorf("no release found"))
 			mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
 				Do(func(ctx context.Context, params installer.UpdateInfraEnvParams, internalIgnitionConfig *string, mirrorRegistryConfiguration *common.MirrorRegistryConfiguration) {
 					Expect(params.InfraEnvID).To(Equal(*backendInfraEnv.ID))
@@ -558,6 +799,7 @@ var _ = Describe("PreprovisioningImage reconcile", func() {
 
 			mockOcRelease.EXPECT().GetReleaseArchitecture(gomock.Any(), hubReleaseImage, "", backendInfraEnv.PullSecret).Return([]string{"arm64"}, nil)
 			mockOcRelease.EXPECT().GetIronicAgentImage(gomock.Any(), hubReleaseImage, "", backendInfraEnv.PullSecret).Return("ironic-image:4.12.0", nil)
+			mockVersionHandler.EXPECT().GetReleaseImage(gomock.Any(), "4.12.0-rc.3", "x86_64", backendInfraEnv.PullSecret).Return(nil, errors.Errorf("no release found"))
 			mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
 				Do(func(ctx context.Context, params installer.UpdateInfraEnvParams, internalIgnitionConfig *string, mirrorRegistryConfiguration *common.MirrorRegistryConfiguration) {
 					Expect(params.InfraEnvID).To(Equal(*backendInfraEnv.ID))
@@ -625,12 +867,76 @@ var _ = Describe("PreprovisioningImage reconcile", func() {
 			backendInfraEnv.CPUArchitecture = "x86_64"
 			backendInfraEnv.PullSecret = "mypullsecret"
 			mockInstallerInternal.EXPECT().GetInfraEnvByKubeKey(gomock.Any()).Return(backendInfraEnv, nil)
-
+			mockBMOUtils.EXPECT().getICCConfig(gomock.Any()).Times(1).Return(nil, errors.Errorf("ICC configuration is not available"))
 			mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
 				Do(func(ctx context.Context, params installer.UpdateInfraEnvParams, internalIgnitionConfig *string, mirrorRegistryConfiguration *common.MirrorRegistryConfiguration) {
 					Expect(params.InfraEnvID).To(Equal(*backendInfraEnv.ID))
 					Expect(internalIgnitionConfig).Should(HaveValue(ContainSubstring(overrideAgentImage)))
 				})
+			mockCRDEventsHandler.EXPECT().NotifyInfraEnvUpdates(infraEnv.Name, infraEnv.Namespace).Times(1)
+
+			res, err := pr.Reconcile(ctx, newPreprovisioningImageRequest(ppi))
+			Expect(err).To(BeNil())
+			Expect(res).To(Equal(ctrl.Result{}))
+		})
+
+		It("uses ironic agent from ClusterImageSet when found for spoke architecture", func() {
+			Expect(c.Create(ctx, clusterVersion)).To(Succeed())
+			Expect(c.Create(ctx, infraEnv)).To(BeNil())
+
+			backendInfraEnv.CPUArchitecture = "arm64"
+			backendInfraEnv.PullSecret = "mypullsecret"
+			mockInstallerInternal.EXPECT().GetInfraEnvByKubeKey(gomock.Any()).Return(backendInfraEnv, nil)
+			mockBMOUtils.EXPECT().getICCConfig(gomock.Any()).Times(1).Return(nil, errors.Errorf("ICC configuration is not available"))
+
+			mockOcRelease.EXPECT().GetReleaseArchitecture(gomock.Any(), hubReleaseImage, "", backendInfraEnv.PullSecret).Return([]string{"x86_64"}, nil)
+			mockOcRelease.EXPECT().GetIronicAgentImage(gomock.Any(), hubReleaseImage, "", backendInfraEnv.PullSecret).Return("hub-ironic-x86-image", nil)
+
+			armReleaseURL := "quay.io/openshift-release-dev/ocp-release:4.12.0-arm64"
+			armCPUArch := "arm64"
+			armVersion := "4.12.0"
+			armReleaseImage := &models.ReleaseImage{
+				CPUArchitecture:  &armCPUArch,
+				OpenshiftVersion: &armVersion,
+				URL:              &armReleaseURL,
+				Version:          &armVersion,
+			}
+			mockVersionHandler.EXPECT().GetReleaseImage(gomock.Any(), "4.12.0-rc.3", "arm64", backendInfraEnv.PullSecret).Return(armReleaseImage, nil)
+
+			armIronicImage := "ironic-agent-arm64:4.12.0"
+			mockOcRelease.EXPECT().GetIronicAgentImage(gomock.Any(), armReleaseURL, "", backendInfraEnv.PullSecret).Return(armIronicImage, nil)
+
+			mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+				Do(func(ctx context.Context, params installer.UpdateInfraEnvParams, internalIgnitionConfig *string, mirrorRegistryConfiguration *common.MirrorRegistryConfiguration) {
+					Expect(params.InfraEnvID).To(Equal(*backendInfraEnv.ID))
+					Expect(*internalIgnitionConfig).Should(ContainSubstring(armIronicImage))
+				}).Return(
+				&common.InfraEnv{InfraEnv: models.InfraEnv{ClusterID: clusterID, ID: &infraEnvID, DownloadURL: downloadURL, CPUArchitecture: infraEnvArch}, GeneratedAt: strfmt.DateTime(time.Now())}, nil).Times(1)
+			mockCRDEventsHandler.EXPECT().NotifyInfraEnvUpdates(infraEnv.Name, infraEnv.Namespace).Times(1)
+
+			res, err := pr.Reconcile(ctx, newPreprovisioningImageRequest(ppi))
+			Expect(err).To(BeNil())
+			Expect(res).To(Equal(ctrl.Result{}))
+		})
+
+		It("handles multi-arch hub release image containing spoke architecture", func() {
+			Expect(c.Create(ctx, clusterVersion)).To(Succeed())
+			Expect(c.Create(ctx, infraEnv)).To(BeNil())
+
+			backendInfraEnv.CPUArchitecture = "arm64"
+			backendInfraEnv.PullSecret = "mypullsecret"
+			mockInstallerInternal.EXPECT().GetInfraEnvByKubeKey(gomock.Any()).Return(backendInfraEnv, nil)
+			mockBMOUtils.EXPECT().getICCConfig(gomock.Any()).Times(1).Return(nil, errors.Errorf("ICC configuration is not available"))
+
+			mockOcRelease.EXPECT().GetReleaseArchitecture(gomock.Any(), hubReleaseImage, "", backendInfraEnv.PullSecret).Return([]string{"x86_64", "arm64"}, nil)
+			mockOcRelease.EXPECT().GetIronicAgentImage(gomock.Any(), hubReleaseImage, "", backendInfraEnv.PullSecret).Return("multi-arch-ironic-image:4.12.0", nil)
+
+			mockInstallerInternal.EXPECT().UpdateInfraEnvInternal(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+				Do(func(ctx context.Context, params installer.UpdateInfraEnvParams, internalIgnitionConfig *string, mirrorRegistryConfiguration *common.MirrorRegistryConfiguration) {
+					Expect(params.InfraEnvID).To(Equal(*backendInfraEnv.ID))
+					Expect(*internalIgnitionConfig).Should(ContainSubstring("multi-arch-ironic-image:4.12.0"))
+				}).Return(
+				&common.InfraEnv{InfraEnv: models.InfraEnv{ClusterID: clusterID, ID: &infraEnvID, DownloadURL: downloadURL, CPUArchitecture: infraEnvArch}, GeneratedAt: strfmt.DateTime(time.Now())}, nil).Times(1)
 			mockCRDEventsHandler.EXPECT().NotifyInfraEnvUpdates(infraEnv.Name, infraEnv.Namespace).Times(1)
 
 			res, err := pr.Reconcile(ctx, newPreprovisioningImageRequest(ppi))
@@ -707,6 +1013,61 @@ var _ = Describe("PreprovisioningImage reconcile", func() {
 			res, err := pr.Reconcile(ctx, newPreprovisioningImageRequest(ppi))
 			Expect(err).To(BeNil())
 			Expect(res).To(Equal(ctrl.Result{}))
+
+			ppiKey := types.NamespacedName{Namespace: ppi.Namespace, Name: ppi.Name}
+			Expect(c.Get(ctx, ppiKey, ppi)).To(Succeed())
+			readyCondition := meta.FindStatusCondition(ppi.Status.Conditions, string(metal3_v1alpha1.ConditionImageReady))
+			Expect(readyCondition.Status).To(Equal(metav1.ConditionFalse))
+			Expect(readyCondition.Message).To(ContainSubstring(fmt.Sprintf("InfraEnv %s/%s is not found or is being deleted", ppi.Labels[InfraEnvLabel], ppi.Namespace)))
+			errorCondition := meta.FindStatusCondition(ppi.Status.Conditions, string(metal3_v1alpha1.ConditionImageError))
+			Expect(errorCondition.Status).To(Equal(metav1.ConditionFalse))
+			Expect(errorCondition.Message).To(ContainSubstring(fmt.Sprintf("InfraEnv %s/%s is not found or is being deleted", ppi.Labels[InfraEnvLabel], ppi.Namespace)))
+			Expect(ppi.Status.ImageUrl).To(BeEmpty())
+			Expect(ppi.Status.KernelUrl).To(BeEmpty())
+			Expect(ppi.Status.ExtraKernelParams).To(BeEmpty())
+			Expect(ppi.Status.Format).To(BeEmpty())
+			Expect(ppi.Status.Architecture).To(BeEmpty())
+		})
+
+		It("sets the not found condition when an existing infraEnv gets removed", func() {
+			Expect(c.Create(ctx, infraEnv)).To(BeNil())
+			mockBMOUtils.EXPECT().getICCConfig(gomock.Any()).Times(1).Return(nil, errors.Errorf("ICC configuration is not available"))
+			setInfraEnvIronicConfig()
+
+			res, err := pr.Reconcile(ctx, newPreprovisioningImageRequest(ppi))
+			Expect(err).To(BeNil())
+			Expect(res).To(Equal(ctrl.Result{}))
+
+			// Check that the conditions are set to reflect an existing InfraEnv
+			ppiKey := types.NamespacedName{Namespace: ppi.Namespace, Name: ppi.Name}
+			Expect(c.Get(ctx, ppiKey, ppi)).To(Succeed())
+			readyCondition := meta.FindStatusCondition(ppi.Status.Conditions, string(metal3_v1alpha1.ConditionImageReady))
+			Expect(readyCondition.Status).To(Equal(metav1.ConditionTrue))
+			errorCondition := meta.FindStatusCondition(ppi.Status.Conditions, string(metal3_v1alpha1.ConditionImageError))
+			Expect(errorCondition.Status).To(Equal(metav1.ConditionFalse))
+
+			// Set PreprovisioningImage to a non-existing InfraEnv
+			ppi.Labels[InfraEnvLabel] = "non-existing-infraenv"
+			Expect(c.Update(ctx, ppi)).To(Succeed())
+
+			res, err = pr.Reconcile(ctx, newPreprovisioningImageRequest(ppi))
+			Expect(err).To(BeNil())
+			Expect(res).To(Equal(ctrl.Result{}))
+
+			// Check that the conditions are updated to reflect a non-existing InfraEnv
+			ppiKey = types.NamespacedName{Namespace: ppi.Namespace, Name: ppi.Name}
+			Expect(c.Get(ctx, ppiKey, ppi)).To(Succeed())
+			readyCondition = meta.FindStatusCondition(ppi.Status.Conditions, string(metal3_v1alpha1.ConditionImageReady))
+			Expect(readyCondition.Status).To(Equal(metav1.ConditionFalse))
+			Expect(readyCondition.Message).To(ContainSubstring(fmt.Sprintf("InfraEnv %s/%s is not found or is being deleted", ppi.Labels[InfraEnvLabel], ppi.Namespace)))
+			errorCondition = meta.FindStatusCondition(ppi.Status.Conditions, string(metal3_v1alpha1.ConditionImageError))
+			Expect(errorCondition.Status).To(Equal(metav1.ConditionFalse))
+			Expect(errorCondition.Message).To(ContainSubstring(fmt.Sprintf("InfraEnv %s/%s is not found or is being deleted", ppi.Labels[InfraEnvLabel], ppi.Namespace)))
+			Expect(ppi.Status.ImageUrl).To(BeEmpty())
+			Expect(ppi.Status.KernelUrl).To(BeEmpty())
+			Expect(ppi.Status.ExtraKernelParams).To(BeEmpty())
+			Expect(ppi.Status.Format).To(BeEmpty())
+			Expect(ppi.Status.Architecture).To(BeEmpty())
 		})
 	})
 	It("PreprovisioningImage not found", func() {
@@ -788,7 +1149,7 @@ var _ = Describe("PreprovisioningImage reconcile", func() {
 			Expect(c.Create(ctx, infraEnv)).To(BeNil())
 			Expect(c.Create(ctx, ppi)).To(BeNil())
 
-			requests := pr.mapInfraEnvPPI()(ctx, infraEnv)
+			requests := pr.mapInfraEnvPPI(ctx, infraEnv)
 
 			Expect(len(requests)).To(Equal(1))
 		})
@@ -799,7 +1160,7 @@ var _ = Describe("PreprovisioningImage reconcile", func() {
 			ppi2 := newPreprovisioningImage("testPPI2", testNamespace, InfraEnvLabel, "testInfraEnv", bmh.Name)
 			Expect(c.Create(ctx, ppi2)).To(BeNil())
 
-			requests := pr.mapInfraEnvPPI()(ctx, infraEnv)
+			requests := pr.mapInfraEnvPPI(ctx, infraEnv)
 
 			Expect(len(requests)).To(Equal(2))
 		})
@@ -810,7 +1171,7 @@ var _ = Describe("PreprovisioningImage reconcile", func() {
 			ppi2 := newPreprovisioningImage("testPPI2", testNamespace, InfraEnvLabel, "someOtherInfraEnv", bmh.Name)
 			Expect(c.Create(ctx, ppi2)).To(BeNil())
 
-			requests := pr.mapInfraEnvPPI()(ctx, infraEnv)
+			requests := pr.mapInfraEnvPPI(ctx, infraEnv)
 
 			Expect(len(requests)).To(Equal(1))
 		})
@@ -819,12 +1180,21 @@ var _ = Describe("PreprovisioningImage reconcile", func() {
 			infraEnv.Status.ISODownloadURL = downloadURL
 			Expect(c.Create(ctx, infraEnv)).To(BeNil())
 
-			requests := pr.mapInfraEnvPPI()(ctx, infraEnv)
+			requests := pr.mapInfraEnvPPI(ctx, infraEnv)
 
 			Expect(len(requests)).To(Equal(0))
 		})
 	})
+})
 
+var _ = Describe("mapBMHtoPPI", func() {
+	It("returns a request for the matching object", func() {
+		bmh := &metal3_v1alpha1.BareMetalHost{ObjectMeta: metav1.ObjectMeta{Name: "testBMH", Namespace: testNamespace}}
+		requests := mapBMHtoPPI(context.Background(), bmh)
+		Expect(len(requests)).To(Equal(1))
+		Expect(requests[0].Namespace).To(Equal(bmh.Namespace))
+		Expect(requests[0].Name).To(Equal(bmh.Name))
+	})
 })
 
 func checkImageConditionFailed(c client.Client, ppi *metal3_v1alpha1.PreprovisioningImage, reason string, messageSubstring string) {
@@ -865,3 +1235,227 @@ func validateStatus(imageURL string, ExpectedImageReadyCondition *conditionsv1.C
 		meta.FindStatusCondition(ppi.Status.Conditions, string(metal3_v1alpha1.ConditionImageError)).Status)))
 
 }
+
+var _ = Describe("PreprovisioningImage deletion protection", func() {
+	var (
+		c                     client.Client
+		pr                    *PreprovisioningImageReconciler
+		mockCtrl              *gomock.Controller
+		mockInstallerInternal *bminventory.MockInstallerInternals
+		mockCRDEventsHandler  *MockCRDEventsHandler
+		mockVersionHandler    *versions.MockHandler
+		mockOcRelease         *oc.MockRelease
+		mockBMOUtils          *MockBMOUtils
+		ctx                   = context.Background()
+		ppi                   *metal3_v1alpha1.PreprovisioningImage
+		bmh                   *metal3_v1alpha1.BareMetalHost
+	)
+
+	BeforeEach(func() {
+		schemes := runtime.NewScheme()
+		Expect(configv1.AddToScheme(schemes)).To(Succeed())
+		Expect(metal3_v1alpha1.AddToScheme(schemes)).To(Succeed())
+		Expect(aiv1beta1.AddToScheme(schemes)).To(Succeed())
+		c = fakeclient.NewClientBuilder().WithScheme(schemes).
+			WithStatusSubresource(&metal3_v1alpha1.PreprovisioningImage{}, &metal3_v1alpha1.BareMetalHost{}).Build()
+		mockCtrl = gomock.NewController(GinkgoT())
+		mockInstallerInternal = bminventory.NewMockInstallerInternals(mockCtrl)
+		mockCRDEventsHandler = NewMockCRDEventsHandler(mockCtrl)
+		mockVersionHandler = versions.NewMockHandler(mockCtrl)
+		mockOcRelease = oc.NewMockRelease(mockCtrl)
+		mockBMOUtils = NewMockBMOUtils(mockCtrl)
+
+		pr = &PreprovisioningImageReconciler{
+			Client:           c,
+			Log:              common.GetTestLog(),
+			Installer:        mockInstallerInternal,
+			CRDEventsHandler: mockCRDEventsHandler,
+			VersionsHandler:  mockVersionHandler,
+			OcRelease:        mockOcRelease,
+			BMOUtils:         mockBMOUtils,
+		}
+
+		bmh = &metal3_v1alpha1.BareMetalHost{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "testBMH",
+				Namespace: testNamespace,
+			},
+			Spec: metal3_v1alpha1.BareMetalHostSpec{
+				AutomatedCleaningMode: metal3_v1alpha1.CleaningModeMetadata,
+			},
+		}
+		Expect(c.Create(ctx, bmh)).To(Succeed())
+
+		ppi = newPreprovisioningImage("testPPI", testNamespace, InfraEnvLabel, "testInfraEnv", bmh.Name)
+	})
+
+	AfterEach(func() {
+		mockCtrl.Finish()
+	})
+
+	Context("ensurePreprovisioningImageFinalizer", func() {
+		It("adds finalizer when not present on PreprovisioningImage", func() {
+			ppi.Finalizers = []string{}
+			Expect(c.Create(ctx, ppi)).To(Succeed())
+
+			// Reconcile and verify finalizer was added
+			result, err := pr.Reconcile(ctx, newPreprovisioningImageRequest(ppi))
+			Expect(err).To(BeNil())
+			Expect(result).To(Equal(ctrl.Result{Requeue: true}))
+
+			key := types.NamespacedName{Name: ppi.Name, Namespace: ppi.Namespace}
+			Expect(c.Get(ctx, key, ppi)).To(Succeed())
+			Expect(ppi.GetFinalizers()).To(ContainElement(PreprovisioningImageFinalizerName))
+		})
+
+		It("does nothing when finalizer is already present on PreprovisioningImage", func() {
+			Expect(c.Create(ctx, ppi)).To(Succeed())
+
+			// Reconcile and verify finalizer was not added again
+			result, err := pr.Reconcile(ctx, newPreprovisioningImageRequest(ppi))
+			Expect(err).To(BeNil())
+			Expect(result).To(Equal(ctrl.Result{}))
+
+			key := types.NamespacedName{Name: ppi.Name, Namespace: ppi.Namespace}
+			Expect(c.Get(ctx, key, ppi)).To(Succeed())
+			Expect(ppi.GetFinalizers()).To(HaveLen(1))
+			Expect(ppi.GetFinalizers()).To(ContainElement(PreprovisioningImageFinalizerName))
+		})
+	})
+
+	Context("handlePreprovisioningImageDeletion", func() {
+		It("allows deletion when finalizer is not present", func() {
+			ppi.OwnerReferences = []metav1.OwnerReference{}
+			Expect(c.Create(ctx, ppi)).To(Succeed())
+			// Delete ppi
+			Expect(c.Delete(ctx, ppi)).To(Succeed())
+
+			result, err := pr.Reconcile(ctx, newPreprovisioningImageRequest(ppi))
+			Expect(err).To(BeNil())
+			Expect(result).To(Equal(ctrl.Result{}))
+
+			// Verify ppi was deleted
+			key := types.NamespacedName{Name: ppi.Name, Namespace: ppi.Namespace}
+			Expect(k8serrors.IsNotFound(c.Get(ctx, key, ppi))).To(BeTrue())
+		})
+
+		It("removes finalizer and allows deletion when BMH not found", func() {
+			// Set owner reference to a non-existent BMH
+			ppi.OwnerReferences = []metav1.OwnerReference{{
+				APIVersion: "metal3.io/v1alpha1",
+				Kind:       "BareMetalHost",
+				Name:       "nonExistentBMH",
+			}}
+			Expect(c.Create(ctx, ppi)).To(Succeed())
+			// Delete ppi
+			Expect(c.Delete(ctx, ppi)).To(Succeed())
+			// Reconcile and verify ppi was deleted
+			result, err := pr.Reconcile(ctx, newPreprovisioningImageRequest(ppi))
+			Expect(err).To(BeNil())
+			Expect(result).To(Equal(ctrl.Result{}))
+
+			// Verify ppi was deleted
+			key := types.NamespacedName{Name: ppi.Name, Namespace: ppi.Namespace}
+			Expect(k8serrors.IsNotFound(c.Get(ctx, key, ppi))).To(BeTrue())
+		})
+
+		It("blocks deletion when BMH has metadata cleaning enabled and is being deleted", func() {
+			Expect(c.Create(ctx, ppi)).To(Succeed())
+			// Delete ppi
+			Expect(c.Delete(ctx, ppi)).To(Succeed())
+
+			// UpdateBMH to set metadata cleaning enabled
+			bmh.Spec.AutomatedCleaningMode = metal3_v1alpha1.CleaningModeMetadata
+			bmh.Status.Provisioning.State = metal3_v1alpha1.StateDeprovisioning
+			bmh.Finalizers = []string{"arbitraryfinalizer"}
+			Expect(c.Update(ctx, bmh)).To(Succeed())
+			// Set BMH to be deleting
+			Expect(c.Delete(ctx, bmh)).To(Succeed())
+
+			result, err := pr.Reconcile(ctx, newPreprovisioningImageRequest(ppi))
+
+			Expect(err).To(BeNil())
+			Expect(result.Requeue).To(BeTrue())
+
+			// Verify finalizer was NOT removed
+			key := types.NamespacedName{Name: ppi.Name, Namespace: ppi.Namespace}
+			Expect(c.Get(ctx, key, ppi)).To(Succeed())
+			Expect(ppi.GetFinalizers()).To(ContainElement(PreprovisioningImageFinalizerName))
+		})
+
+		It("allows deletion when BMH has cleaning disabled", func() {
+			Expect(c.Create(ctx, ppi)).To(Succeed())
+			// Delete ppi
+			Expect(c.Delete(ctx, ppi)).To(Succeed())
+			// Set BMH cleaning to disabled
+			bmh.Spec.AutomatedCleaningMode = metal3_v1alpha1.CleaningModeDisabled
+			Expect(c.Update(ctx, bmh)).To(Succeed())
+			Expect(c.Delete(ctx, bmh)).To(Succeed())
+
+			result, err := pr.Reconcile(ctx, newPreprovisioningImageRequest(ppi))
+
+			Expect(err).To(BeNil())
+			Expect(result).To(Equal(ctrl.Result{}))
+
+			// Verify ppi was deleted
+			key := types.NamespacedName{Name: ppi.Name, Namespace: ppi.Namespace}
+			Expect(k8serrors.IsNotFound(c.Get(ctx, key, ppi))).To(BeTrue())
+		})
+
+		It("allows deletion when BMH finished deprovisioning with state deleting", func() {
+			Expect(c.Create(ctx, ppi)).To(Succeed())
+			// Delete ppi
+			Expect(c.Delete(ctx, ppi)).To(Succeed())
+			// Set BMH to be deleting
+			bmh.Spec.AutomatedCleaningMode = metal3_v1alpha1.CleaningModeMetadata
+			bmh.Status.Provisioning.State = metal3_v1alpha1.StateDeleting
+			Expect(c.Update(ctx, bmh)).To(Succeed())
+			Expect(c.Delete(ctx, bmh)).To(Succeed())
+
+			result, err := pr.Reconcile(ctx, newPreprovisioningImageRequest(ppi))
+
+			Expect(err).To(BeNil())
+			Expect(result).To(Equal(ctrl.Result{}))
+
+			// Verify ppi was deleted
+			key := types.NamespacedName{Name: ppi.Name, Namespace: ppi.Namespace}
+			Expect(k8serrors.IsNotFound(c.Get(ctx, key, ppi))).To(BeTrue())
+		})
+
+		It("allows deletion when BMH finished deprovisioning with state powering off before delete", func() {
+			Expect(c.Create(ctx, ppi)).To(Succeed())
+			// Delete ppi
+			Expect(c.Delete(ctx, ppi)).To(Succeed())
+			// Set BMH to be deleting
+			bmh.Spec.AutomatedCleaningMode = metal3_v1alpha1.CleaningModeMetadata
+			bmh.Status.Provisioning.State = metal3_v1alpha1.StatePoweringOffBeforeDelete
+			Expect(c.Update(ctx, bmh)).To(Succeed())
+			Expect(c.Delete(ctx, bmh)).To(Succeed())
+
+			result, err := pr.Reconcile(ctx, newPreprovisioningImageRequest(ppi))
+
+			Expect(err).To(BeNil())
+			Expect(result).To(Equal(ctrl.Result{}))
+
+			// Verify ppi was deleted
+			key := types.NamespacedName{Name: ppi.Name, Namespace: ppi.Namespace}
+			Expect(k8serrors.IsNotFound(c.Get(ctx, key, ppi))).To(BeTrue())
+		})
+
+		It("blocks deletion when BMH has metadata cleaning enabled but is NOT being deleted", func() {
+			Expect(c.Create(ctx, ppi)).To(Succeed())
+			// Delete ppi
+			Expect(c.Delete(ctx, ppi)).To(Succeed())
+			// BMH is not being deleted (no DeletionTimestamp)
+			result, err := pr.Reconcile(ctx, newPreprovisioningImageRequest(ppi))
+
+			Expect(err).To(BeNil())
+			Expect(result.Requeue).To(BeTrue())
+
+			// Verify ppi finalizer was not removed
+			key := types.NamespacedName{Name: ppi.Name, Namespace: ppi.Namespace}
+			Expect(c.Get(ctx, key, ppi)).To(Succeed())
+			Expect(ppi.GetFinalizers()).To(ContainElement(PreprovisioningImageFinalizerName))
+		})
+	})
+})

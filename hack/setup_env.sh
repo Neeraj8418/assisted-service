@@ -44,9 +44,9 @@ function podman_remote() {
 }
 
 function envtest() {
-  # Branch 'release-0.17' is the newest version that can be installed with Go 1.21. This should be updated when we
-  # update the version of Go.
-  go install sigs.k8s.io/controller-runtime/tools/setup-envtest@release-0.17
+  # Branch 'release-0.22' is the newest version that can be installed with the current 
+  # version of Go (1.25.5). This should be updated when we update the version of Go.
+  go install sigs.k8s.io/controller-runtime/tools/setup-envtest@release-0.22
 
   # The unit tests will try to use the 'setup-envtest' tool to download and locate the required assets. But that doesn't
   # work in the CI environment because that tool saves the assets to a directory in the home of the user, which may not
@@ -90,10 +90,11 @@ function assisted_service() {
   test_tools
 
 
-  go install golang.org/x/tools/cmd/goimports@v0.1.5
-  go install sigs.k8s.io/controller-tools/cmd/controller-gen@v0.14.0
+  go install golang.org/x/tools/cmd/goimports@v0.34.0
+  go install sigs.k8s.io/controller-tools/cmd/controller-gen@v0.17.0
 
   python3 -m venv ${VIRTUAL_ENV:-/opt/venv}
+  source ${VIRTUAL_ENV:-/opt/venv}/bin/activate
   python3 -m pip install --upgrade pip
   python3 -m pip install --no-cache-dir -r ./dev-requirements.txt
 }

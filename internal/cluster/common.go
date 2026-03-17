@@ -37,6 +37,7 @@ const (
 	statusInfoTimeout                         = "cluster installation timed out while pending user action (a manual booting from installation disk)"
 	statusInfoInstallationTimeout             = "cluster installation timeout (%d minutes) has expired"
 	statusInfoAddingHosts                     = "cluster is adding hosts to existing OCP cluster"
+	statusInfoDisconnected                    = "Cluster created for offline installation"
 	statusInfoInstallingPendingUserAction     = "Cluster has hosts pending user action"
 	statusInfoUnpreparingHostExists           = "At least one host has stopped preparing for installation"
 	statusInfoClusterFailedToPrepare          = "Cluster failed to prepare for installation"
@@ -188,21 +189,28 @@ func getKnownMastersNodesIds(c *common.Cluster, db *gorm.DB) ([]*strfmt.UUID, er
 	return masterNodesIds, nil
 }
 
-func HostsInStatus(c *common.Cluster, statuses []string) (int, int) {
+func HostsInStatus(c *common.Cluster, statuses []string) (int, int, int) {
 	mappedMastersByRole := MapMasterHostsByStatus(c)
+	mappedArbitersByRole := MapArbiterHostsByStatus(c)
 	mappedWorkersByRole := MapWorkersHostsByStatus(c)
 	mastersInSomeInstallingStatus := 0
+	arbitersInSomeInstallingStatus := 0
 	workersInSomeInstallingStatus := 0
 
 	for _, status := range statuses {
 		mastersInSomeInstallingStatus += len(mappedMastersByRole[status])
+		arbitersInSomeInstallingStatus += len(mappedArbitersByRole[status])
 		workersInSomeInstallingStatus += len(mappedWorkersByRole[status])
 	}
-	return mastersInSomeInstallingStatus, workersInSomeInstallingStatus
+	return mastersInSomeInstallingStatus, arbitersInSomeInstallingStatus, workersInSomeInstallingStatus
 }
 
 func MapMasterHostsByStatus(c *common.Cluster) map[string][]*models.Host {
 	return mapHostsByStatus(c, models.HostRoleMaster)
+}
+
+func MapArbiterHostsByStatus(c *common.Cluster) map[string][]*models.Host {
+	return mapHostsByStatus(c, models.HostRoleArbiter)
 }
 
 func MapWorkersHostsByStatus(c *common.Cluster) map[string][]*models.Host {

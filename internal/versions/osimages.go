@@ -24,8 +24,8 @@ type OSImages interface {
 
 type osImageList models.OsImages
 
-func NewOSImages(images models.OsImages) (OSImages, error) {
-	if len(images) == 0 {
+func NewOSImages(images models.OsImages, enableImageService bool) (OSImages, error) {
+	if len(images) == 0 && enableImageService {
 		return nil, errors.New("No OS images provided")
 	}
 	for _, osImage := range images {
@@ -46,16 +46,16 @@ func validateOSImage(osImage *models.OsImage) error {
 	}
 
 	if swag.StringValue(osImage.URL) == "" {
-		return errors.Errorf(fmt.Sprintf(missingValueTemplate, "url", *osImage.OpenshiftVersion))
+		return errors.Errorf(missingValueTemplate, "url", *osImage.OpenshiftVersion)
 	}
 	if swag.StringValue(osImage.Version) == "" {
-		return errors.Errorf(fmt.Sprintf(missingValueTemplate, "version", *osImage.OpenshiftVersion))
+		return errors.Errorf(missingValueTemplate, "version", *osImage.OpenshiftVersion)
 	}
 	if osImage.CPUArchitecture == nil {
 		return errors.Errorf("osImage version '%s' CPU architecture is missing", *osImage.OpenshiftVersion)
 	}
 	if err := osImage.Validate(strfmt.Default); err != nil {
-		return errors.Wrapf(err, "osImage version '%s' CPU architecture is not valid", *osImage.OpenshiftVersion)
+		return errors.Wrap(err, fmt.Sprintf("osImage version '%s' CPU architecture is not valid", *osImage.OpenshiftVersion))
 	}
 
 	return nil

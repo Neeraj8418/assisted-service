@@ -13,18 +13,21 @@ aliases:
     - danielerez
     - omertuc
     - eliorerz
-    - paul-maidment
     - jhernand
     - rccrdpccl
     - adriengentil
     - CrystalChun
     - javipolo
     - danmanor
-    - eifrach
     - pastequo
     - mlorenzofr
     - linoyaslan
     - giladravid16
+    - yoavsc0302
+    - cve-automation
+    - omer-vishlitzky
+    - maorfr
+    - bluesort
   emeritus_approvers:
     - empovit
     - yevgeny-shnaidman
@@ -33,4 +36,3 @@ aliases:
     - pawanpinjarkar
     - sagidayan
     - ybettan
-    - omer-vishlitzky

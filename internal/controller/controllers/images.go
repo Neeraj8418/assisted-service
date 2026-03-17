@@ -23,16 +23,12 @@ import (
 )
 
 const (
-	OsImagesEnvVar             string = "OS_IMAGES"
+	OsImagesEnvVar string = "OS_IMAGES"
+	// leaving this here to ensure it's consistent with the previous implementation if/when it is needed for el9/10
 	serviceImageBaseAnnotation string = "agent-install.openshift.io/service-image-base"
-	serviceImageBaseEL8        string = "el8"
 )
 
 func ServiceImage(asc client.Object) string {
-	val, ok := asc.GetAnnotations()[serviceImageBaseAnnotation]
-	if ok && val == serviceImageBaseEL8 {
-		return serviceImageEL8()
-	}
 	return serviceImageDefault()
 }
 
@@ -40,16 +36,12 @@ func serviceImageDefault() string {
 	return getEnvVar("SERVICE_IMAGE", "quay.io/edge-infrastructure/assisted-service:latest")
 }
 
-func serviceImageEL8() string {
-	return getEnvVar("SERVICE_EL8_IMAGE", "quay.io/edge-infrastructure/assisted-service-el8:latest")
-}
-
 func ImageServiceImage() string {
 	return getEnvVar("IMAGE_SERVICE_IMAGE", "quay.io/edge-infrastructure/assisted-image-service:latest")
 }
 
 func DatabaseImage() string {
-	return getEnvVar("DATABASE_IMAGE", "quay.io/sclorg/postgresql-12-c8s:latest")
+	return getEnvVar("DATABASE_IMAGE", "quay.io/sclorg/postgresql-13-c9s:latest")
 }
 
 func AgentImage() string {

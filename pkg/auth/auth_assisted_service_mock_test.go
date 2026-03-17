@@ -81,6 +81,10 @@ func (f fakeInventory) V2RegisterCluster(ctx context.Context, params installer.V
 	return installer.NewV2RegisterClusterCreated()
 }
 
+func (f fakeInventory) V2RegisterDisconnectedCluster(ctx context.Context, params installer.V2RegisterDisconnectedClusterParams) middleware.Responder {
+	return installer.NewV2RegisterDisconnectedClusterCreated()
+}
+
 func (f fakeInventory) V2ImportCluster(ctx context.Context, params installer.V2ImportClusterParams) middleware.Responder {
 	return installer.NewV2ImportClusterCreated()
 }
@@ -248,6 +252,10 @@ func (f fakeInventory) V2GetCredentials(ctx context.Context, params installer.V2
 
 func (f fakeInventory) GetSupportedFeatures(ctx context.Context, params installer.GetSupportedFeaturesParams) middleware.Responder {
 	return installer.NewGetSupportedFeaturesOK()
+}
+
+func (f fakeInventory) GetDetailedSupportedFeatures(ctx context.Context, params installer.GetDetailedSupportedFeaturesParams) middleware.Responder {
+	return installer.NewGetDetailedSupportedFeaturesOK()
 }
 
 func (f fakeInventory) GetSupportedArchitectures(ctx context.Context, params installer.GetSupportedArchitecturesParams) middleware.Responder {

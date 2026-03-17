@@ -2,6 +2,8 @@ package host
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"sort"
 	"time"
 
@@ -93,32 +95,62 @@ func SortHosts(hosts []*models.Host) ([]*models.Host, bool) {
 		}
 	}
 
+	// Separate hosts into GPU and non-GPU lists
+	var hostsWithoutGPU []*models.Host
+	var hostsWithGPU []*models.Host
 	allHostsHasInventory := true
-	sort.SliceStable(hosts, func(i, j int) bool {
-		inventory_i, _ := common.UnmarshalInventory(hosts[i].Inventory)
-		if inventory_i == nil {
+
+	for _, host := range hosts {
+		inventory, _ := common.UnmarshalInventory(host.Inventory)
+		if inventory == nil {
 			allHostsHasInventory = false
-			return false
+			// Hosts without inventory go to non-GPU list (safer default)
+			hostsWithoutGPU = append(hostsWithoutGPU, host)
+			continue
 		}
 
-		inventory_j, _ := common.UnmarshalInventory(hosts[j].Inventory)
-		if inventory_j == nil {
-			allHostsHasInventory = false
-			return true
+		if int64(len(inventory.Gpus)) > 0 {
+			hostsWithGPU = append(hostsWithGPU, host)
+		} else {
+			hostsWithoutGPU = append(hostsWithoutGPU, host)
 		}
+	}
 
-		//(host_cores - 4) + ((host_ram_gb - 16) * 0.1) + ((host_disk_capacity_gb - 100) * 0.004)
-		wi := 1.0*(float64(cpuCount(inventory_i))-HostWeightMinimumCpuCores) +
-			HostWeightMemWeight*(float64(memInGib(inventory_i))-HostWeightMinimumMemGib) +
-			HostWeightDiskWeight*(float64(diskCapacityGiB(inventory_i.Disks))-HostWeightMinimumDiskCapacityGib)
+	sortByWeight := func(hostList []*models.Host) {
+		sort.SliceStable(hostList, func(i, j int) bool {
+			inventory_i, _ := common.UnmarshalInventory(hostList[i].Inventory)
+			inventory_j, _ := common.UnmarshalInventory(hostList[j].Inventory)
 
-		wj := 1.0*(float64(cpuCount(inventory_j))-HostWeightMinimumCpuCores) +
-			HostWeightMemWeight*(float64(memInGib(inventory_j))-HostWeightMinimumMemGib) +
-			HostWeightDiskWeight*(float64(diskCapacityGiB(inventory_j.Disks))-HostWeightMinimumDiskCapacityGib)
+			if inventory_i == nil {
+				return false
+			}
+			if inventory_j == nil {
+				return true
+			}
 
-		return wi < wj
-	})
-	return hosts, allHostsHasInventory
+			//(host_cores - 4) + ((host_ram_gb - 16) * 0.1) + ((host_disk_capacity_gb - 100) * 0.004)
+			wi := 1.0*(float64(cpuCount(inventory_i))-HostWeightMinimumCpuCores) +
+				HostWeightMemWeight*(float64(memInGib(inventory_i))-HostWeightMinimumMemGib) +
+				HostWeightDiskWeight*(float64(diskCapacityGiB(inventory_i.Disks))-HostWeightMinimumDiskCapacityGib)
+
+			wj := 1.0*(float64(cpuCount(inventory_j))-HostWeightMinimumCpuCores) +
+				HostWeightMemWeight*(float64(memInGib(inventory_j))-HostWeightMinimumMemGib) +
+				HostWeightDiskWeight*(float64(diskCapacityGiB(inventory_j.Disks))-HostWeightMinimumDiskCapacityGib)
+
+			return wi < wj
+		})
+	}
+
+	// Sort each list separately
+	sortByWeight(hostsWithoutGPU)
+	sortByWeight(hostsWithGPU)
+
+	// Concatenate: non-GPU hosts first, then GPU hosts
+	result := make([]*models.Host, 0, len(hosts))
+	result = append(result, hostsWithoutGPU...)
+	result = append(result, hostsWithGPU...)
+
+	return result, allHostsHasInventory
 }
 
 func (m *Manager) resetRoleAssignmentIfNotAllRolesAreSet() {
@@ -149,9 +181,13 @@ func (m *Manager) clusterHostMonitoring() {
 		clusters  []*common.Cluster
 		err       error
 	)
-
 	m.resetRoleAssignmentIfNotAllRolesAreSet()
 	query := m.monitorClusterQueryGenerator.NewClusterQuery()
+	cycleStartTime := time.Now()
+	isFullScan := query.IsFullScan()
+	defer func() {
+		m.metricApi.MonitoredHostsCycleDurationMs(ctx, time.Since(cycleStartTime), isFullScan)
+	}()
 	for {
 		if clusters, err = query.Next(); err != nil {
 			m.log.WithError(err).Error("Getting clusters")
@@ -179,10 +215,20 @@ func (m *Manager) clusterHostMonitoring() {
 				startTime := time.Now()
 
 				log.Debug("Started refreshing host status")
-				err = m.refreshStatusInternal(ctx, host, c, nil, inventoryCache, m.db)
+				// Deadline per host refresh to avoid long-running host monitoring
+				hCtx, cancel := context.WithTimeout(ctx, m.Config.MaxHostDisconnectionTime)
+				dbc := m.db.WithContext(hCtx)
+				err = m.refreshStatusInternal(hCtx, host, c, nil, inventoryCache, dbc)
+				if errors.Is(hCtx.Err(), context.DeadlineExceeded) {
+					log.WithField("cluster", c.ID.String()).WithField("host", host.ID.String()).Errorf("host monitoring exceeded deadline %s", m.Config.MaxHostDisconnectionTime)
+					m.eventsHandler.NotifyInternalEvent(ctx, c.ID, host.ID, nil, fmt.Sprintf("host monitor deadline exceeded for host %s in cluster %s", host.ID.String(), c.ID.String()))
+					cancel()
+					continue
+				}
+				cancel()
 
-				duration := float64(time.Since(startTime).Milliseconds())
-				m.metricApi.MonitoredHostsDurationMs(duration)
+				duration := time.Since(startTime)
+				m.metricApi.MonitoredHostsDurationMs(ctx, *host.ID, c.ID, duration)
 				if err != nil {
 					log.WithError(err).Error("failed to refresh host state")
 				}
@@ -244,9 +290,19 @@ func (m *Manager) infraEnvHostMonitoring() {
 				}
 				if funk.ContainsString(monitorStates, swag.StringValue(host.Status)) {
 					startTime := time.Now()
-					err = m.refreshStatusInternal(ctx, &host.Host, nil, i, inventoryCache, m.db)
-					duration := float64(time.Since(startTime).Milliseconds())
-					m.metricApi.MonitoredHostsDurationMs(duration)
+					// Use a per-host deadline to avoid long-running operations
+					hCtx, cancel := context.WithTimeout(ctx, m.Config.MaxHostDisconnectionTime)
+					dbc := m.db.WithContext(hCtx)
+					err = m.refreshStatusInternal(hCtx, &host.Host, nil, i, inventoryCache, dbc)
+					if errors.Is(hCtx.Err(), context.DeadlineExceeded) {
+						m.log.WithField("infraEnv", i.ID.String()).WithField("host", host.ID.String()).Errorf("infra-env host monitoring exceeded deadline %s", m.Config.MaxHostDisconnectionTime)
+						m.eventsHandler.NotifyInternalEvent(ctx, nil, host.ID, i.ID, fmt.Sprintf("infra-env host monitor deadline exceeded for host %s in infra-env %s", host.ID.String(), i.ID.String()))
+						cancel()
+						continue
+					}
+					cancel()
+					duration := time.Since(startTime)
+					m.metricApi.MonitoredHostsDurationMs(ctx, *host.ID, nil, duration)
 					if err != nil {
 						log.WithError(err).Errorf("failed to refresh host %s state", *host.ID)
 					}

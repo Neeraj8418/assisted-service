@@ -29,7 +29,9 @@ import (
 	hiveext "github.com/openshift/assisted-service/api/hiveextension/v1beta1"
 	aiv1beta1 "github.com/openshift/assisted-service/api/v1beta1"
 	"github.com/openshift/assisted-service/internal/controller/controllers"
+	"github.com/openshift/assisted-service/internal/kubernetes"
 	"github.com/openshift/assisted-service/internal/spoke_k8s_client"
+	"github.com/openshift/assisted-service/internal/system"
 	"github.com/openshift/assisted-service/models"
 	hivev1 "github.com/openshift/hive/apis/hive/v1"
 	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
@@ -97,6 +99,15 @@ func validateManagedClusterCRDExists(mgr manager.Manager) error {
 		return err
 	}
 	return nil
+}
+
+func getPodIntrospector(log logrus.FieldLogger, mgr manager.Manager) kubernetes.PodIntrospector {
+	introspector, err := kubernetes.NewKubePodIntrospector(mgr.GetClient())
+	if err != nil {
+		log.WithError(err).Error("failed to create pod introspector, using noop introspector")
+		return kubernetes.NewNoopPodIntrospector()
+	}
+	return introspector
 }
 
 func main() {
@@ -177,7 +188,7 @@ func main() {
 	}
 
 	log := logrus.New()
-	spokeClientFactory, err := spoke_k8s_client.NewFactory(log, nil)
+	spokeClientFactory, err := spoke_k8s_client.NewFactory(log, nil, system.NewLocalSystemInfo())
 	if err != nil {
 		log.WithError(err).Error("failed to create spoke client factory")
 		os.Exit(1)
@@ -194,15 +205,16 @@ func main() {
 		log.WithError(err).Error("failed to check server ")
 		os.Exit(1)
 	}
-
+	introspector := getPodIntrospector(log, mgr)
 	if err = (&controllers.AgentServiceConfigReconciler{
 		AgentServiceConfigReconcileContext: controllers.AgentServiceConfigReconcileContext{
-			Log:          log,
-			Scheme:       mgr.GetScheme(),
-			NodeSelector: nodeSelector,
-			Tolerations:  tolerations,
-			Recorder:     mgr.GetEventRecorderFor("agentserviceconfig-controller"),
-			IsOpenShift:  isOpenShift,
+			Log:             log,
+			Scheme:          mgr.GetScheme(),
+			NodeSelector:    nodeSelector,
+			Tolerations:     tolerations,
+			Recorder:        mgr.GetEventRecorderFor("agentserviceconfig-controller"),
+			PodIntrospector: introspector,
+			IsOpenShift:     isOpenShift,
 		},
 		Client:    mgr.GetClient(),
 		Namespace: ns,

@@ -16,8 +16,8 @@ import (
 
 	clusterPkg "github.com/openshift/assisted-service/internal/cluster"
 	"github.com/openshift/assisted-service/internal/common"
+	ignitioncommon "github.com/openshift/assisted-service/internal/common/ignition"
 	"github.com/openshift/assisted-service/internal/constants"
-	"github.com/openshift/assisted-service/internal/host/hostutil"
 	"github.com/openshift/assisted-service/internal/oc"
 	"github.com/openshift/assisted-service/internal/templating"
 	"github.com/openshift/assisted-service/internal/versions"
@@ -153,6 +153,7 @@ ConditionPathExists=/enoent
 
 const tempNMConnectionsDir = "/etc/assisted/network"
 const mirrorRegistriesConfigKey = "MirrorRegistriesConfig"
+const mirrorRegistriesPolicyConfigKey = "MirrorRegistriesPolicyConfig"
 const mirrorRegistriesCAConfigKey = "MirrorRegistriesCAConfig"
 
 // IgnitionBuilder defines the ignition formatting methods for the various images
@@ -229,18 +230,18 @@ func (ib *ignitionBuilder) shouldAppendOKDFiles(ctx context.Context, infraEnv *c
 	return okdRpmsImage, true
 }
 
-func (ib *ignitionBuilder) setIgnitionMirrorRegistry(ignitionParams map[string]interface{}, configuration *common.MirrorRegistryConfiguration) error {
+func (ib *ignitionBuilder) setIgnitionMirrorRegistry(infraEnv *common.InfraEnv, ignitionParams map[string]interface{}, configuration *common.MirrorRegistryConfiguration) error {
+	hasMirrorConfig := false
 
 	// check if mirror registry is configured in the infra env
 	if common.IsMirrorConfigurationSet(configuration) {
 		ib.log.Debugf("Setting ignition cluster mirror registry to %s", configuration.RegistriesConf)
+		ib.log.Infof("Using mirror registry configuration from InfraEnv %s", infraEnv.ID.String())
 		ignitionParams[mirrorRegistriesConfigKey] = base64.StdEncoding.EncodeToString([]byte(configuration.RegistriesConf))
 		ignitionParams[mirrorRegistriesCAConfigKey] = base64.StdEncoding.EncodeToString([]byte(configuration.CaBundleCrt))
-		return nil
-	}
-
-	// check if mirror registry is configured for the entire env
-	if ib.mirrorRegistriesBuilder.IsMirrorRegistriesConfigured() {
+		hasMirrorConfig = true
+	} else if ib.mirrorRegistriesBuilder.IsMirrorRegistriesConfigured() {
+		// check if mirror registry is configured for the entire env
 		caContents, mirrorsErr := ib.mirrorRegistriesBuilder.GetMirrorCA()
 		if mirrorsErr != nil {
 			ib.log.WithError(mirrorsErr).Errorf("Failed to get the mirror registries CA contents")
@@ -251,9 +252,17 @@ func (ib *ignitionBuilder) setIgnitionMirrorRegistry(ignitionParams map[string]i
 			ib.log.WithError(mirrorsErr).Errorf("Failed to get the mirror registries config contents")
 			return mirrorsErr
 		}
+
 		ignitionParams[mirrorRegistriesConfigKey] = base64.StdEncoding.EncodeToString(registriesContents)
 		ignitionParams[mirrorRegistriesCAConfigKey] = base64.StdEncoding.EncodeToString(caContents)
-		return nil
+		hasMirrorConfig = true
+	}
+
+	if hasMirrorConfig {
+		if encodedPolicy, err := ib.mirrorRegistriesBuilder.GenerateInsecurePolicyJSON(); err == nil && encodedPolicy != "" {
+			ib.log.Infof("Applying insecure image policy override (ForceInsecurePolicy=true) to infraEnv %s", infraEnv.ID.String())
+			ignitionParams[mirrorRegistriesPolicyConfigKey] = encodedPolicy
+		}
 	}
 
 	return nil
@@ -364,7 +373,7 @@ func (ib *ignitionBuilder) FormatDiscoveryIgnitionFile(ctx context.Context, infr
 		return "", err
 	}
 
-	if err = ib.setIgnitionMirrorRegistry(ignitionParams, mirrorRegistryConfiguration); err != nil {
+	if err = ib.setIgnitionMirrorRegistry(infraEnv, ignitionParams, mirrorRegistryConfiguration); err != nil {
 		return "", err
 	}
 
@@ -382,7 +391,7 @@ func (ib *ignitionBuilder) FormatDiscoveryIgnitionFile(ctx context.Context, infr
 
 	res := buf.String()
 	if infraEnv.InternalIgnitionConfigOverride != "" {
-		res, err = MergeIgnitionConfig([]byte(res), []byte(infraEnv.InternalIgnitionConfigOverride))
+		res, err = ignitioncommon.MergeIgnitionConfig([]byte(res), []byte(infraEnv.InternalIgnitionConfigOverride))
 		if err != nil {
 			return "", err
 		}
@@ -390,7 +399,7 @@ func (ib *ignitionBuilder) FormatDiscoveryIgnitionFile(ctx context.Context, infr
 	}
 
 	if infraEnv.IgnitionConfigOverride != "" {
-		res, err = MergeIgnitionConfig([]byte(res), []byte(infraEnv.IgnitionConfigOverride))
+		res, err = ignitioncommon.MergeIgnitionConfig([]byte(res), []byte(infraEnv.IgnitionConfigOverride))
 		if err != nil {
 			return "", err
 		}
@@ -463,7 +472,7 @@ func (ib *ignitionBuilder) FormatSecondDayWorkerIgnitionFile(url string, caCert 
 	overrides := buf.String()
 	if host.IgnitionConfigOverrides != "" {
 		var err error
-		overrides, err = MergeIgnitionConfig(buf.Bytes(), []byte(host.IgnitionConfigOverrides))
+		overrides, err = ignitioncommon.MergeIgnitionConfig(buf.Bytes(), []byte(host.IgnitionConfigOverrides))
 		if err != nil {
 			return []byte(""), errors.Wrapf(err, "Failed to apply ignition override for host %s", host.ID)
 		}
@@ -474,6 +483,11 @@ func (ib *ignitionBuilder) FormatSecondDayWorkerIgnitionFile(url string, caCert 
 	res, err := SetHostnameForNodeIgnition([]byte(overrides), host)
 	if err != nil {
 		return []byte(""), errors.Wrapf(err, "Failed to set hostname in ignition for host %s", host.ID)
+	}
+
+	res, err = AddStateRootCleanupToIgnition(ib.log, res, host)
+	if err != nil {
+		return []byte(""), errors.Wrapf(err, "Failed to add state root cleanup to ignition for host %s", host.ID)
 	}
 
 	ib.log.Debugf("Final ignition for day2 host %s: %s", host.ID, string(res))
@@ -492,26 +506,6 @@ func GetProfileProxyEntries(http_proxy string, https_proxy string, no_proxy stri
 		entries = append(entries, fmt.Sprintf("export NO_PROXY=%[1]s\nexport no_proxy=%[1]s", no_proxy))
 	}
 	return strings.Join(entries, "\n") + "\n"
-}
-
-func SetHostnameForNodeIgnition(ignition []byte, host *models.Host) ([]byte, error) {
-	config, err := ParseToLatest(ignition)
-	if err != nil {
-		return nil, errors.Errorf("error parsing ignition: %v", err)
-	}
-
-	hostname, err := hostutil.GetCurrentHostName(host)
-	if err != nil {
-		return nil, errors.Errorf("failed to get hostname for host %s", host.ID)
-	}
-
-	setFileInIgnition(config, "/etc/hostname", fmt.Sprintf("data:,%s", hostname), false, 420, true)
-
-	configBytes, err := json.Marshal(config)
-	if err != nil {
-		return nil, err
-	}
-	return configBytes, nil
 }
 
 func getUserSSHKey(sshKey string) (string, error) {

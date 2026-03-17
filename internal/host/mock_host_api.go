@@ -326,19 +326,19 @@ func (mr *MockAPIMockRecorder) IsRequireUserActionReset(arg0 interface{}) *gomoc
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "IsRequireUserActionReset", reflect.TypeOf((*MockAPI)(nil).IsRequireUserActionReset), arg0)
 }
 
-// IsValidMasterCandidate mocks base method.
-func (m *MockAPI) IsValidMasterCandidate(arg0 *models.Host, arg1 *common.Cluster, arg2 *gorm.DB, arg3 logrus.FieldLogger, arg4 bool) (bool, error) {
+// IsValidCandidate mocks base method.
+func (m *MockAPI) IsValidCandidate(arg0 *models.Host, arg1 *common.Cluster, arg2 models.HostRole, arg3 *gorm.DB, arg4 logrus.FieldLogger, arg5 bool) (bool, error) {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "IsValidMasterCandidate", arg0, arg1, arg2, arg3, arg4)
+	ret := m.ctrl.Call(m, "IsValidCandidate", arg0, arg1, arg2, arg3, arg4, arg5)
 	ret0, _ := ret[0].(bool)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
 
-// IsValidMasterCandidate indicates an expected call of IsValidMasterCandidate.
-func (mr *MockAPIMockRecorder) IsValidMasterCandidate(arg0, arg1, arg2, arg3, arg4 interface{}) *gomock.Call {
+// IsValidCandidate indicates an expected call of IsValidCandidate.
+func (mr *MockAPIMockRecorder) IsValidCandidate(arg0, arg1, arg2, arg3, arg4, arg5 interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "IsValidMasterCandidate", reflect.TypeOf((*MockAPI)(nil).IsValidMasterCandidate), arg0, arg1, arg2, arg3, arg4)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "IsValidCandidate", reflect.TypeOf((*MockAPI)(nil).IsValidCandidate), arg0, arg1, arg2, arg3, arg4, arg5)
 }
 
 // PermanentHostsDeletion mocks base method.
@@ -577,6 +577,20 @@ func (m *MockAPI) UpdateDomainNameResolution(arg0 context.Context, arg1 *models.
 func (mr *MockAPIMockRecorder) UpdateDomainNameResolution(arg0, arg1, arg2, arg3 interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "UpdateDomainNameResolution", reflect.TypeOf((*MockAPI)(nil).UpdateDomainNameResolution), arg0, arg1, arg2, arg3)
+}
+
+// UpdateFencing mocks base method.
+func (m *MockAPI) UpdateFencing(arg0 context.Context, arg1 *models.Host, arg2 string, arg3 *gorm.DB) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "UpdateFencing", arg0, arg1, arg2, arg3)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// UpdateFencing indicates an expected call of UpdateFencing.
+func (mr *MockAPIMockRecorder) UpdateFencing(arg0, arg1, arg2, arg3 interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "UpdateFencing", reflect.TypeOf((*MockAPI)(nil).UpdateFencing), arg0, arg1, arg2, arg3)
 }
 
 // UpdateHostname mocks base method.

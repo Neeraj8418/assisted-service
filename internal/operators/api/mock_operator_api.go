@@ -53,31 +53,31 @@ func (mr *MockOperatorMockRecorder) GenerateManifests(arg0 interface{}) *gomock.
 }
 
 // GetBundleLabels mocks base method.
-func (m *MockOperator) GetBundleLabels() []string {
+func (m *MockOperator) GetBundleLabels(arg0 []models.FeatureSupportLevelID) []string {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "GetBundleLabels")
+	ret := m.ctrl.Call(m, "GetBundleLabels", arg0)
 	ret0, _ := ret[0].([]string)
 	return ret0
 }
 
 // GetBundleLabels indicates an expected call of GetBundleLabels.
-func (mr *MockOperatorMockRecorder) GetBundleLabels() *gomock.Call {
+func (mr *MockOperatorMockRecorder) GetBundleLabels(arg0 interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetBundleLabels", reflect.TypeOf((*MockOperator)(nil).GetBundleLabels))
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetBundleLabels", reflect.TypeOf((*MockOperator)(nil).GetBundleLabels), arg0)
 }
 
-// GetClusterValidationID mocks base method.
-func (m *MockOperator) GetClusterValidationID() string {
+// GetClusterValidationIDs mocks base method.
+func (m *MockOperator) GetClusterValidationIDs() []string {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "GetClusterValidationID")
-	ret0, _ := ret[0].(string)
+	ret := m.ctrl.Call(m, "GetClusterValidationIDs")
+	ret0, _ := ret[0].([]string)
 	return ret0
 }
 
-// GetClusterValidationID indicates an expected call of GetClusterValidationID.
-func (mr *MockOperatorMockRecorder) GetClusterValidationID() *gomock.Call {
+// GetClusterValidationIDs indicates an expected call of GetClusterValidationIDs.
+func (mr *MockOperatorMockRecorder) GetClusterValidationIDs() *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetClusterValidationID", reflect.TypeOf((*MockOperator)(nil).GetClusterValidationID))
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetClusterValidationIDs", reflect.TypeOf((*MockOperator)(nil).GetClusterValidationIDs))
 }
 
 // GetDependencies mocks base method.
@@ -93,6 +93,20 @@ func (m *MockOperator) GetDependencies(arg0 *common.Cluster) ([]string, error) {
 func (mr *MockOperatorMockRecorder) GetDependencies(arg0 interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetDependencies", reflect.TypeOf((*MockOperator)(nil).GetDependencies), arg0)
+}
+
+// GetDependenciesFeatureSupportID mocks base method.
+func (m *MockOperator) GetDependenciesFeatureSupportID() []models.FeatureSupportLevelID {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetDependenciesFeatureSupportID")
+	ret0, _ := ret[0].([]models.FeatureSupportLevelID)
+	return ret0
+}
+
+// GetDependenciesFeatureSupportID indicates an expected call of GetDependenciesFeatureSupportID.
+func (mr *MockOperatorMockRecorder) GetDependenciesFeatureSupportID() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetDependenciesFeatureSupportID", reflect.TypeOf((*MockOperator)(nil).GetDependenciesFeatureSupportID))
 }
 
 // GetFeatureSupportID mocks base method.
@@ -210,10 +224,10 @@ func (mr *MockOperatorMockRecorder) GetProperties() *gomock.Call {
 }
 
 // ValidateCluster mocks base method.
-func (m *MockOperator) ValidateCluster(arg0 context.Context, arg1 *common.Cluster) (ValidationResult, error) {
+func (m *MockOperator) ValidateCluster(arg0 context.Context, arg1 *common.Cluster) ([]ValidationResult, error) {
 	m.ctrl.T.Helper()
 	ret := m.ctrl.Call(m, "ValidateCluster", arg0, arg1)
-	ret0, _ := ret[0].(ValidationResult)
+	ret0, _ := ret[0].([]ValidationResult)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }

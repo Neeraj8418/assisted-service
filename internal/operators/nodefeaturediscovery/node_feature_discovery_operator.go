@@ -14,6 +14,11 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+const (
+	clusterValidationID = string(models.ClusterValidationIDNodeFeatureDiscoveryRequirementsSatisfied)
+	hostValidationID    = string(models.HostValidationIDNodeFeatureDiscoveryRequirementsSatisfied)
+)
+
 var Operator = models.MonitoredOperator{
 	Namespace:        "openshift-nfd",
 	Name:             "node-feature-discovery",
@@ -21,8 +26,7 @@ var Operator = models.MonitoredOperator{
 	SubscriptionName: "nfd",
 	TimeoutSeconds:   30 * 60,
 	Bundles: pq.StringArray{
-		operatorscommon.BundleOpenShiftAIAMD.ID,
-		operatorscommon.BundleOpenShiftAINVIDIA.ID,
+		operatorscommon.BundleOpenShiftAI.ID,
 	},
 }
 
@@ -65,25 +69,26 @@ func (o *operator) GetDependencies(c *common.Cluster) ([]string, error) {
 	return make([]string, 0), nil
 }
 
-// GetClusterValidationID returns cluster validation ID for the operator.
-func (o *operator) GetClusterValidationID() string {
-	return string(models.ClusterValidationIDNodeFeatureDiscoveryRequirementsSatisfied)
+func (o *operator) GetDependenciesFeatureSupportID() []models.FeatureSupportLevelID {
+	return nil
+}
+
+// GetClusterValidationIDs returns cluster validation IDs for the operator.
+func (o *operator) GetClusterValidationIDs() []string {
+	return []string{clusterValidationID}
 }
 
 // GetHostValidationID returns host validation ID for the operator.
 func (o *operator) GetHostValidationID() string {
-	return string(models.HostValidationIDNodeFeatureDiscoveryRequirementsSatisfied)
+	return hostValidationID
 }
 
 // ValidateCluster checks if the cluster satisfies the requirements to install the operator.
-func (o *operator) ValidateCluster(ctx context.Context, cluster *common.Cluster) (result api.ValidationResult,
-	err error) {
-	result.ValidationId = o.GetClusterValidationID()
-	result = api.ValidationResult{
+func (o *operator) ValidateCluster(ctx context.Context, cluster *common.Cluster) ([]api.ValidationResult, error) {
+	return []api.ValidationResult{{
+		ValidationId: clusterValidationID,
 		Status:       api.Success,
-		ValidationId: o.GetClusterValidationID(),
-	}
-	return
+	}}, nil
 }
 
 // ValidateHost returns validationResult based on node type requirements such as memory and CPU.
@@ -144,6 +149,6 @@ func (o *operator) GetFeatureSupportID() models.FeatureSupportLevelID {
 	return models.FeatureSupportLevelIDNODEFEATUREDISCOVERY
 }
 
-func (o *operator) GetBundleLabels() []string {
+func (o *operator) GetBundleLabels(featureIDs []models.FeatureSupportLevelID) []string {
 	return []string(Operator.Bundles)
 }

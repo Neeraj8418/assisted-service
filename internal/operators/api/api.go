@@ -35,16 +35,18 @@ type Operator interface {
 	GetFullName() string
 	// GetDependencies provides a list of dependencies of the Operator
 	GetDependencies(cluster *common.Cluster) ([]string, error)
+	// GetDependenciesFeatureSupportID provides a list of all feature ids that are potential dependencies
+	GetDependenciesFeatureSupportID() []models.FeatureSupportLevelID
 	// ValidateCluster verifies whether this operator is valid for given cluster
-	ValidateCluster(ctx context.Context, cluster *common.Cluster) (ValidationResult, error)
+	ValidateCluster(ctx context.Context, cluster *common.Cluster) ([]ValidationResult, error)
 	// ValidateHost verifies whether this operator is valid for given host
 	ValidateHost(ctx context.Context, cluster *common.Cluster, hosts *models.Host, additionalOperatorRequirements *models.ClusterHostRequirementsDetails) (ValidationResult, error)
 	// GenerateManifests generates manifests for the operator
 	GenerateManifests(*common.Cluster) (map[string][]byte, []byte, error)
 	// GetHostRequirements provides operator's requirements towards the host
 	GetHostRequirements(ctx context.Context, cluster *common.Cluster, host *models.Host) (*models.ClusterHostRequirementsDetails, error)
-	// GetClusterValidationID returns cluster validation ID for the Operator
-	GetClusterValidationID() string
+	// GetClusterValidationIDs returns cluster validation IDs for the Operator
+	GetClusterValidationIDs() []string
 	// GetHostValidationID returns host validation ID for the Operator
 	GetHostValidationID() string
 	// GetProperties provides description of operator properties
@@ -55,8 +57,8 @@ type Operator interface {
 	GetPreflightRequirements(ctx context.Context, cluster *common.Cluster) (*models.OperatorHardwareRequirements, error)
 	// GetFeatureSupportID returns the operator unique feature-support ID
 	GetFeatureSupportID() models.FeatureSupportLevelID
-	// GetBundleLabels returns the list of bundles names associated with the operator
-	GetBundleLabels() []string
+	// GetBundleLabels returns the list of bundles names associated with the operator based on the given feature IDs
+	GetBundleLabels(featureIDs []models.FeatureSupportLevelID) []string
 }
 
 // Storage Operator provide a generic API for storage operators

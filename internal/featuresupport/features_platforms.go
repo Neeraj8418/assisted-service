@@ -63,12 +63,12 @@ func (feature *BaremetalPlatformFeature) GetName() string {
 	return "Baremetal Platform Integration"
 }
 
-func (feature *BaremetalPlatformFeature) getSupportLevel(filters SupportLevelFilters) models.SupportLevel {
+func (feature *BaremetalPlatformFeature) getSupportLevel(filters SupportLevelFilters) (models.SupportLevel, models.IncompatibilityReason) {
 	if isPlatformSet(filters) {
-		return ""
+		return "", ""
 	}
 
-	return models.SupportLevelSupported
+	return models.SupportLevelSupported, ""
 }
 
 func (feature *BaremetalPlatformFeature) getFeatureActiveLevel(cluster *common.Cluster, _ *models.InfraEnv, clusterUpdateParams *models.V2ClusterUpdateParams, _ *models.InfraEnvUpdateParams) featureActiveLevel {
@@ -79,14 +79,14 @@ func (feature *BaremetalPlatformFeature) getFeatureActiveLevel(cluster *common.C
 	return activeLevelNotActive
 }
 
-func (feature *BaremetalPlatformFeature) getIncompatibleFeatures(string) *[]models.FeatureSupportLevelID {
-	return &[]models.FeatureSupportLevelID{
+func (feature *BaremetalPlatformFeature) getIncompatibleFeatures(string) []models.FeatureSupportLevelID {
+	return []models.FeatureSupportLevelID{
 		models.FeatureSupportLevelIDPLATFORMMANAGEDNETWORKING,
 		models.FeatureSupportLevelIDUSERMANAGEDNETWORKING,
 	}
 }
 
-func (feature *BaremetalPlatformFeature) getIncompatibleArchitectures(_ *string) *[]models.ArchitectureSupportLevelID {
+func (feature *BaremetalPlatformFeature) getIncompatibleArchitectures(_ *string) []models.ArchitectureSupportLevelID {
 	return nil
 }
 
@@ -105,12 +105,12 @@ func (feature *NonePlatformFeature) GetName() string {
 	return "None Platform Integration"
 }
 
-func (feature *NonePlatformFeature) getSupportLevel(filters SupportLevelFilters) models.SupportLevel {
+func (feature *NonePlatformFeature) getSupportLevel(filters SupportLevelFilters) (models.SupportLevel, models.IncompatibilityReason) {
 	if isPlatformSet(filters) {
-		return ""
+		return "", ""
 	}
 
-	return models.SupportLevelSupported
+	return models.SupportLevelSupported, ""
 }
 
 func (feature *NonePlatformFeature) getFeatureActiveLevel(cluster *common.Cluster, _ *models.InfraEnv, clusterUpdateParams *models.V2ClusterUpdateParams, _ *models.InfraEnvUpdateParams) featureActiveLevel {
@@ -121,15 +121,15 @@ func (feature *NonePlatformFeature) getFeatureActiveLevel(cluster *common.Cluste
 	return activeLevelNotActive
 }
 
-func (feature *NonePlatformFeature) getIncompatibleFeatures(string) *[]models.FeatureSupportLevelID {
-	return &[]models.FeatureSupportLevelID{
+func (feature *NonePlatformFeature) getIncompatibleFeatures(string) []models.FeatureSupportLevelID {
+	return []models.FeatureSupportLevelID{
 		models.FeatureSupportLevelIDVIPAUTOALLOC,
 		models.FeatureSupportLevelIDCLUSTERMANAGEDNETWORKING,
 		models.FeatureSupportLevelIDUSERMANAGEDLOADBALANCER,
 	}
 }
 
-func (feature *NonePlatformFeature) getIncompatibleArchitectures(_ *string) *[]models.ArchitectureSupportLevelID {
+func (feature *NonePlatformFeature) getIncompatibleArchitectures(_ *string) []models.ArchitectureSupportLevelID {
 	return nil
 }
 
@@ -148,23 +148,23 @@ func (feature *NutanixIntegrationFeature) GetName() string {
 	return "Nutanix Platform Integration"
 }
 
-func (feature *NutanixIntegrationFeature) getSupportLevel(filters SupportLevelFilters) models.SupportLevel {
+func (feature *NutanixIntegrationFeature) getSupportLevel(filters SupportLevelFilters) (models.SupportLevel, models.IncompatibilityReason) {
 	if isPlatformSet(filters) {
-		return ""
+		return "", ""
 	}
 
 	if !isFeatureCompatibleWithArchitecture(feature, filters.OpenshiftVersion, swag.StringValue(filters.CPUArchitecture)) {
-		return models.SupportLevelUnavailable
+		return models.SupportLevelUnavailable, models.IncompatibilityReasonCPUArchitecture
 	}
 
 	if isNotSupported, err := common.BaseVersionLessThan("4.11", filters.OpenshiftVersion); isNotSupported || err != nil {
-		return models.SupportLevelUnavailable
+		return models.SupportLevelUnavailable, models.IncompatibilityReasonOpenshiftVersion
 	}
 
 	if isEqual, _ := common.BaseVersionEqual("4.11", filters.OpenshiftVersion); isEqual {
-		return models.SupportLevelDevPreview
+		return models.SupportLevelDevPreview, ""
 	}
-	return models.SupportLevelSupported
+	return models.SupportLevelSupported, ""
 }
 
 func (feature *NutanixIntegrationFeature) getFeatureActiveLevel(cluster *common.Cluster, _ *models.InfraEnv, clusterUpdateParams *models.V2ClusterUpdateParams, _ *models.InfraEnvUpdateParams) featureActiveLevel {
@@ -175,9 +175,11 @@ func (feature *NutanixIntegrationFeature) getFeatureActiveLevel(cluster *common.
 	return activeLevelNotActive
 }
 
-func (feature *NutanixIntegrationFeature) getIncompatibleFeatures(string) *[]models.FeatureSupportLevelID {
-	return &[]models.FeatureSupportLevelID{
+func (feature *NutanixIntegrationFeature) getIncompatibleFeatures(string) []models.FeatureSupportLevelID {
+	return []models.FeatureSupportLevelID{
 		models.FeatureSupportLevelIDSNO,
+		models.FeatureSupportLevelIDTNA,
+		models.FeatureSupportLevelIDTNF,
 		models.FeatureSupportLevelIDUSERMANAGEDNETWORKING,
 		models.FeatureSupportLevelIDLVM,
 		models.FeatureSupportLevelIDMCE,
@@ -188,11 +190,12 @@ func (feature *NutanixIntegrationFeature) getIncompatibleFeatures(string) *[]mod
 		models.FeatureSupportLevelIDUSERMANAGEDLOADBALANCER,
 		models.FeatureSupportLevelIDOSC,
 		models.FeatureSupportLevelIDNMSTATE,
+		models.FeatureSupportLevelIDDUALSTACKPRIMARYIPV6,
 	}
 }
 
-func (feature *NutanixIntegrationFeature) getIncompatibleArchitectures(_ *string) *[]models.ArchitectureSupportLevelID {
-	return &[]models.ArchitectureSupportLevelID{
+func (feature *NutanixIntegrationFeature) getIncompatibleArchitectures(_ *string) []models.ArchitectureSupportLevelID {
+	return []models.ArchitectureSupportLevelID{
 		models.ArchitectureSupportLevelIDS390XARCHITECTURE,
 		models.ArchitectureSupportLevelIDPPC64LEARCHITECTURE,
 		models.ArchitectureSupportLevelIDARM64ARCHITECTURE,
@@ -214,16 +217,16 @@ func (feature *VsphereIntegrationFeature) GetName() string {
 	return "vSphere Platform Integration"
 }
 
-func (feature *VsphereIntegrationFeature) getSupportLevel(filters SupportLevelFilters) models.SupportLevel {
+func (feature *VsphereIntegrationFeature) getSupportLevel(filters SupportLevelFilters) (models.SupportLevel, models.IncompatibilityReason) {
 	if isPlatformSet(filters) {
-		return ""
+		return "", ""
 	}
 
 	if !isFeatureCompatibleWithArchitecture(feature, filters.OpenshiftVersion, swag.StringValue(filters.CPUArchitecture)) {
-		return models.SupportLevelUnavailable
+		return models.SupportLevelUnavailable, models.IncompatibilityReasonCPUArchitecture
 	}
 
-	return models.SupportLevelSupported
+	return models.SupportLevelSupported, ""
 }
 
 func (feature *VsphereIntegrationFeature) getFeatureActiveLevel(cluster *common.Cluster, _ *models.InfraEnv, clusterUpdateParams *models.V2ClusterUpdateParams, _ *models.InfraEnvUpdateParams) featureActiveLevel {
@@ -234,26 +237,29 @@ func (feature *VsphereIntegrationFeature) getFeatureActiveLevel(cluster *common.
 	return activeLevelNotActive
 }
 
-func (feature *VsphereIntegrationFeature) getIncompatibleFeatures(openshiftVersion string) *[]models.FeatureSupportLevelID {
+func (feature *VsphereIntegrationFeature) getIncompatibleFeatures(openshiftVersion string) []models.FeatureSupportLevelID {
 	incompatibleFeatures := []models.FeatureSupportLevelID{
 		models.FeatureSupportLevelIDSNO,
+		models.FeatureSupportLevelIDTNA,
+		models.FeatureSupportLevelIDTNF,
 		models.FeatureSupportLevelIDLVM,
 		models.FeatureSupportLevelIDPLATFORMMANAGEDNETWORKING,
 		models.FeatureSupportLevelIDCNV,
 		models.FeatureSupportLevelIDMTV,
 		models.FeatureSupportLevelIDNONSTANDARDHACONTROLPLANE,
 		models.FeatureSupportLevelIDOSC,
+		models.FeatureSupportLevelIDDUALSTACKPRIMARYIPV6,
 	}
 
 	if isNotSupported, err := common.BaseVersionLessThan("4.13", openshiftVersion); isNotSupported || err != nil {
 		incompatibleFeatures = append(incompatibleFeatures, models.FeatureSupportLevelIDDUALSTACK)
 	}
 
-	return &incompatibleFeatures
+	return incompatibleFeatures
 }
 
-func (feature *VsphereIntegrationFeature) getIncompatibleArchitectures(_ *string) *[]models.ArchitectureSupportLevelID {
-	return &[]models.ArchitectureSupportLevelID{
+func (feature *VsphereIntegrationFeature) getIncompatibleArchitectures(_ *string) []models.ArchitectureSupportLevelID {
+	return []models.ArchitectureSupportLevelID{
 		models.ArchitectureSupportLevelIDS390XARCHITECTURE,
 		models.ArchitectureSupportLevelIDPPC64LEARCHITECTURE,
 	}
@@ -274,24 +280,26 @@ func (feature *OciIntegrationFeature) GetName() string {
 	return "Oracle Cloud Infrastructure external platform"
 }
 
-func (feature *OciIntegrationFeature) getSupportLevel(filters SupportLevelFilters) models.SupportLevel {
+func (feature *OciIntegrationFeature) getSupportLevel(filters SupportLevelFilters) (models.SupportLevel, models.IncompatibilityReason) {
 	if isPlatformSet(filters) {
-		return ""
+		return "", ""
 	}
 
 	if !isFeatureCompatibleWithArchitecture(feature, filters.OpenshiftVersion, swag.StringValue(filters.CPUArchitecture)) {
-		return models.SupportLevelUnavailable
+		return models.SupportLevelUnavailable, models.IncompatibilityReasonCPUArchitecture
 	}
 
 	if isSupported, err := common.BaseVersionGreaterOrEqual("4.14", filters.OpenshiftVersion); isSupported || err != nil {
-		return models.SupportLevelSupported
+		return models.SupportLevelSupported, ""
 	}
 
-	return models.SupportLevelUnavailable
+	return models.SupportLevelUnavailable, models.IncompatibilityReasonOpenshiftVersion
 }
 
-func (feature *OciIntegrationFeature) getIncompatibleFeatures(string) *[]models.FeatureSupportLevelID {
-	return &[]models.FeatureSupportLevelID{
+func (feature *OciIntegrationFeature) getIncompatibleFeatures(string) []models.FeatureSupportLevelID {
+	return []models.FeatureSupportLevelID{
+		models.FeatureSupportLevelIDTNA,
+		models.FeatureSupportLevelIDTNF,
 		models.FeatureSupportLevelIDCLUSTERMANAGEDNETWORKING,
 		models.FeatureSupportLevelIDVIPAUTOALLOC,
 		models.FeatureSupportLevelIDDUALSTACKVIPS,
@@ -299,11 +307,14 @@ func (feature *OciIntegrationFeature) getIncompatibleFeatures(string) *[]models.
 		models.FeatureSupportLevelIDNONSTANDARDHACONTROLPLANE,
 		models.FeatureSupportLevelIDUSERMANAGEDLOADBALANCER,
 		models.FeatureSupportLevelIDNMSTATE,
+		models.FeatureSupportLevelIDODF,
+		models.FeatureSupportLevelIDOPENSHIFTAI,
+		models.FeatureSupportLevelIDDUALSTACKPRIMARYIPV6,
 	}
 }
 
-func (feature *OciIntegrationFeature) getIncompatibleArchitectures(_ *string) *[]models.ArchitectureSupportLevelID {
-	return &[]models.ArchitectureSupportLevelID{
+func (feature *OciIntegrationFeature) getIncompatibleArchitectures(_ *string) []models.ArchitectureSupportLevelID {
+	return []models.ArchitectureSupportLevelID{
 		models.ArchitectureSupportLevelIDS390XARCHITECTURE,
 		models.ArchitectureSupportLevelIDPPC64LEARCHITECTURE,
 	}
@@ -332,29 +343,32 @@ func (feature *ExternalPlatformFeature) GetName() string {
 	return "External Platform Integration"
 }
 
-func (feature *ExternalPlatformFeature) getSupportLevel(filters SupportLevelFilters) models.SupportLevel {
+func (feature *ExternalPlatformFeature) getSupportLevel(filters SupportLevelFilters) (models.SupportLevel, models.IncompatibilityReason) {
 	if isPlatformSet(filters) {
-		return ""
+		return "", ""
 	}
 
 	if isNotSupported, err := common.BaseVersionLessThan("4.14", filters.OpenshiftVersion); isNotSupported || err != nil {
-		return models.SupportLevelUnavailable
+		return models.SupportLevelUnavailable, models.IncompatibilityReasonOpenshiftVersion
 	}
 
-	return models.SupportLevelSupported
+	return models.SupportLevelSupported, ""
 }
 
-func (feature *ExternalPlatformFeature) getIncompatibleFeatures(string) *[]models.FeatureSupportLevelID {
-	return &[]models.FeatureSupportLevelID{
+func (feature *ExternalPlatformFeature) getIncompatibleFeatures(string) []models.FeatureSupportLevelID {
+	return []models.FeatureSupportLevelID{
+		models.FeatureSupportLevelIDTNA,
+		models.FeatureSupportLevelIDTNF,
 		models.FeatureSupportLevelIDCLUSTERMANAGEDNETWORKING,
 		models.FeatureSupportLevelIDVIPAUTOALLOC,
 		models.FeatureSupportLevelIDNONSTANDARDHACONTROLPLANE,
 		models.FeatureSupportLevelIDUSERMANAGEDLOADBALANCER,
 		models.FeatureSupportLevelIDNMSTATE,
+		models.FeatureSupportLevelIDDUALSTACKPRIMARYIPV6,
 	}
 }
 
-func (feature *ExternalPlatformFeature) getIncompatibleArchitectures(_ *string) *[]models.ArchitectureSupportLevelID {
+func (feature *ExternalPlatformFeature) getIncompatibleArchitectures(_ *string) []models.ArchitectureSupportLevelID {
 	return nil
 }
 

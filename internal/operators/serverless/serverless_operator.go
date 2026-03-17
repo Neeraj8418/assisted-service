@@ -2,6 +2,7 @@ package serverless
 
 import (
 	"context"
+	"slices"
 	"text/template"
 
 	"github.com/kelseyhightower/envconfig"
@@ -14,6 +15,11 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+const (
+	clusterValidationID = string(models.ClusterValidationIDServerlessRequirementsSatisfied)
+	hostValidationID    = string(models.HostValidationIDServerlessRequirementsSatisfied)
+)
+
 var Operator = models.MonitoredOperator{
 	Namespace:        "openshift-serverless",
 	Name:             "serverless",
@@ -21,8 +27,7 @@ var Operator = models.MonitoredOperator{
 	SubscriptionName: "serverless-operator",
 	TimeoutSeconds:   30 * 60,
 	Bundles: pq.StringArray{
-		operatorscommon.BundleOpenShiftAINVIDIA.ID,
-		operatorscommon.BundleOpenShiftAIAMD.ID,
+		operatorscommon.BundleOpenShiftAI.ID,
 	},
 }
 
@@ -66,25 +71,26 @@ func (o *operator) GetDependencies(c *common.Cluster) ([]string, error) {
 	return result, nil
 }
 
-// GetClusterValidationID returns cluster validation ID for the operator.
-func (o *operator) GetClusterValidationID() string {
-	return string(models.ClusterValidationIDServerlessRequirementsSatisfied)
+func (o *operator) GetDependenciesFeatureSupportID() []models.FeatureSupportLevelID {
+	return nil
+}
+
+// GetClusterValidationIDs returns cluster validation IDs for the operator.
+func (o *operator) GetClusterValidationIDs() []string {
+	return []string{clusterValidationID}
 }
 
 // GetHostValidationID returns host validation ID for the operator.
 func (o *operator) GetHostValidationID() string {
-	return string(models.HostValidationIDServerlessRequirementsSatisfied)
+	return hostValidationID
 }
 
 // ValidateCluster checks if the cluster satisfies the requirements to install the operator.
-func (o *operator) ValidateCluster(ctx context.Context, cluster *common.Cluster) (result api.ValidationResult,
-	err error) {
-	result.ValidationId = o.GetClusterValidationID()
-	result = api.ValidationResult{
+func (o *operator) ValidateCluster(ctx context.Context, cluster *common.Cluster) ([]api.ValidationResult, error) {
+	return []api.ValidationResult{{
+		ValidationId: clusterValidationID,
 		Status:       api.Success,
-		ValidationId: o.GetClusterValidationID(),
-	}
-	return
+	}}, nil
 }
 
 // ValidateHost returns validationResult based on node type requirements such as memory and CPU.
@@ -145,6 +151,12 @@ func (o *operator) GetFeatureSupportID() models.FeatureSupportLevelID {
 	return models.FeatureSupportLevelIDSERVERLESS
 }
 
-func (o *operator) GetBundleLabels() []string {
+func (o *operator) GetBundleLabels(featureIDs []models.FeatureSupportLevelID) []string {
+	// For SNO feature, exclude from openshift-ai bundle
+	if slices.Contains(featureIDs, models.FeatureSupportLevelIDSNO) {
+		return []string{}
+	}
+
+	// For non-SNO deployments, use the default bundle behavior
 	return []string(Operator.Bundles)
 }

@@ -1,6 +1,9 @@
 package mirrorregistries
 
 import (
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
 	"os"
 
 	"github.com/openshift/assisted-service/internal/common"
@@ -13,17 +16,22 @@ type ServiceMirrorRegistriesConfigBuilder interface {
 	GetMirrorCA() ([]byte, error)
 	GetMirrorRegistries() ([]byte, error)
 	ExtractLocationMirrorDataFromRegistries() ([]RegistriesConf, error)
+	GenerateInsecurePolicyJSON() (string, error)
 }
 
 type mirrorRegistriesConfigBuilder struct {
 	MirrorRegistriesConfigPath      string
 	MirrorRegistriesCertificatePath string
+	SystemCertificateBundlePath     string
+	ForceInsecurePolicy             bool
 }
 
-func New() ServiceMirrorRegistriesConfigBuilder {
+func New(forceInsecurePolicy bool) ServiceMirrorRegistriesConfigBuilder {
 	return &mirrorRegistriesConfigBuilder{
 		MirrorRegistriesConfigPath:      common.MirrorRegistriesConfigPath,
 		MirrorRegistriesCertificatePath: common.MirrorRegistriesCertificatePath,
+		SystemCertificateBundlePath:     common.SystemCertificateBundlePath,
+		ForceInsecurePolicy:             forceInsecurePolicy,
 	}
 }
 
@@ -59,7 +67,12 @@ func (m *mirrorRegistriesConfigBuilder) IsMirrorRegistriesConfigured() bool {
 // the mirror registries are not configured.
 // empty dir is due to the way we mao configmap in the assisted-service pod
 func (m *mirrorRegistriesConfigBuilder) GetMirrorCA() ([]byte, error) {
-	return os.ReadFile(m.MirrorRegistriesCertificatePath)
+	bytes, err := os.ReadFile(m.MirrorRegistriesCertificatePath)
+	if err != nil {
+		// fallback to tls-ca-bundle.pem (used by ABI)
+		return os.ReadFile(m.SystemCertificateBundlePath)
+	}
+	return bytes, nil
 }
 
 // GetMirrorRegistries returns error if the file is not present, which will also indicate that
@@ -88,4 +101,31 @@ func ExtractLocationMirrorDataFromRegistriesFromToml(registriesConfToml string) 
 	}
 
 	return registriesConfList, nil
+}
+
+// GenerateInsecurePolicyJSON returns a base64 encoded minimal policy.json that disables signature enforcement
+func (m *mirrorRegistriesConfigBuilder) GenerateInsecurePolicyJSON() (string, error) {
+	if !m.ForceInsecurePolicy {
+		return "", nil
+	}
+
+	policy := map[string]interface{}{
+		"default": []map[string]string{
+			{"type": "insecureAcceptAnything"},
+		},
+		"transports": map[string]interface{}{
+			"docker-daemon": map[string]interface{}{
+				"": []map[string]string{
+					{"type": "insecureAcceptAnything"},
+				},
+			},
+		},
+	}
+
+	data, err := json.MarshalIndent(policy, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal policy.json: %w", err)
+	}
+
+	return base64.StdEncoding.EncodeToString(data), nil
 }

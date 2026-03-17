@@ -42,6 +42,7 @@ import (
 	"github.com/openshift/assisted-service/internal/installercache"
 	internaljson "github.com/openshift/assisted-service/internal/json"
 	"github.com/openshift/assisted-service/internal/manifests"
+	manifestsapi "github.com/openshift/assisted-service/internal/manifests/api"
 	"github.com/openshift/assisted-service/internal/metrics"
 	"github.com/openshift/assisted-service/internal/migrations"
 	"github.com/openshift/assisted-service/internal/network"
@@ -124,9 +125,11 @@ var Options struct {
 	IgnoredOpenshiftVersions             string        `envconfig:"IGNORED_OPENSHIFT_VERSIONS" default:""`
 	ClusterStateMonitorInterval          time.Duration `envconfig:"CLUSTER_MONITOR_INTERVAL" default:"10s"`
 	ClusterEventsUploaderInterval        time.Duration `envconfig:"CLUSTER_EVENTS_UPLOADER_INTERVAL" default:"15m"`
+	EventRateLimits                      string        `envconfig:"EVENT_RATE_LIMITS" default:""`
 	S3Config                             s3wrapper.Config
 	HostStateMonitorInterval             time.Duration `envconfig:"HOST_MONITOR_INTERVAL" default:"8s"`
 	Versions                             versions.Versions
+	EnableImageService                   bool          `envconfig:"ENABLE_IMAGE_SERVICE" default:"true"`
 	OsImages                             string        `envconfig:"OS_IMAGES" default:""`
 	ReleaseImages                        string        `envconfig:"RELEASE_IMAGES" default:""`
 	MustGatherImages                     string        `envconfig:"MUST_GATHER_IMAGES" default:""`
@@ -165,6 +168,7 @@ var Options struct {
 	HTTPListenPort                       string        `envconfig:"HTTP_LISTEN_PORT" default:""`
 	AllowConvergedFlow                   bool          `envconfig:"ALLOW_CONVERGED_FLOW" default:"true"`
 	PauseProvisionedBMHs                 bool          `envconfig:"PAUSE_PROVISIONED_BMHS" default:"true"`
+	ForceInsecurePolicyJson              bool          `envconfig:"FORCE_INSECURE_POLICY_JSON" default:"false"`
 	PreprovisioningImageControllerConfig controllers.PreprovisioningImageControllerConfig
 	BMACConfig                           controllers.BMACConfig
 	InstallerCacheConfig                 installercache.Config
@@ -174,6 +178,12 @@ var Options struct {
 
 	// EnableXattrFallback is a boolean flag to enable en emulated fallback methoid of xattr on systems that do not support xattr.
 	EnableXattrFallback bool `envconfig:"ENABLE_XATTR_FALLBACK" default:"true"`
+
+	// SlowClusterMonitorLogThreshold defines the duration after which clusters that take too long to process will be logged
+	SlowClusterMonitorLogThreshold time.Duration `envconfig:"SLOW_CLUSTER_MONITOR_LOG_THRESHOLD" default:"1s"`
+
+	// SlowHostMonitorLogThreshold defines the duration after which hosts that take too long to process will be logged
+	SlowHostMonitorLogThreshold time.Duration `envconfig:"SLOW_HOST_MONITOR_LOG_THRESHOLD" default:"1s"`
 }
 
 func InitLogs(logLevel, logFormat string) *logrus.Logger {
@@ -240,6 +250,162 @@ func setUpXattrClient(
 	return xattrClient
 }
 
+func getOsImages(log *logrus.Logger) (versions.OSImages, error) {
+
+	var osImagesArray models.OsImages
+	if Options.EnableImageService && Options.OsImages == "" {
+		return nil, errors.New("OS_IMAGES list is empty")
+	}
+	if Options.EnableImageService {
+		err := json.Unmarshal([]byte(Options.OsImages), &osImagesArray)
+		if err != nil {
+			return nil, fmt.Errorf("Failed to parse OS_IMAGES json %s: %w", Options.OsImages, err)
+		}
+	}
+	osImages, err := versions.NewOSImages(osImagesArray, Options.EnableImageService)
+	return osImages, err
+}
+
+// startKubeAPIControllers initializes and starts all controllers for KubeAPI mode
+func startKubeAPIControllers(
+	ctrlMgr manager.Manager,
+	log *logrus.Logger,
+	bm bminventory.InstallerInternals,
+	crdEventsHandler controllers.CRDEventsHandler,
+	osImages versions.OSImages,
+	versionHandler versions.Handler,
+	releaseHandler oc.Release,
+	clusterApi cluster.API,
+	hostApi host.API,
+	manifestsApi manifestsapi.ManifestsAPI,
+	generateInsecureIPXEURLs bool,
+	sys system.SystemInfo,
+) {
+	if !Options.EnableKubeAPI {
+		return
+	}
+
+	failOnError := func(err error, msg string, args ...interface{}) {
+		if err != nil {
+			log.WithError(err).Fatalf(msg, args...)
+		}
+	}
+
+	failOnError(doesBMHCRDExist(ctrlMgr), "BareMetalHost CRD does not exist in cluster")
+	clientConfig := ctrl.GetConfigOrDie()
+	osClient := osclientset.NewForConfigOrDie(clientConfig)
+	kubeClient := kubernetes.NewForConfigOrDie(clientConfig)
+	bmoUtils := controllers.NewBMOUtils(ctrlMgr.GetAPIReader(),
+		osClient,
+		kubeClient,
+		log.WithField("pkg", "baremetal_operator_utils"),
+		Options.EnableKubeAPI,
+	)
+	useConvergedFlow := Options.AllowConvergedFlow && bmoUtils.ConvergedFlowAvailable()
+
+	c := ctrlMgr.GetClient()
+	r := ctrlMgr.GetAPIReader()
+	failOnError((&controllers.InfraEnvReconciler{
+		Client:              c,
+		APIReader:           r,
+		Config:              Options.InfraEnvConfig,
+		Log:                 log,
+		Installer:           bm,
+		CRDEventsHandler:    crdEventsHandler,
+		ServiceBaseURL:      Options.BMConfig.ServiceBaseURL,
+		ImageServiceBaseURL: Options.BMConfig.ImageServiceBaseURL,
+		AuthType:            Options.Auth.AuthType,
+		OsImages:            osImages,
+		PullSecretHandler:   controllers.NewPullSecretHandler(c, r, bm),
+		InsecureIPXEURLs:    generateInsecureIPXEURLs,
+		ImageServiceEnabled: Options.EnableImageService,
+	}).SetupWithManager(ctrlMgr), "unable to create controller InfraEnv")
+
+	spokeClientFactory, err := spoke_k8s_client.NewFactory(log, nil, sys)
+	failOnError(err, "unable to create spoke client factory")
+
+	cluster_client := ctrlMgr.GetClient()
+	cluster_reader := ctrlMgr.GetAPIReader()
+	failOnError((&controllers.ClusterDeploymentsReconciler{
+		Client:                        cluster_client,
+		APIReader:                     cluster_reader,
+		Log:                           log,
+		Scheme:                        ctrlMgr.GetScheme(),
+		Installer:                     bm,
+		ClusterApi:                    clusterApi,
+		HostApi:                       hostApi,
+		CRDEventsHandler:              crdEventsHandler,
+		Manifests:                     manifestsApi,
+		ServiceBaseURL:                Options.BMConfig.ServiceBaseURL,
+		PullSecretHandler:             controllers.NewPullSecretHandler(cluster_client, cluster_reader, bm),
+		AuthType:                      Options.Auth.AuthType,
+		VersionsHandler:               versionHandler,
+		SpokeK8sClientFactory:         spokeClientFactory,
+		MirrorRegistriesConfigBuilder: mirrorregistries.New(Options.ForceInsecurePolicyJson),
+	}).SetupWithManager(ctrlMgr), "unable to create controller ClusterDeployment")
+
+	failOnError((&controllers.AgentReconciler{
+		Client:                     ctrlMgr.GetClient(),
+		APIReader:                  ctrlMgr.GetAPIReader(),
+		Log:                        log,
+		Scheme:                     ctrlMgr.GetScheme(),
+		Installer:                  bm,
+		CRDEventsHandler:           crdEventsHandler,
+		ServiceBaseURL:             Options.BMConfig.ServiceBaseURL,
+		AuthType:                   Options.Auth.AuthType,
+		SpokeK8sClientFactory:      spokeClientFactory,
+		ApproveCsrsRequeueDuration: Options.ApproveCsrsRequeueDuration,
+		AgentContainerImage:        Options.BMConfig.AgentDockerImg,
+		HostFSMountDir:             hostFSMountDir,
+		ImageServiceEnabled:        Options.EnableImageService,
+	}).SetupWithManager(ctrlMgr), "unable to create controller Agent")
+
+	if Options.EnableImageService {
+		failOnError((&controllers.BMACReconciler{
+			Client:                ctrlMgr.GetClient(),
+			APIReader:             ctrlMgr.GetAPIReader(),
+			Log:                   log,
+			Scheme:                ctrlMgr.GetScheme(),
+			Installer:             bm,
+			SpokeK8sClientFactory: spokeClientFactory,
+			ConvergedFlowEnabled:  useConvergedFlow,
+			PauseProvisionedBMHs:  Options.PauseProvisionedBMHs,
+			Drainer:               &controllers.KubectlDrainer{},
+			Config:                &Options.BMACConfig,
+		}).SetupWithManager(ctrlMgr), "unable to create controller BMH")
+	}
+	failOnError((&controllers.AgentClusterInstallReconciler{
+		Client:           ctrlMgr.GetClient(),
+		Log:              log,
+		CRDEventsHandler: crdEventsHandler,
+	}).SetupWithManager(ctrlMgr), "unable to create controller AgentClusterInstall")
+
+	failOnError((&controllers.AgentClassificationReconciler{
+		Client: ctrlMgr.GetClient(),
+		Log:    log,
+	}).SetupWithManager(ctrlMgr), "unable to create controller AgentClassification")
+
+	failOnError((&controllers.AgentLabelReconciler{
+		Client: ctrlMgr.GetClient(),
+		Log:    log,
+	}).SetupWithManager(ctrlMgr), "unable to create controller AgentLabel")
+
+	if Options.EnableImageService && useConvergedFlow {
+		failOnError((&controllers.PreprovisioningImageReconciler{
+			Client:           ctrlMgr.GetClient(),
+			Log:              log,
+			Installer:        bm,
+			CRDEventsHandler: crdEventsHandler,
+			VersionsHandler:  versionHandler,
+			OcRelease:        releaseHandler,
+			Config:           Options.PreprovisioningImageControllerConfig,
+			BMOUtils:         bmoUtils,
+		}).SetupWithManager(ctrlMgr), "failed to create PreprovisioningImage ceontroller")
+	}
+	log.Infof("Starting controllers")
+	failOnError(ctrlMgr.Start(ctrl.SetupSignalHandler()), "failed to run manager")
+}
+
 func main() {
 	err := envconfig.Process(common.EnvConfigPrefix, &Options)
 	if err == nil {
@@ -263,17 +429,11 @@ func main() {
 
 	log.Println("Starting bm service")
 
-	if Options.BMConfig.ImageServiceBaseURL == "" {
+	if Options.EnableImageService && Options.BMConfig.ImageServiceBaseURL == "" {
 		log.Fatal("IMAGE_SERVICE_BASE_URL is required")
 	}
 
-	var osImagesArray models.OsImages
-	if Options.OsImages == "" {
-		log.Fatal("OS_IMAGES list is empty")
-	}
-	failOnError(json.Unmarshal([]byte(Options.OsImages), &osImagesArray),
-		"Failed to parse OS_IMAGES json %s", Options.OsImages)
-	osImages, err := versions.NewOSImages(osImagesArray)
+	osImages, err := getOsImages(log)
 	failOnError(err, "Failed to initialize OSImages")
 
 	var releaseImagesArray = models.ReleaseImages{}
@@ -288,10 +448,11 @@ func main() {
 	var ignoredOpenshiftVersions = []string{}
 	versions.ParseIgnoredOpenshiftVersions(&ignoredOpenshiftVersions, Options.IgnoredOpenshiftVersions, failOnError)
 
+	err = events.InitializeEventLimits(Options.EventRateLimits, log)
+	failOnError(err, "Failed to initialize event rate limits")
+
 	log.Println(fmt.Sprintf("Started service with OS Images %v, Release Images %v, Release Sources %v, Ignored OpenShift Versions %v",
 		Options.OsImages, Options.ReleaseImages, Options.ReleaseSourcesConfig.ReleaseSources, Options.IgnoredOpenshiftVersions))
-
-	failOnError(os.MkdirAll(Options.BMConfig.ISOCacheDir, 0700), "Failed to create ISO cache directory %s", Options.BMConfig.ISOCacheDir)
 
 	// Connect to db
 	db := setupDB(log)
@@ -316,7 +477,11 @@ func main() {
 	prometheusRegistry := prometheus.DefaultRegisterer
 	metricsManagerConfig := &metrics.MetricsManagerConfig{
 		DirectoryUsageMonitorConfig: metrics.DirectoryUsageMonitorConfig{
-			Directories: []string{Options.WorkDir}}}
+			Directories: []string{Options.WorkDir},
+		},
+		ClusterMonitorSlowLogThreshold: Options.SlowClusterMonitorLogThreshold,
+		HostMonitorSlowLogThreshold:    Options.SlowHostMonitorLogThreshold,
+	}
 	diskStatsHelper := metrics.NewOSDiskStatsHelper(log)
 	metricsManager := metrics.NewMetricsManager(prometheusRegistry, eventsHandler, diskStatsHelper, metricsManagerConfig, log)
 	if ocmClient != nil {
@@ -340,12 +505,13 @@ func main() {
 	var k8sClient *kubernetes.Clientset
 	var startupLeader leader.ElectorInterface
 
-	mirrorRegistriesBuilder := mirrorregistries.New()
+	mirrorRegistriesBuilder := mirrorregistries.New(Options.ForceInsecurePolicyJson)
+	sys := system.NewLocalSystemInfo()
 	releaseHandler := oc.NewRelease(
 		&executer.CommonExecuter{},
 		oc.Config{MaxTries: oc.DefaultTries, RetryDelay: oc.DefaltRetryDelay},
 		mirrorRegistriesBuilder,
-		system.NewLocalSystemInfo(),
+		sys,
 	)
 
 	versionHandler, versionsAPIHandler, err := createVersionHandlers(
@@ -458,7 +624,7 @@ func main() {
 	manifestsGenerator := network.NewManifestsGenerator(manifestsApi, Options.ManifestsGeneratorConfig, db)
 	clusterApi := cluster.NewManager(Options.ClusterConfig, log.WithField("pkg", "cluster-state"), db,
 		notificationStream, eventsHandler, uploadClient, hostApi, metricsManager, manifestsGenerator, lead, operatorsManager,
-		ocmClient, objectHandler, dnsApi, authHandler, manifestsApi, Options.EnableSoftTimeouts)
+		ocmClient, objectHandler, dnsApi, authHandler, manifestsApi, Options.EnableSoftTimeouts, usageManager)
 	infraEnvApi := infraenv.NewManager(log.WithField("pkg", "host-state"), db, objectHandler)
 
 	clusterEventsUploader := thread.New(
@@ -548,10 +714,19 @@ func main() {
 	serverInfo := servers.New(Options.HTTPListenPort, swag.StringValue(port), Options.HTTPSKeyFile, Options.HTTPSCertFile)
 	generateInsecureIPXEURLs := serverInfo.HTTP != nil
 
+	disconnectedIgnitionGenerator := ignition.NewDisconnectedIgnitionGenerator(
+		&executer.CommonExecuter{},
+		mirrorRegistriesBuilder,
+		installerCache,
+		versionHandler,
+		log.WithField("pkg", "DisconnectedIgnition"),
+		Options.GeneratorConfig.GetWorkingDirectory(),
+	)
+
 	bm := bminventory.NewBareMetalInventory(db, notificationStream, log.WithField("pkg", "Inventory"), hostApi, clusterApi, infraEnvApi, Options.BMConfig,
 		generator, eventsHandler, objectHandler, metricsManager, usageManager, operatorsManager, authHandler, authzHandler, ocpClient, ocmClient,
 		lead, pullSecretValidator, versionHandler, osImages, crdUtils, ignitionBuilder, hwValidator, dnsApi, installConfigBuilder, staticNetworkConfig,
-		Options.GCConfig, providerRegistry, generateInsecureIPXEURLs, Options.GeneratorConfig.InstallInvoker)
+		Options.GCConfig, providerRegistry, generateInsecureIPXEURLs, Options.GeneratorConfig.InstallInvoker, disconnectedIgnitionGenerator)
 	events := events.NewApi(eventsHandler, logrus.WithField("pkg", "eventsApi"))
 
 	//Set inner handler chain. Inner handlers requires access to the Route
@@ -609,125 +784,20 @@ func main() {
 		go startPPROF(log)
 	}
 
-	go func() {
-		if Options.EnableKubeAPI {
-			failOnError(doesBMHCRDExist(ctrlMgr), "BareMetalHost CRD does not exist in cluster")
-			clientConfig := ctrl.GetConfigOrDie()
-			osClient := osclientset.NewForConfigOrDie(clientConfig)
-			kubeClient := kubernetes.NewForConfigOrDie(clientConfig)
-			bmoUtils := controllers.NewBMOUtils(ctrlMgr.GetAPIReader(),
-				osClient,
-				kubeClient,
-				log.WithField("pkg", "baremetal_operator_utils"),
-				Options.EnableKubeAPI)
-			useConvergedFlow := Options.AllowConvergedFlow && bmoUtils.ConvergedFlowAvailable()
-
-			c := ctrlMgr.GetClient()
-			r := ctrlMgr.GetAPIReader()
-			failOnError((&controllers.InfraEnvReconciler{
-				Client:              c,
-				APIReader:           r,
-				Config:              Options.InfraEnvConfig,
-				Log:                 log,
-				Installer:           bm,
-				CRDEventsHandler:    crdEventsHandler,
-				ServiceBaseURL:      Options.BMConfig.ServiceBaseURL,
-				ImageServiceBaseURL: Options.BMConfig.ImageServiceBaseURL,
-				AuthType:            Options.Auth.AuthType,
-				OsImages:            osImages,
-				PullSecretHandler:   controllers.NewPullSecretHandler(c, r, bm),
-				InsecureIPXEURLs:    generateInsecureIPXEURLs,
-			}).SetupWithManager(ctrlMgr), "unable to create controller InfraEnv")
-
-			spokeClientFactory, err := spoke_k8s_client.NewFactory(log, nil)
-			failOnError(err, "unable to create spoke client factory")
-
-			cluster_client := ctrlMgr.GetClient()
-			cluster_reader := ctrlMgr.GetAPIReader()
-			failOnError((&controllers.ClusterDeploymentsReconciler{
-				Client:                        cluster_client,
-				APIReader:                     cluster_reader,
-				Log:                           log,
-				Scheme:                        ctrlMgr.GetScheme(),
-				Installer:                     bm,
-				ClusterApi:                    clusterApi,
-				HostApi:                       hostApi,
-				CRDEventsHandler:              crdEventsHandler,
-				Manifests:                     manifestsApi,
-				ServiceBaseURL:                Options.BMConfig.ServiceBaseURL,
-				PullSecretHandler:             controllers.NewPullSecretHandler(cluster_client, cluster_reader, bm),
-				AuthType:                      Options.Auth.AuthType,
-				VersionsHandler:               versionHandler,
-				SpokeK8sClientFactory:         spokeClientFactory,
-				MirrorRegistriesConfigBuilder: mirrorregistries.New(),
-			}).SetupWithManager(ctrlMgr), "unable to create controller ClusterDeployment")
-
-			failOnError((&controllers.AgentReconciler{
-				Client:                     ctrlMgr.GetClient(),
-				APIReader:                  ctrlMgr.GetAPIReader(),
-				Log:                        log,
-				Scheme:                     ctrlMgr.GetScheme(),
-				Installer:                  bm,
-				CRDEventsHandler:           crdEventsHandler,
-				ServiceBaseURL:             Options.BMConfig.ServiceBaseURL,
-				AuthType:                   Options.Auth.AuthType,
-				SpokeK8sClientFactory:      spokeClientFactory,
-				ApproveCsrsRequeueDuration: Options.ApproveCsrsRequeueDuration,
-				AgentContainerImage:        Options.BMConfig.AgentDockerImg,
-				HostFSMountDir:             hostFSMountDir,
-			}).SetupWithManager(ctrlMgr), "unable to create controller Agent")
-
-			failOnError((&controllers.BMACReconciler{
-				Client:                ctrlMgr.GetClient(),
-				APIReader:             ctrlMgr.GetAPIReader(),
-				Log:                   log,
-				Scheme:                ctrlMgr.GetScheme(),
-				Installer:             bm,
-				SpokeK8sClientFactory: spokeClientFactory,
-				ConvergedFlowEnabled:  useConvergedFlow,
-				PauseProvisionedBMHs:  Options.PauseProvisionedBMHs,
-				Drainer:               &controllers.KubectlDrainer{},
-				Config:                &Options.BMACConfig,
-			}).SetupWithManager(ctrlMgr), "unable to create controller BMH")
-
-			failOnError((&controllers.AgentClusterInstallReconciler{
-				Client:           ctrlMgr.GetClient(),
-				Log:              log,
-				CRDEventsHandler: crdEventsHandler,
-			}).SetupWithManager(ctrlMgr), "unable to create controller AgentClusterInstall")
-
-			failOnError((&controllers.AgentClassificationReconciler{
-				Client: ctrlMgr.GetClient(),
-				Log:    log,
-			}).SetupWithManager(ctrlMgr), "unable to create controller AgentClassification")
-
-			failOnError((&controllers.AgentLabelReconciler{
-				Client: ctrlMgr.GetClient(),
-				Log:    log,
-			}).SetupWithManager(ctrlMgr), "unable to create controller AgentLabel")
-
-			if useConvergedFlow {
-				failOnError((&controllers.PreprovisioningImageReconciler{
-					Client:           ctrlMgr.GetClient(),
-					Log:              log,
-					Installer:        bm,
-					CRDEventsHandler: crdEventsHandler,
-					VersionsHandler:  versionHandler,
-					OcRelease:        releaseHandler,
-					Config:           Options.PreprovisioningImageControllerConfig,
-					BMOUtils:         bmoUtils,
-				}).SetupWithManager(ctrlMgr), "failed to create PreprovisioningImage ceontroller")
-			}
-			log.Infof("Starting controllers")
-			failOnError(ctrlMgr.Start(ctrl.SetupSignalHandler()), "failed to run manager")
-		}
-	}()
+	go startKubeAPIControllers(ctrlMgr, log, bm, crdEventsHandler, osImages, versionHandler, releaseHandler, clusterApi, hostApi, manifestsApi, generateInsecureIPXEURLs, sys)
 
 	// Interrupt servers on SIGINT/SIGTERM
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
 
-	// Run listen on http and https ports if iPXE artifacts need to be exposed via HTTP
+	setupServerForIPXE(serverInfo, h)
+	serverInfo.ListenAndServe()
+	<-stop
+	serverInfo.Shutdown()
+}
+
+// Run listen on http and https ports if iPXE artifacts need to be exposed via HTTP
+func setupServerForIPXE(serverInfo *servers.ServerInfo, h http.Handler) {
 	if serverInfo.HasBothHandlers {
 		h = app.WithIPXEScriptMiddleware(h)
 	}
@@ -737,9 +807,6 @@ func main() {
 	if serverInfo.HTTPS != nil {
 		serverInfo.HTTPS.Handler = h
 	}
-	serverInfo.ListenAndServe()
-	<-stop
-	serverInfo.Shutdown()
 }
 
 func setupDB(log logrus.FieldLogger) *gorm.DB {

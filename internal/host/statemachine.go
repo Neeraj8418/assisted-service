@@ -127,13 +127,25 @@ func NewHostStateMachine(sm stateswitch.StateMachine, th TransitionHandler) stat
 	sm.AddTransitionRule(stateswitch.TransitionRule{
 		TransitionType: TransitionTypeRegisterHost,
 		SourceStates: []stateswitch.State{
+			stateswitch.State(models.HostStatusPreparingForInstallation),
+			stateswitch.State(models.HostStatusPreparingSuccessful),
+		},
+		DestinationState: stateswitch.State(models.HostStatusKnown),
+		PostTransition:   th.PostRegisterDuringPreparingForInstallation,
+		Documentation: stateswitch.TransitionRuleDoc{
+			Name:        "Re-registration during preparation",
+			Description: "When a host re-registers during preparing-for-installation, we preserve inventory and bootstrap flag, reset to 'known' status, and reset LastInstallationPreparation to allow state machine re-evaluation",
+		},
+	})
+
+	sm.AddTransitionRule(stateswitch.TransitionRule{
+		TransitionType: TransitionTypeRegisterHost,
+		SourceStates: []stateswitch.State{
 			stateswitch.State(models.HostStatusDiscovering),
 			stateswitch.State(models.HostStatusKnown),
 			stateswitch.State(models.HostStatusDisconnected),
 			stateswitch.State(models.HostStatusInsufficient),
 			stateswitch.State(models.HostStatusResettingPendingUserAction),
-			stateswitch.State(models.HostStatusPreparingForInstallation),
-			stateswitch.State(models.HostStatusPreparingSuccessful),
 			stateswitch.State(models.HostStatusBinding),
 			stateswitch.State(models.HostStatusPendingForInput),
 		},
@@ -347,6 +359,12 @@ func NewHostStateMachine(sm stateswitch.StateMachine, th TransitionHandler) stat
 	sm.AddTransitionRule(stateswitch.TransitionRule{
 		TransitionType: TransitionTypeUnbindHost,
 		SourceStates: []stateswitch.State{
+			stateswitch.State(models.HostStatusPreparingForInstallation),
+			stateswitch.State(models.HostStatusPreparingSuccessful),
+			stateswitch.State(models.HostStatusPreparingFailed),
+			stateswitch.State(models.HostStatusInstalling),
+			stateswitch.State(models.HostStatusInstallingInProgress),
+			stateswitch.State(models.HostStatusInstallingPendingUserAction),
 			stateswitch.State(models.HostStatusInstalled),
 			stateswitch.State(models.HostStatusAddedToExistingCluster),
 			stateswitch.State(models.HostStatusError),
@@ -789,20 +807,20 @@ func NewHostStateMachine(sm stateswitch.StateMachine, th TransitionHandler) stat
 	// Host stage timeout transitions.  They handle all stages when cluster is in 'installing-in-progress' status besides
 	// rebooting stage which is handled differently - it moves to installing-pending-user-action
 
-	// Timeout while host installationInProgress and soft timeouts is not enabled for stages other than [writing-image-to-disk, rebooting]
+	// Timeout while host installationInProgress and soft timeouts is not enabled for stages other than [writing-image-to-disk, copying-registry-data-to-disk, rebooting]
 	sm.AddTransitionRule(stateswitch.TransitionRule{
 		TransitionType: TransitionTypeRefresh,
 		SourceStates: []stateswitch.State{
 			stateswitch.State(models.HostStatusInstallingInProgress)},
 		Condition: stateswitch.And(
 			stateswitch.Not(If(SoftTimeoutsEnabled)),
-			stateswitch.Not(IsInStages(models.HostStageWritingImageToDisk, models.HostStageRebooting)),
+			stateswitch.Not(IsInStages(models.HostStageWritingImageToDisk, models.HostStageCopyingRegistryDataToDisk, models.HostStageRebooting)),
 			th.HasInstallationInProgressTimedOut,
 			stateswitch.Not(shouldIgnoreInstallationProgressTimeout)),
 		DestinationState: stateswitch.State(models.HostStatusError),
 		PostTransition:   th.PostRefreshHost(statusInfoInstallationInProgressTimedOut),
 		Documentation: stateswitch.TransitionRuleDoc{
-			Name:        "Move to error on timeout if host is in particular installation in progress stages other than [writing-image-to-disk, rebooting]",
+			Name:        "Move to error on timeout if host is in particular installation in progress stages other than [writing-image-to-disk, copying-registry-data-to-disk, rebooting]",
 			Description: "The transition is triggered when soft timeouts is not enabled which means that timeout expiration causes a host to move to error",
 		},
 	})
@@ -825,7 +843,25 @@ func NewHostStateMachine(sm stateswitch.StateMachine, th TransitionHandler) stat
 		},
 	})
 
-	// Timeout while host installationInProgress and soft timeouts is enabled for stages other than [writing-image-to-disk, rebooting]
+	// Timeout while host installationInProgress and soft timeouts is not enabled for stage copying-registry-data-to-disk.
+	sm.AddTransitionRule(stateswitch.TransitionRule{
+		TransitionType: TransitionTypeRefresh,
+		SourceStates: []stateswitch.State{
+			stateswitch.State(models.HostStatusInstallingInProgress)},
+		Condition: stateswitch.And(
+			stateswitch.Not(If(SoftTimeoutsEnabled)),
+			IsInStages(models.HostStageCopyingRegistryDataToDisk),
+			th.HasInstallationInProgressTimedOut,
+			stateswitch.Not(shouldIgnoreInstallationProgressTimeout)),
+		DestinationState: stateswitch.State(models.HostStatusError),
+		PostTransition:   th.PostRefreshHost(statusInfoInstallationInProgressCopyingRegistryDataToDiskTimedOut),
+		Documentation: stateswitch.TransitionRuleDoc{
+			Name:        "Move to error on timeout if host is in particular installation in progress stage copying-registry-data-to-disk",
+			Description: "The transition is triggered when soft timeouts is not enabled which means that timeout expiration causes a host to move to error",
+		},
+	})
+
+	// Timeout while host installationInProgress and soft timeouts is enabled for stages other than [writing-image-to-disk, copying-registry-data-to-disk, rebooting]
 	sm.AddTransitionRule(stateswitch.TransitionRule{
 		TransitionType: TransitionTypeRefresh,
 		SourceStates: []stateswitch.State{
@@ -833,13 +869,13 @@ func NewHostStateMachine(sm stateswitch.StateMachine, th TransitionHandler) stat
 		Condition: stateswitch.And(
 			If(SoftTimeoutsEnabled),
 			stateswitch.Not(If(HostStageTimedOut)),
-			stateswitch.Not(IsInStages(models.HostStageWritingImageToDisk, models.HostStageRebooting)),
+			stateswitch.Not(IsInStages(models.HostStageWritingImageToDisk, models.HostStageCopyingRegistryDataToDisk, models.HostStageRebooting)),
 			th.HasInstallationInProgressTimedOut,
 			stateswitch.Not(shouldIgnoreInstallationProgressTimeout)),
 		DestinationState: stateswitch.State(models.HostStatusInstallingInProgress),
 		PostTransition:   th.PostHostStageTimeout(statusInfoInstallationInProgressSoftTimedOut),
 		Documentation: stateswitch.TransitionRuleDoc{
-			Name:        "Indicate that timeout occurred and continue installation in particular installation in progress stages other than [writing-image-to-disk, rebooting]",
+			Name:        "Indicate that timeout occurred and continue installation in particular installation in progress stages other than [writing-image-to-disk, copying-registry-data-to-disk, rebooting]",
 			Description: "The transition is triggered when soft timeouts is enabled which means that timeout expiration causes event generation only",
 		},
 	})
@@ -859,6 +895,25 @@ func NewHostStateMachine(sm stateswitch.StateMachine, th TransitionHandler) stat
 		PostTransition:   th.PostHostStageTimeout(statusInfoInstallationInProgressWritingImageToDiskSoftTimedOut),
 		Documentation: stateswitch.TransitionRuleDoc{
 			Name:        "Indicate that timeout occurred and continue installation in particular installation in progress stage writing-image-to-disk",
+			Description: "The transition is triggered when soft timeouts is enabled which means that timeout expiration causes event generation only",
+		},
+	})
+
+	// Timeout while host installationInProgress and soft timeouts is enabled for stage copying-registry-data-to-disk.
+	sm.AddTransitionRule(stateswitch.TransitionRule{
+		TransitionType: TransitionTypeRefresh,
+		SourceStates: []stateswitch.State{
+			stateswitch.State(models.HostStatusInstallingInProgress)},
+		Condition: stateswitch.And(
+			If(SoftTimeoutsEnabled),
+			stateswitch.Not(If(HostStageTimedOut)),
+			IsInStages(models.HostStageCopyingRegistryDataToDisk),
+			th.HasInstallationInProgressTimedOut,
+			stateswitch.Not(shouldIgnoreInstallationProgressTimeout)),
+		DestinationState: stateswitch.State(models.HostStatusInstallingInProgress),
+		PostTransition:   th.PostHostStageTimeout(statusInfoInstallationInProgressCopyingRegistryDataToDiskSoftTimedOut),
+		Documentation: stateswitch.TransitionRuleDoc{
+			Name:        "Indicate that timeout occurred and continue installation in particular installation in progress stage copying-registry-data-to-disk",
 			Description: "The transition is triggered when soft timeouts is enabled which means that timeout expiration causes event generation only",
 		},
 	})
@@ -966,6 +1021,17 @@ func NewHostStateMachine(sm stateswitch.StateMachine, th TransitionHandler) stat
 		If(AreNmstateRequirementsSatisfied),
 		If(AreAMDGPURequirementsSatisfied),
 		If(AreKMMRequirementsSatisfied),
+		If(AreNodeHealthcheckRequirementsSatisfied),
+		If(AreSelfNodeRemediationRequirementsSatisfied),
+		If(AreFenceAgentsRemediationRequirementsSatisfied),
+		If(AreNodeMaintenanceRequirementsSatisfied),
+		If(AreKubeDeschedulerRequirementsSatisfied),
+		If(AreClusterObservabilityRequirementsSatisfied),
+		If(AreNUMAResourcesRequirementsSatisfied),
+		If(AreOADPRequirementsSatisfied),
+		If(AreMetalLBRequirementsSatisfied),
+		If(AreLokiRequirementsSatisfied),
+		If(AreOpenShiftLoggingRequirementsSatisfied),
 		/*
 					 * MGMT-15213: The release domain is not resolved correctly when there is a mirror or proxy.  In this case
 					 * validation might fail, but the installation may succeed.

@@ -390,7 +390,7 @@ paths:
           name: role
           description: Role to request.
           type: string
-          enum: ['master', 'worker', 'auto-assign']
+          enum: ['master', 'arbiter', 'worker', 'auto-assign']
           required: false
         - in: query
           description: Hosts status to request.
@@ -1710,10 +1710,10 @@ paths:
           enum: ['discovery-image-always', 'boot-order-control']
         - in: query
           name: discovery_iso_type
-          description: Overrides the ISO type for the disovery ignition, either 'full-iso' or 'minimal-iso'.
+          description: Overrides the ISO type for the discovery ignition.
           required: false
           type: string
-          enum: ['full-iso', 'minimal-iso']
+          enum: ['full-iso', 'minimal-iso', 'disconnected-iso']
       responses:
         "200":
           description: Success.
@@ -2064,7 +2064,7 @@ paths:
           name: file_name
           description: The file to be downloaded.
           type: string
-          enum: [bootstrap.ign, master.ign, metadata.json, worker.ign, install-config.yaml, custom_manifests.json, custom_manifests.yaml]
+          enum: [bootstrap.ign, master.ign, metadata.json, worker.ign, install-config.yaml, custom_manifests.json, custom_manifests.yaml, arbiter.ign]
           required: true
         - in: header
           name: discovery_agent_version
@@ -2704,21 +2704,34 @@ paths:
             items:
               type: string
               enum:
+              - 'amd-gpu'
               - 'lso'
               - 'mtv'
-              - 'openshift_ai'
+              - 'openshift-ai'
               - 'osc'
               - 'servicemesh'
               - 'authorino'
               - 'cnv'
-              - 'nvidia_gpu'
+              - 'nvidia-gpu'
               - 'pipelines'
               - 'odf'
               - 'lvm'
               - 'mce'
-              - 'node_feature_discovery'
+              - 'node-feature-discovery'
               - 'serverless'
               - 'nmstate'
+              - 'kmm'
+              - 'node-healthcheck'
+              - 'self-node-remediation'
+              - 'fence-agents-remediation'
+              - 'node-maintenance'
+              - 'kube-descheduler'
+              - 'cluster-observability'
+              - 'numa-resources'
+              - 'oadp'
+              - 'metallb'
+              - 'loki'
+              - 'openshift-logging'
         "401":
           description: Unauthorized.
           schema:
@@ -2736,9 +2749,39 @@ paths:
     get:
       tags:
         - operators
-      summary: Get list of avaliable bundles 
-      description: Retrieves a list of avaliable bundles.
+      summary: Get list of available bundles 
+      description: Retrieves a list of available bundles filtered by support level.
       operationId: V2ListBundles
+      parameters:
+        - in: query
+          name: openshift_version
+          type: string
+          description: Version of the OpenShift cluster. If the parameter is not specified, no filtering is applied.
+        - in: query
+          name: cpu_architecture
+          description: The CPU architecture of the image (x86_64/arm64/etc). openshift_version must be set.
+          type: string
+          # TODO: remove arm64 when AI moves to using aarch64
+          enum: [ 'x86_64', 'aarch64', 'arm64','ppc64le','s390x','multi' ]
+          default: x86_64
+        - in: query
+          name: platform_type
+          description: The provider platform type. openshift_version must be set.
+          type: string
+          enum: [ 'baremetal', 'none', 'nutanix', 'vsphere', 'external' ]
+        - in: query
+          name: external_platform_name
+          description: External platform name when platform type is set to external. The value of this parameter will be ignored if platform_type is not external or if openshift_version is not set.
+          type: string
+        - in: query
+          name: feature_ids
+          description: Array of feature IDs that affect bundle composition (e.g., ["SNO"] for Single Node OpenShift).
+          type: array
+          items:
+            type: string
+            enum:
+              - 'SNO'
+          collectionFormat: multi
       responses:
         "200":
           description: Success
@@ -2746,6 +2789,10 @@ paths:
             type: array
             items:
               $ref: '#/definitions/bundle'
+        "400":
+          description: Error.
+          schema:
+            $ref: '#/definitions/error'
         "500":
           description: Internal server error
           schema:
@@ -2756,19 +2803,32 @@ paths:
       tags:
         - operators
       summary: Get operator properties for a bundle
-      description: Retrieves an array of operator properties for the specified bundle.
+      description: Retrieves an array of operator properties for the specified bundle when some features are activated.
       operationId: V2GetBundle
       parameters:
         - in: path
           name: id
-          description: Identifier of the bundle, for example, `virtualization` or `openshift-ai-nvidia`.
+          description: Identifier of the bundle, for example, `virtualization` or `openshift-ai`.
           required: true
           type: string
+        - in: query
+          name: feature_ids
+          description: Array of feature IDs that affect bundle composition (e.g., ["SNO"] for Single Node OpenShift).
+          type: array
+          items:
+            type: string
+            enum:
+              - 'SNO'
+          collectionFormat: multi
       responses:
         "200":
           description: Success
           schema:
             $ref: '#/definitions/bundle'
+        "400":
+          description: Error.
+          schema:
+            $ref: '#/definitions/error'
         "404":
           description: Bundle not found
           schema:
@@ -3362,7 +3422,7 @@ paths:
           description: The log file to be uploaded.
           type: file
           required: false
-          maxLength: 104857600  #100MB
+          maxLength: 262144000  #250MB
           x-mimetype: application/zip
         - in: query
           name: logs_type
@@ -3385,6 +3445,10 @@ paths:
       responses:
         "204":
           description: Success.
+        "400":
+          description: Bad Request
+          schema:
+            $ref: '#/definitions/error'
         "401":
           description: Unauthorized.
           schema:
@@ -3820,6 +3884,67 @@ paths:
           schema:
             $ref: '#/definitions/error'
 
+  /v2/support-levels/features/detailed:
+    get:
+      tags:
+        - installer
+      security:
+        - userAuth: [admin, read-only-admin, user]
+      operationId: GetDetailedSupportedFeatures
+      description: Retrieves detailed features information including support level, incompatibilities, and operator dependencies.
+      parameters:
+        - in: query
+          name: openshift_version
+          type: string
+          description: Version of the OpenShift cluster.
+          required: true
+        - in: query
+          name: cpu_architecture
+          description: The CPU architecture of the image (x86_64/arm64/etc).
+          type: string
+          enum: [ 'x86_64', 'arm64', 'ppc64le', 's390x', 'multi' ]
+          default: x86_64
+        - in: query
+          name: platform_type
+          description: The provider platform type.
+          type: string
+          enum: [ 'baremetal', 'none', 'nutanix', 'vsphere', 'external' ]
+        - in: query
+          name: external_platform_name
+          description: External platform name when platform type is set to external. The value of this parameter will be ignored if platform_type is not external.
+          type: string
+      responses:
+        "200":
+          description: Success.
+          schema:
+            type: object
+            properties:
+              features:
+                type: array
+                items:
+                  $ref: '#/definitions/feature'
+              operators:
+                type: array
+                items:
+                  $ref: '#/definitions/operator'
+        "400":
+          description: Error.
+          schema:
+            $ref: '#/definitions/error'
+        "401":
+          description: Unauthorized.
+          schema:
+            $ref: '#/definitions/infra_error'
+        "403":
+          description: Forbidden.
+          schema:
+            $ref: '#/definitions/infra_error'
+        "500":
+          description: Internal Server Error.
+          schema:
+            $ref: '#/definitions/error'
+
+
   /v2/support-levels/architectures:
     get:
       tags:
@@ -3877,6 +4002,40 @@ paths:
           required: true
           schema:
             $ref: '#/definitions/import-cluster-params'
+      responses:
+        "201":
+          description: Success.
+          schema:
+            $ref: '#/definitions/cluster'
+        "400":
+          description: Error.
+          schema:
+            $ref: '#/definitions/error'
+        "401":
+          description: Unauthorized.
+          schema:
+            $ref: '#/definitions/infra_error'
+        "403":
+          description: Forbidden.
+          schema:
+            $ref: '#/definitions/infra_error'
+        "500":
+          description: Error.
+          schema:
+            $ref: '#/definitions/error'
+  /v2/clusters/disconnected:
+    post:
+      tags:
+        - installer
+      description: Create a disconnected OpenShift cluster for offline installation with embedded ignition
+      operationId: v2RegisterDisconnectedCluster
+      parameters:
+        - in: body
+          name: new-cluster-params
+          description: Parameters for creating a disconnected cluster.
+          required: true
+          schema:
+            $ref: '#/definitions/disconnected-cluster-create-params'
       responses:
         "201":
           description: Success.
@@ -4115,6 +4274,9 @@ definitions:
             package: github.com/lib/pq
           hints:
             noValidation: true
+      dependency_only:
+        type: boolean
+        description: Whether the operator can't be installed without being required by another operator.
 
   operator-monitor-report:
     type: object
@@ -4217,12 +4379,16 @@ definitions:
 
   support-level:
     type: string
+    x-nullable: false
     enum: [ supported, unsupported, tech-preview, dev-preview, unavailable ]
 
   feature-support-level-id:
     type: string
+    x-nullable: false
     enum:
       - 'SNO'
+      - 'TNA'
+      - 'TNF'
       - 'VIP_AUTO_ALLOC'
       - 'CUSTOM_MANIFEST'
       - 'SINGLE_NODE_EXPANSION'
@@ -4245,10 +4411,13 @@ definitions:
       - 'EXTERNAL_PLATFORM_OCI'
       - 'DUAL_STACK'
       - 'PLATFORM_MANAGED_NETWORKING'
-      - 'SKIP_MCO_REBOOT'
       - 'EXTERNAL_PLATFORM'
       - 'OVN_NETWORK_TYPE'
       - 'SDN_NETWORK_TYPE'
+      - 'CILIUM_NETWORK_TYPE'
+      - 'CALICO_NETWORK_TYPE'
+      - 'CISCO_ACI_NETWORK_TYPE'
+      - 'NONE_NETWORK_TYPE'
       - 'NODE_FEATURE_DISCOVERY'
       - 'NVIDIA_GPU'
       - 'PIPELINES'
@@ -4261,6 +4430,18 @@ definitions:
       - 'NMSTATE'
       - 'AMD_GPU'
       - 'KMM'
+      - 'NODE_HEALTHCHECK'
+      - 'SELF_NODE_REMEDIATION'
+      - 'FENCE_AGENTS_REMEDIATION'
+      - 'NODE_MAINTENANCE'
+      - 'KUBE_DESCHEDULER'
+      - 'CLUSTER_OBSERVABILITY'
+      - 'NUMA_RESOURCES'
+      - 'OADP'
+      - 'METALLB'
+      - 'DUAL_STACK_PRIMARY_IPV6'
+      - 'LOKI'
+      - 'OPENSHIFT_LOGGING'
 
   architecture-support-level-id:
     type: string
@@ -4271,6 +4452,58 @@ definitions:
       - 'S390X_ARCHITECTURE'
       - 'MULTIARCH_RELEASE_IMAGE'
 
+  feature:
+    type: object
+    properties:
+      feature-support-level-id:
+        $ref: '#/definitions/feature-support-level-id'
+      support_level:
+        $ref: '#/definitions/support-level'
+      reason:
+        $ref: '#/definitions/incompatibility-reason'
+      incompatibilities:
+        type: array
+        items:
+          $ref: '#/definitions/feature-support-level-id'
+    required:
+      - feature-support-level-id
+      - support_level
+      - incompatibilities
+
+  operator:
+    type: object
+    properties:
+      feature-support-level-id:
+        $ref: '#/definitions/feature-support-level-id'
+      support_level:
+        $ref: '#/definitions/support-level'
+      reason:
+        $ref: '#/definitions/incompatibility-reason'
+      incompatibilities:
+        type: array
+        items:
+          $ref: '#/definitions/feature-support-level-id'
+      name:
+        type: string
+        description: Name of the operator
+      dependencies:
+        type: array
+        items:
+          $ref: '#/definitions/feature-support-level-id'
+    required:
+      - feature-support-level-id
+      - support_level
+      - incompatibilities
+      - name
+      - dependencies
+
+  incompatibility-reason:
+    type: string
+    enum:
+      - cpuArchitecture
+      - platform
+      - openshiftVersion
+      - ociExternalIntegrationDisabled
 
   preflight-hardware-requirements:
     type: object
@@ -4394,6 +4627,10 @@ definitions:
         x-go-name: MasterRequirements
         $ref: '#/definitions/cluster-host-requirements-details'
         description: Master node requirements
+      arbiter:
+        x-go-name: ArbiterRequirements
+        $ref: '#/definitions/cluster-host-requirements-details'
+        description: Arbiter node requirements
       worker:
         x-go-name: WorkerRequirements
         $ref: '#/definitions/cluster-host-requirements-details'
@@ -4750,6 +4987,11 @@ definitions:
         description: |-
           A comma-seperated list of host disks that the service will avoid
           formatting.
+      fencing_credentials:
+        x-go-custom-tag: gorm:"type:text"
+        type: string
+        description: The host's BMC credentials that will be used in TNF.
+
   installer-args-params:
     type: object
     properties:
@@ -4965,13 +5207,22 @@ definitions:
           $ref: '#/definitions/operator-create-params'
       hyperthreading:
         type: string
-        description: Enable/disable hyperthreading on master nodes, worker nodes, or all nodes.
-        enum: ['masters', 'workers', 'none', 'all']
+        description: Enable/disable hyperthreading on master nodes, arbiter nodes, worker nodes, or a combination of them.
+        enum: ['none', 'masters', 'arbiters', 'workers', 'masters,arbiters', 'masters,workers', 'arbiters,workers', 'masters,arbiters,workers', 'all']
         default: 'all'
       network_type:
         type: string
-        description: "The desired network type used."
-        enum: ['OpenShiftSDN', 'OVNKubernetes']
+        description: |
+          The desired network type used.
+          - OVNKubernetes: Default CNI for OpenShift (recommended)
+          - OpenShiftSDN: Legacy SDN (deprecated in newer versions)
+          - CiscoACI: Cisco ACI CNI (requires custom manifests)
+          - Cilium: Isovalent Cilium CNI (requires custom manifests)
+          - Calico: Tigera Calico CNI (requires custom manifests)
+          - None: No CNI - user must provide custom CNI manifests
+          Note: Third-party CNIs (CiscoACI, Cilium, Calico, None) require uploading
+          CNI manifests via the custom manifests API before installation.
+        enum: ['OpenShiftSDN', 'OVNKubernetes', 'CiscoACI', 'Cilium', 'Calico', 'None']
         x-nullable: true
       schedulable_masters:
         type: boolean
@@ -5028,7 +5279,7 @@ definitions:
       host_role:
         type: string
         x-nullable: true
-        enum: ['auto-assign', 'master', 'worker']
+        enum: ['auto-assign', 'master', 'arbiter', 'worker']
       host_name:
         type: string
         x-nullable: true
@@ -5062,6 +5313,25 @@ definitions:
         x-nullable: true
         items:
             $ref: '#/definitions/node-label-params'
+      fencing_credentials:
+        $ref: '#/definitions/fencing-credentials-params'
+        x-nullable: true
+        description: The host's BMC credentials that will be used in TNF.
+
+  disconnected-cluster-create-params:
+    type: object
+    required:
+      - name
+      - openshift_version
+    properties:
+      name:
+        type: string
+        minLength: 1
+        maxLength: 54
+        description: Name of the OpenShift cluster.
+      openshift_version:
+        type: string
+        description: Version of the OpenShift cluster.
 
   v2-cluster-update-params:
     type: object
@@ -5160,13 +5430,22 @@ definitions:
           $ref: '#/definitions/operator-create-params'
       hyperthreading:
         type: string
-        description: Enable/disable hyperthreading on master nodes, worker nodes, or all nodes.
-        enum: ['masters', 'workers', 'all', 'none']
+        description: Enable/disable hyperthreading on master nodes, arbiter nodes, worker nodes, or a combination of them.
+        enum: ['none', 'masters', 'arbiters', 'workers', 'masters,arbiters', 'masters,workers', 'arbiters,workers', 'masters,arbiters,workers', 'all']
         x-nullable: true
       network_type:
         type: string
-        description: The desired network type used.
-        enum: ['OpenShiftSDN', 'OVNKubernetes']
+        description: |
+          The desired network type used.
+          - OVNKubernetes: Default CNI for OpenShift (recommended)
+          - OpenShiftSDN: Legacy SDN (deprecated in newer versions)
+          - CiscoACI: Cisco ACI CNI (requires custom manifests)
+          - Cilium: Isovalent Cilium CNI (requires custom manifests)
+          - Calico: Tigera Calico CNI (requires custom manifests)
+          - None: No CNI - user must provide custom CNI manifests
+          Note: Third-party CNIs (CiscoACI, Cilium, Calico, None) require uploading
+          CNI manifests via the custom manifests API before installation.
+        enum: ['OpenShiftSDN', 'OVNKubernetes', 'CiscoACI', 'Cilium', 'Calico', 'None']
         x-nullable: true
       schedulable_masters:
         type: boolean
@@ -5253,16 +5532,17 @@ definitions:
     properties:
       kind:
         type: string
-        enum: ['Cluster', 'AddHostsCluster']
+        enum: ['Cluster', 'AddHostsCluster', 'DisconnectedCluster']
         description: |
           Indicates the type of this object. Will be 'Cluster' if this is a complete object,
           'AddHostsCluster' for cluster that add hosts to existing OCP cluster,
+          'DisconnectedCluster' for clusters with embedded ignition for offline installation,
       high_availability_mode:
         type: string
         enum: ['Full', 'None']
         default: 'Full'
         description: |
-          Guaranteed availability of the installed cluster. 'Full' installs a Highly-Available cluster
+          (DEPRECATED) Please use 'control_plane_count' instead. Guaranteed availability of the installed cluster. 'Full' installs a Highly-Available cluster
           over multiple master nodes whereas 'None' installs a full cluster over one node.
       id:
         type: string
@@ -5365,6 +5645,7 @@ definitions:
           - adding-hosts
           - cancelled
           - installing-pending-user-action
+          - unmonitored
       status_info:
         type: string
         x-go-custom-tag: gorm:"type:varchar(2048)"
@@ -5522,16 +5803,23 @@ definitions:
         description: Unique identifier of the AMS subscription in OCM.
       hyperthreading:
         type: string
-        enum: ['masters', 'workers', 'all', 'none']
-        description: Enable/disable hyperthreading on master nodes, worker nodes, or all nodes
+        description: Enable/disable hyperthreading on master nodes, arbiter nodes, worker nodes, or a combination of them.
+        enum: ['none', 'masters', 'arbiters', 'workers', 'masters,arbiters', 'masters,workers', 'arbiters,workers', 'masters,arbiters,workers', 'all']
       feature_usage:
         type: string
         description: JSON-formatted string containing the usage information by feature name
         x-go-custom-tag: gorm:"type:text"
       network_type:
         type: string
-        description: The desired network type used.
-        enum: ['OpenShiftSDN', 'OVNKubernetes']
+        description: |
+          The desired network type used.
+          - OVNKubernetes: Default CNI for OpenShift (recommended)
+          - OpenShiftSDN: Legacy SDN (deprecated in newer versions)
+          - CiscoACI: Cisco ACI CNI (requires custom manifests)
+          - Cilium: Isovalent Cilium CNI (requires custom manifests)
+          - Calico: Tigera Calico CNI (requires custom manifests)
+          - None: No CNI - user must provide custom CNI manifests
+        enum: ['OpenShiftSDN', 'OVNKubernetes', 'CiscoACI', 'Cilium', 'Calico', 'None']
         x-nullable: true
       cluster_networks:
         x-go-custom-tag: gorm:"foreignkey:ClusterID;references:ID"
@@ -5686,14 +5974,17 @@ definitions:
         mac_address:
           type: string
           pattern: '^([0-9A-Fa-f]{2}[:]){5}([0-9A-Fa-f]{2})$'
+          x-nullable: false
           description: mac address present on the host
         logical_nic_name:
           type: string
           description: nic name used in the yaml, which relates 1:1 to the mac address
+      required:
+        - mac_address
 
   image_type:
     type: string
-    enum: [full-iso, minimal-iso]
+    enum: [full-iso, minimal-iso, disconnected-iso]
 
   free-addresses-list:
     type: array
@@ -5874,8 +6165,8 @@ definitions:
     properties:
       enable_on:
         type: string
-        description: Enable/disable disk encryption on master nodes, worker nodes, or all nodes.
-        enum: ['none', 'all', 'masters', 'workers']
+        description: Enable/disable disk encryption on master nodes, arbiter nodes, worker nodes, or a combination of them.
+        enum: ['none', 'masters', 'arbiters', 'workers', 'masters,arbiters', 'masters,workers', 'arbiters,workers', 'masters,arbiters,workers', 'all']
         default: none
       mode:
         type: string
@@ -5897,6 +6188,7 @@ definitions:
       - Waiting for controller
       - Installing
       - Writing image to disk
+      - Copying registry data to disk
       - Rebooting
       - Waiting for ignition
       - Configuring
@@ -6598,11 +6890,36 @@ definitions:
         description: The value for the label's key-value pair.
         type: string
 
+  fencing-credentials-params:
+    type: object
+    required:
+      - 'address'
+      - 'username'
+      - 'password'
+    properties:
+      address:
+        description: The URL of the host's BMC, for example https://bmc1.example.com.
+        type: string
+      username:
+        description: The username to connect to the host's BMC.
+        type: string
+      password:
+        description: The password to connect to the host's BMC.
+        type: string
+      certificate_verification:
+        description: Whether to enable or disable certificate verification when connecting to the host's BMC.
+        type: string
+        enum:
+          - Enabled
+          - Disabled
+        default: Enabled
+
   host-role-update-params:
     type: string
     enum:
       - 'auto-assign'
       - 'master'
+      - 'arbiter'
       - 'worker'
 
   host-role:
@@ -6610,6 +6927,7 @@ definitions:
     enum:
       - 'auto-assign'
       - 'master'
+      - 'arbiter'
       - 'worker'
       - 'bootstrap'
 
@@ -6671,6 +6989,17 @@ definitions:
       - 'nmstate-requirements-satisfied'
       - 'amd-gpu-requirements-satisfied'
       - 'kmm-requirements-satisfied'
+      - 'node-healthcheck-requirements-satisfied'
+      - 'self-node-remediation-requirements-satisfied'
+      - 'fence-agents-remediation-requirements-satisfied'
+      - 'node-maintenance-requirements-satisfied'
+      - 'kube-descheduler-requirements-satisfied'
+      - 'cluster-observability-requirements-satisfied'
+      - 'numa-resources-requirements-satisfied'
+      - 'oadp-requirements-satisfied'
+      - 'metallb-requirements-satisfied'
+      - 'loki-requirements-satisfied'
+      - 'openshift-logging-requirements-satisfied'
 
   dhcp_allocation_request:
     type: object
@@ -6811,13 +7140,6 @@ definitions:
         pattern: '^(([a-zA-Z0-9\-\.]+)(:[0-9]+)?\/)?[a-z0-9\._\-\/@]+[?::a-zA-Z0-9_\-.]+$'
         type: string
         description: Assisted installer image
-      high_availability_mode:
-        type: string
-        enum: ['Full', 'None']
-        default: 'Full'
-        description: |
-          Guaranteed availability of the installed cluster. 'Full' installs a Highly-Available cluster
-          over multiple master nodes whereas 'None' installs a full cluster over one node.
       control_plane_count:
         type: integer
         description: Specifies the required number of control plane nodes that should be part of the cluster.
@@ -7043,6 +7365,7 @@ definitions:
       - 'mtv-requirements-satisfied'
       - 'osc-requirements-satisfied'
       - 'network-type-valid'
+      - 'custom-manifests-requirements-satisfied'
       - 'platform-requirements-satisfied'
       - 'node-feature-discovery-requirements-satisfied'
       - 'nvidia-gpu-requirements-satisfied'
@@ -7050,10 +7373,22 @@ definitions:
       - 'servicemesh-requirements-satisfied'
       - 'serverless-requirements-satisfied'
       - 'openshift-ai-requirements-satisfied'
+      - 'openshift-ai-gpu-requirements-satisfied'
       - 'authorino-requirements-satisfied'
       - 'nmstate-requirements-satisfied'
       - 'amd-gpu-requirements-satisfied'
       - 'kmm-requirements-satisfied'
+      - 'node-healthcheck-requirements-satisfied'
+      - 'self-node-remediation-requirements-satisfied'
+      - 'fence-agents-remediation-requirements-satisfied'
+      - 'node-maintenance-requirements-satisfied'
+      - 'kube-descheduler-requirements-satisfied'
+      - 'cluster-observability-requirements-satisfied'
+      - 'numa-resources-requirements-satisfied'
+      - 'oadp-requirements-satisfied'
+      - 'metallb-requirements-satisfied'
+      - 'loki-requirements-satisfied'
+      - 'openshift-logging-requirements-satisfied'
 
   logs_type:
     type: string
@@ -7430,6 +7765,14 @@ definitions:
       static_network_config:
         type: string
         description: static network configuration string in the format expected by discovery ignition generation.
+      rendezvous_ip:
+        type: string
+        description: |-
+          The IP address of the host that will act as the rendezvous (bootstrap) node for agent-based installations.
+          This is optional for disconnected-iso image type and specifies which host will run the assisted service
+          during the bootstrap phase. All other hosts will connect to this IP to coordinate the installation.
+        x-nullable: true
+        pattern: '^(?:$|(?:(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:(:[0-9a-fA-F]{1,4}){1,6}|:(:[0-9a-fA-F]{1,4}){1,7}|:|fe80:(:[0-9a-fA-F]{0,4}){0,4}%[0-9a-zA-Z]{1,}|::(ffff(:0{1,4}){0,1}:){0,1}((25[0-5]|(2[0-4]|1?[0-9])?[0-9])\.){3}(25[0-5]|(2[0-4]|1?[0-9])?[0-9])|([0-9a-fA-F]{1,4}:){1,4}:((25[0-5]|(2[0-4]|1?[0-9])?[0-9])\.){3}(25[0-5]|(2[0-4]|1?[0-9])?[0-9]))))$'
       type:
         $ref: '#/definitions/image_type'
       ignition_config_override:
@@ -7546,6 +7889,14 @@ definitions:
         type: array
         items:
           $ref: '#/definitions/host_static_network_config'
+      rendezvous_ip:
+        type: string
+        description: |-
+          The IP address of the host that will act as the rendezvous (bootstrap) node for agent-based installations.
+          This is optional for disconnected-iso image type and specifies which host will run the assisted service
+          during the bootstrap phase. All other hosts will connect to this IP to coordinate the installation.
+        x-nullable: true
+        pattern: '^(?:$|(?:(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:(:[0-9a-fA-F]{1,4}){1,6}|:(:[0-9a-fA-F]{1,4}){1,7}|:|fe80:(:[0-9a-fA-F]{0,4}){0,4}%[0-9a-zA-Z]{1,}|::(ffff(:0{1,4}){0,1}:){0,1}((25[0-5]|(2[0-4]|1?[0-9])?[0-9])\.){3}(25[0-5]|(2[0-4]|1?[0-9])?[0-9])|([0-9a-fA-F]{1,4}:){1,4}:((25[0-5]|(2[0-4]|1?[0-9])?[0-9])\.){3}(25[0-5]|(2[0-4]|1?[0-9])?[0-9]))))$'
       image_type:
         $ref: '#/definitions/image_type'
       ignition_config_override:
@@ -7597,6 +7948,14 @@ definitions:
         type: array
         items:
           $ref: '#/definitions/host_static_network_config'
+      rendezvous_ip:
+        type: string
+        description: |-
+          The IP address of the host that will act as the rendezvous (bootstrap) node for agent-based installations.
+          This is optional for disconnected-iso image type and specifies which host will run the assisted service
+          during the bootstrap phase. All other hosts will connect to this IP to coordinate the installation.
+        x-nullable: true
+        pattern: '^(?:$|(?:(?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])|(?:([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:(:[0-9a-fA-F]{1,4}){1,6}|:(:[0-9a-fA-F]{1,4}){1,7}|:|fe80:(:[0-9a-fA-F]{0,4}){0,4}%[0-9a-zA-Z]{1,}|::(ffff(:0{1,4}){0,1}:){0,1}((25[0-5]|(2[0-4]|1?[0-9])?[0-9])\.){3}(25[0-5]|(2[0-4]|1?[0-9])?[0-9])|([0-9a-fA-F]{1,4}:){1,4}:((25[0-5]|(2[0-4]|1?[0-9])?[0-9])\.){3}(25[0-5]|(2[0-4]|1?[0-9])?[0-9]))))$'
       image_type:
         $ref: '#/definitions/image_type'
       ignition_config_override:
@@ -7616,12 +7975,12 @@ definitions:
 
   ip:
     type: string
-    x-go-custom-tag: gorm:"primaryKey"
+    x-go-custom-tag: gorm:"primaryKey;type:inet"
     pattern: '^(?:(?:(?:[0-9]{1,3}\.){3}[0-9]{1,3})|(?:(?:[0-9a-fA-F]*:[0-9a-fA-F]*){2,}))?$'
 
   subnet:
     type: string
-    x-go-custom-tag: gorm:"primaryKey"
+    x-go-custom-tag: gorm:"primaryKey;type:cidr"
     pattern: '^(?:(?:(?:[0-9]{1,3}\.){3}[0-9]{1,3}\/(?:(?:[0-9])|(?:[1-2][0-9])|(?:3[0-2])))|(?:(?:[0-9a-fA-F]*:[0-9a-fA-F]*){2,})/(?:(?:[0-9])|(?:[1-9][0-9])|(?:1[0-1][0-9])|(?:12[0-8])))$'
 
   vip_verification:

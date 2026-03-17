@@ -13,11 +13,14 @@ import (
 	"github.com/openshift/assisted-service/internal/common"
 	"github.com/openshift/assisted-service/internal/featuresupport"
 	manifestsapi "github.com/openshift/assisted-service/internal/manifests/api"
+	"github.com/openshift/assisted-service/internal/operators/amdgpu"
 	"github.com/openshift/assisted-service/internal/operators/api"
 	operatorscommon "github.com/openshift/assisted-service/internal/operators/common"
 	"github.com/openshift/assisted-service/internal/operators/lvm"
 	"github.com/openshift/assisted-service/internal/operators/mce"
+	"github.com/openshift/assisted-service/internal/operators/nvidiagpu"
 	"github.com/openshift/assisted-service/internal/operators/odf"
+	"github.com/openshift/assisted-service/internal/operators/openshiftai"
 	"github.com/openshift/assisted-service/models"
 	logutil "github.com/openshift/assisted-service/pkg/log"
 	"github.com/openshift/assisted-service/pkg/s3wrapper"
@@ -25,9 +28,15 @@ import (
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/thoas/go-funk"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	k8syaml "sigs.k8s.io/yaml"
 )
 
-const controllerManifestFile = "custom_manifests.json"
+const (
+	controllerManifestFile          = "custom_manifests.json"
+	controllerManifestConfigMapFile = "olm_operator_manifests.yaml"
+)
 
 var storageOperatorsPriority = []string{odf.Operator.Name, lvm.Operator.Name}
 
@@ -46,6 +55,19 @@ type Manager struct {
 	monitoredOperators map[string]*models.MonitoredOperator
 	manifestsAPI       manifestsapi.ManifestsAPI
 	objectHandler      s3wrapper.API
+}
+
+type OperatorFeatureSupportID struct {
+	OperatorName     string
+	FeatureSupportID models.FeatureSupportLevelID
+	Dependencies     []models.FeatureSupportLevelID
+}
+
+// operatorMetadata is a struct to marshal the metadata content into YAML for the OLM Operator ConfigMap.
+type operatorMetadata struct {
+	Namespace        string   `json:"namespace" yaml:"namespace"`
+	SubscriptionName string   `json:"subscriptionName" yaml:"subscriptionName"`
+	Manifests        []string `json:"manifests" yaml:"manifests"`
 }
 
 // API defines Operator management operation
@@ -79,10 +101,12 @@ type API interface {
 	GetPreflightRequirementsBreakdownForCluster(ctx context.Context, cluster *common.Cluster) ([]*models.OperatorHardwareRequirements, error)
 	// EnsureOperatorPrerequisite Ensure that for the given operators has the base prerequisite for installation
 	EnsureOperatorPrerequisite(cluster *common.Cluster, openshiftVersion string, cpuArchitecture string, operators []*models.MonitoredOperator) error
-	// ListBundles returns the list of available bundles
-	ListBundles() []*models.Bundle
-	// GetBundle returns the Bundle object
-	GetBundle(bundleID string) (*models.Bundle, error)
+	// ListBundles returns the list of available bundles filtered by feature support
+	ListBundles(filters *featuresupport.SupportLevelFilters, featureIDs []models.FeatureSupportLevelID) []*models.Bundle
+	// GetBundle returns the Bundle object with operators based on feature IDs
+	GetBundle(bundleID string, featureIDs []models.FeatureSupportLevelID) (*models.Bundle, error)
+	// GetOperatorDependenciesFeatureID returns the list of dependencies
+	GetOperatorDependenciesFeatureID() []OperatorFeatureSupportID
 }
 
 // GetPreflightRequirementsBreakdownForCluster provides host requirements breakdown for each supported OLM operator
@@ -197,7 +221,13 @@ func (mgr *Manager) GenerateManifests(ctx context.Context, cluster *common.Clust
 		if err != nil {
 			return err
 		}
-		if err := mgr.createControllerManifest(ctx, cluster, string(content)); err != nil {
+		if err = mgr.createControllerManifest(ctx, cluster, string(content)); err != nil {
+			return err
+		}
+		// Create ConfigMap with custom manifests to allow retrieval from assisted-installer
+		// if API cannot be reached
+		err = mgr.createOLMOperatorsConfigMap(ctx, cluster, &controllerManifests)
+		if err != nil {
 			return err
 		}
 	}
@@ -214,6 +244,103 @@ func (mgr *Manager) createControllerManifest(ctx context.Context, cluster *commo
 		return errors.Errorf("Failed to upload custom manifests for cluster %s", cluster.ID)
 	}
 	return nil
+}
+
+// Create a ConfigMap containing the operator custom manifests and add it to install manifests.
+// This is needed when the assisted-installer cannot access the API to retrieve the manifest file, e.g.
+// for the Agent-Based Installer.
+// The data section of the ConfigMap will contain the manifests and additional metadata from
+// MonitoredOperators
+//   <operator-name>.metadata.yaml: |
+//     namespace: <operator-namespace>
+//     subscriptionName: <operator-subscriptionName>
+//     manifests:
+//       - <operator-name>-01.yaml
+//   <operator-name>-01.yaml: |
+//     <content of manifest>
+func (mgr *Manager) createOLMOperatorsConfigMap(ctx context.Context, cluster *common.Cluster, manifests *[]Manifest) error {
+	configMap := &corev1.ConfigMap{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "v1",
+			Kind:       "ConfigMap",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "olm-operator-manifests",
+			Namespace: "assisted-installer",
+		},
+		Data: make(map[string]string),
+	}
+	// Track per-operator file counts and filenames across all batches
+	counts := make(map[string]int)
+	filesByOp := make(map[string][]string)
+	opDetailsCache := make(map[string]*models.MonitoredOperator)
+
+	for _, manifest := range *manifests {
+		op, err := mgr.GetOperatorByName(manifest.Name)
+		if err != nil {
+			mgr.log.Infof("Could not find operator %s in monitored operators", manifest.Name)
+			continue
+		}
+
+		// Cache operator info
+		opDetailsCache[op.Name] = op
+
+		// Decode the base64 controller manifest back to YAML bytes.
+		decoded, err := base64.StdEncoding.DecodeString(manifest.Content)
+		if err != nil {
+			return fmt.Errorf("could not base64-decode manifest for %s: %w", manifest.Name, err)
+		}
+		// Split the manifest content into individual YAML documents.
+		rawManifests, err := common.GetMultipleYamls[map[string]interface{}](decoded)
+		if err != nil {
+			return fmt.Errorf("could not decode YAML for %s: %w", manifest.Name, err)
+		}
+
+		// Re-marshal each document to YAML and add to the ConfigMap data.
+		for _, doc := range rawManifests {
+			if len(doc) == 0 {
+				continue
+			}
+			b, err := k8syaml.Marshal(doc)
+			if err != nil {
+				return fmt.Errorf("failed to marshal YAML doc for %s: %w", manifest.Name, err)
+			}
+			trimmedManifest := strings.TrimSpace(string(b))
+			if trimmedManifest == "" {
+				continue
+			}
+			// Store base64-encoded content for assisted-installer
+			encodedManifest := base64.StdEncoding.EncodeToString([]byte(trimmedManifest))
+
+			counts[op.Name]++
+			fileName := fmt.Sprintf("%s-%02d.yaml", op.Name, counts[op.Name])
+			configMap.Data[fileName] = encodedManifest
+			filesByOp[op.Name] = append(filesByOp[op.Name], fileName)
+		}
+	}
+
+	// Emit one metadata entry per operator with the full list of files
+	for name, fileNames := range filesByOp {
+		info := opDetailsCache[name]
+		metadata := operatorMetadata{
+			Namespace:        info.Namespace,
+			SubscriptionName: info.SubscriptionName,
+			Manifests:        fileNames,
+		}
+		metadataYAML, err := k8syaml.Marshal(metadata)
+		if err != nil {
+			return fmt.Errorf("failed to marshal metadata for operator %s: %w", name, err)
+		}
+		metadataKey := fmt.Sprintf("%s.metadata.yaml", name)
+		configMap.Data[metadataKey] = string(metadataYAML)
+	}
+
+	contents, err := k8syaml.Marshal(configMap)
+	if err != nil {
+		return fmt.Errorf("failed to marshal configMap to yaml: %w", err)
+	}
+
+	return mgr.createInstallManifests(ctx, cluster, controllerManifestConfigMapFile, contents, models.ManifestFolderOpenshift)
 }
 
 func (mgr *Manager) createInstallManifests(ctx context.Context, cluster *common.Cluster, filename string, content []byte, folder string) error {
@@ -245,6 +372,9 @@ func (mgr *Manager) AnyOLMOperatorEnabled(cluster *common.Cluster) bool {
 
 // ValidateHost validates host requirements
 func (mgr *Manager) ValidateHost(ctx context.Context, cluster *common.Cluster, host *models.Host) ([]api.ValidationResult, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	results := make([]api.ValidationResult, 0, len(mgr.olmOperators))
 	additionalOperatorRequirements := &models.ClusterHostRequirementsDetails{}
 
@@ -260,6 +390,9 @@ func (mgr *Manager) ValidateHost(ctx context.Context, cluster *common.Cluster, h
 	}
 
 	for _, clusterOperator := range cluster.MonitoredOperators {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if clusterOperator.OperatorType != models.OperatorTypeOlm {
 			continue
 		}
@@ -310,20 +443,22 @@ func (mgr *Manager) ValidateCluster(ctx context.Context, cluster *common.Cluster
 				return nil, err
 			}
 			delete(pendingOperators, clusterOperator.Name)
-			results = append(results, result)
+			results = append(results, result...)
 		}
 	}
 	// Add successful validation result for disabled operators
 	for opName := range pendingOperators {
 		operator := mgr.olmOperators[opName]
-		result := api.ValidationResult{
-			Status:       api.Success,
-			ValidationId: operator.GetClusterValidationID(),
-			Reasons: []string{
-				fmt.Sprintf("%s is disabled", opName),
-			},
+		for _, validationID := range operator.GetClusterValidationIDs() {
+			result := api.ValidationResult{
+				Status:       api.Success,
+				ValidationId: validationID,
+				Reasons: []string{
+					fmt.Sprintf("%s is disabled", opName),
+				},
+			}
+			results = append(results, result)
 		}
-		results = append(results, result)
 	}
 	return results, nil
 }
@@ -346,30 +481,63 @@ func (mgr *Manager) GetOperatorProperties(operatorName string) (models.OperatorP
 }
 
 func (mgr *Manager) ResolveDependencies(cluster *common.Cluster, operators []*models.MonitoredOperator) ([]*models.MonitoredOperator, error) {
-	allDependentOperators, err := mgr.getDependencies(cluster, operators)
-	if err != nil {
-		return operators, nil
-	}
+	ret := make([]*models.MonitoredOperator, 0)
+	alreadyPresent := make([]string, 0)
+	currentDependencies := make(map[string]*models.MonitoredOperator)
 
-	inputOperatorNames := make([]string, len(operators))
-	for _, inputOperator := range operators {
-		inputOperatorNames = append(inputOperatorNames, inputOperator.Name)
-	}
+	// Compute list of operator without dependencies (they might be not required anymore)
+	for _, operator := range operators {
+		if operator.DependencyOnly {
+			// Keep the current dependency definition to be sure, properties and others fields are consistent
+			currentDependencies[operator.Name] = operator
 
-	for operatorName := range allDependentOperators {
-		if funk.Contains(inputOperatorNames, operatorName) {
 			continue
 		}
 
-		operator, err := mgr.GetOperatorByName(operatorName)
+		ret = append(ret, operator)
+		alreadyPresent = append(alreadyPresent, operator.Name)
+	}
+
+	// Get dependent operators
+	allDependentOperators, err := mgr.getDependencies(cluster, ret)
+	if err != nil {
+		return nil, err
+	}
+
+	for operatorName := range allDependentOperators {
+		if funk.Contains(alreadyPresent, operatorName) {
+			continue
+		}
+
+		operator, err := mgr.getDependency(operatorName, currentDependencies)
 		if err != nil {
 			return nil, err
 		}
 
-		operators = append(operators, operator)
+		operator.DependencyOnly = true
+
+		ret = append(ret, operator)
+		alreadyPresent = append(alreadyPresent, operatorName)
 	}
 
-	return operators, nil
+	// If openshift-ai is included, mark nvidia-gpu & amd-gpu as dependency only
+	if operatorscommon.HasOperator(ret, openshiftai.Operator.Name) {
+		for _, operator := range ret {
+			if operator.Name == nvidiagpu.Operator.Name || operator.Name == amdgpu.Operator.Name {
+				operator.DependencyOnly = true
+			}
+		}
+	}
+
+	return ret, nil
+}
+
+func (mgr *Manager) getDependency(name string, definitions map[string]*models.MonitoredOperator) (*models.MonitoredOperator, error) {
+	if ret, ok := definitions[name]; ok {
+		return ret, nil
+	}
+
+	return mgr.GetOperatorByName(name)
 }
 
 func (mgr *Manager) getDependencies(cluster *common.Cluster, operators []*models.MonitoredOperator) (map[string]bool, error) {
@@ -379,13 +547,13 @@ func (mgr *Manager) getDependencies(cluster *common.Cluster, operators []*models
 		if op.OperatorType != models.OperatorTypeOlm {
 			continue
 		}
-		mgr.log.Infof("Attempting to resolve %s operator dependencies", op.Name)
+		mgr.log.Debugf("Attempting to resolve %s operator dependencies", op.Name)
 		deps, err := mgr.olmOperators[op.Name].GetDependencies(cluster)
 		if err != nil {
 			return map[string]bool{}, err
 		}
 		visited[op.Name] = true
-		mgr.log.Infof("Dependencies found for %s operator: %+v ", op.Name, deps)
+		mgr.log.Debugf("Dependencies found for %s operator: %+v ", op.Name, deps)
 		for _, dep := range deps {
 			fifo.PushBack(dep)
 		}
@@ -416,7 +584,7 @@ func (mgr *Manager) GetMonitoredOperatorsList() map[string]*models.MonitoredOper
 func (mgr *Manager) GetOperatorByName(operatorName string) (*models.MonitoredOperator, error) {
 	operator, ok := mgr.monitoredOperators[operatorName]
 	if !ok {
-		return nil, fmt.Errorf("Operator %s isn't supported", operatorName)
+		return nil, fmt.Errorf("operator %s isn't supported", operatorName)
 	}
 
 	return &models.MonitoredOperator{
@@ -493,13 +661,13 @@ func EnsureLVMAndCNVDoNotClash(cluster *common.Cluster, openshiftVersion string,
 	}
 	// Openshift version greater or Equal to 4.12.0 support cnv and lvms
 	if isGreaterOrEqual, _ := common.BaseVersionGreaterOrEqual(lvm.LvmsMinOpenshiftVersion4_12, openshiftVersion); !isGreaterOrEqual {
-		return errors.Errorf("Currently, you can not install Logical Volume Manager operator at the same time as Virtualization operator.")
+		return errors.New("Currently, you can not install Logical Volume Manager operator at the same time as Virtualization operator.")
 	}
 
 	// before 4.15 multi node LVM not supported
 	if !common.IsSingleNodeCluster(cluster) {
 		message := fmt.Sprintf("Logical Volume Manager is only supported for highly available openshift with version %s or above", lvm.LvmMinMultiNodeSupportVersion)
-		return errors.Errorf(message)
+		return errors.New(message)
 	}
 
 	return nil
@@ -519,34 +687,46 @@ func (mgr *Manager) EnsureOperatorPrerequisite(cluster *common.Cluster, openshif
 	return nil
 }
 
-// ListBundles returns a list of available bundles.
-func (mgr *Manager) ListBundles() []*models.Bundle {
-	var bundles []*models.Bundle
+// ListBundles returns a list of available bundles filtered by feature support.
+func (mgr *Manager) ListBundles(filters *featuresupport.SupportLevelFilters, featureIDs []models.FeatureSupportLevelID) []*models.Bundle {
+	var ret []*models.Bundle
+
 	for _, basicBundleDetails := range operatorscommon.Bundles {
-		completeBundleDeetails, err := mgr.GetBundle(basicBundleDetails.ID)
+		// Get the bundle with operators based on feature IDs
+		completeBundleDetails, err := mgr.GetBundle(basicBundleDetails.ID, featureIDs)
 		if err != nil {
 			mgr.log.Error(err)
 			continue
 		}
-		bundles = append(bundles, completeBundleDeetails)
+
+		// Check if all operators in the bundle are supported using featuresupport API
+		if mgr.isBundleSupported(completeBundleDetails, filters, featureIDs) {
+			ret = append(ret, completeBundleDetails)
+		}
 	}
-	return bundles
+
+	return ret
 }
 
-// GetBundle returns the Bundle object
-func (mgr *Manager) GetBundle(bundleID string) (*models.Bundle, error) {
+// GetBundle returns the Bundle object with operators based on feature IDs
+func (mgr *Manager) GetBundle(bundleID string, featureIDs []models.FeatureSupportLevelID) (*models.Bundle, error) {
 	bundle, ok := mgr.lookupBundle(bundleID)
 	if !ok {
 		return nil, fmt.Errorf("bundle '%s' is not supported", bundleID)
 	}
+
+	// Get all operators for the bundle based on feature IDs
 	for _, operator := range mgr.olmOperators {
-		for _, operatorBundle := range operator.GetBundleLabels() {
+		operatorBundles := operator.GetBundleLabels(featureIDs)
+		for _, operatorBundle := range operatorBundles {
 			if operatorBundle == bundleID {
-				bundle.Operators = append(bundle.Operators, operator.GetName())
+				operatorName := operator.GetName()
+				bundle.Operators = append(bundle.Operators, operatorName)
 				break
 			}
 		}
 	}
+
 	return bundle, nil
 }
 
@@ -562,5 +742,71 @@ func (mgr *Manager) lookupBundle(bundleID string) (result *models.Bundle, ok boo
 			return
 		}
 	}
+
 	return
+}
+
+func (mgr *Manager) GetOperatorDependenciesFeatureID() []OperatorFeatureSupportID {
+	ret := make([]OperatorFeatureSupportID, 0)
+
+	for _, operator := range mgr.olmOperators {
+		ret = append(ret, OperatorFeatureSupportID{
+			OperatorName:     operator.GetName(),
+			FeatureSupportID: operator.GetFeatureSupportID(),
+			Dependencies:     operator.GetDependenciesFeatureSupportID(),
+		})
+	}
+
+	return ret
+}
+
+// isBundleSupported checks if all operators in a bundle are supported using featuresupport API
+func (mgr *Manager) isBundleSupported(bundle *models.Bundle, filters *featuresupport.SupportLevelFilters, featureIDs []models.FeatureSupportLevelID) bool {
+	// If bundle has no operators, it's not supported
+	if len(bundle.Operators) == 0 {
+		return false
+	}
+
+	// If there is no filter, it's always supported
+	if filters == nil {
+		return true
+	}
+
+	// Check each operator in the bundle using featuresupport API
+	for _, operatorName := range bundle.Operators {
+		operatorFeatureSupportID, err := mgr.getOperatorFeatureSupportID(operatorName)
+		if err != nil {
+			mgr.log.WithError(err).Warnf("Operator %s has no feature support ID", operatorName)
+
+			return false
+		}
+
+		if !mgr.isOperatorSupported(operatorFeatureSupportID, *filters, featureIDs) {
+			return false
+		}
+	}
+
+	return true
+}
+
+// getOperatorFeatureSupportID gets the feature support ID for an operator
+func (mgr *Manager) getOperatorFeatureSupportID(operatorName string) (models.FeatureSupportLevelID, error) {
+	operator, ok := mgr.olmOperators[operatorName]
+	if !ok {
+		return "", fmt.Errorf("operator %s not found", operatorName)
+	}
+
+	return operator.GetFeatureSupportID(), nil
+}
+
+// isOperatorSupported checks if an operator is supported using featuresupport API
+func (mgr *Manager) isOperatorSupported(featureID models.FeatureSupportLevelID, filters featuresupport.SupportLevelFilters, featureIDs []models.FeatureSupportLevelID) bool {
+	supportLevel := featuresupport.GetSupportLevel(featureID, filters)
+
+	// Consider the operator supported if it's not unavailable or unsupported
+	if supportLevel == models.SupportLevelUnavailable || supportLevel == models.SupportLevelUnsupported {
+		return false
+	}
+
+	return featuresupport.IsFeatureCompatibleWithOther(filters.OpenshiftVersion, featureID, featureIDs)
 }

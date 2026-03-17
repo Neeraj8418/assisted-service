@@ -149,8 +149,8 @@ func (hr *HypershiftAgentServiceConfigReconciler) Reconcile(origCtx context.Cont
 			"hypershift_service_namespace": req.Namespace,
 		})
 
-	log.Info("HypershiftAgentServiceConfig Reconcile started")
-	defer log.Info("HypershiftAgentServiceConfig Reconcile ended")
+	log.Debug("HypershiftAgentServiceConfig Reconcile started")
+	defer log.Debug("HypershiftAgentServiceConfig Reconcile ended")
 
 	// read the resource from k8s
 	instance := &aiv1beta1.HypershiftAgentServiceConfig{}
@@ -220,9 +220,11 @@ func (hr *HypershiftAgentServiceConfigReconciler) Reconcile(origCtx context.Cont
 		return result, err
 	}
 
-	// Ensure image-service StatefulSet is reconciled
-	if err = ensureImageServiceStatefulSet(ctx, log, asc); err != nil {
-		return ctrl.Result{Requeue: true}, err
+	// Ensure image-service StatefulSet is reconciled (only if image service is not disabled)
+	if isImageServiceEnabled(asc.Object.GetAnnotations()) {
+		if err = ensureImageServiceStatefulSet(ctx, log, asc); err != nil {
+			return ctrl.Result{Requeue: true}, err
+		}
 	}
 
 	log.Info("read certificate from hub")
@@ -250,7 +252,7 @@ func (hr *HypershiftAgentServiceConfigReconciler) Reconcile(origCtx context.Cont
 func (hr *HypershiftAgentServiceConfigReconciler) reconcileHubComponents(ctx context.Context, log *logrus.Entry, asc ASC) (ctrl.Result, error) {
 	hubComponents := []component{}
 	hubComponents = append(hubComponents, assistedServiceRBAC_hub...)
-	hubComponents = append(hubComponents, getComponents(asc.spec, asc.rec.IsOpenShift)...)
+	hubComponents = append(hubComponents, getComponents(asc.spec, asc.rec.IsOpenShift, asc.Object.GetAnnotations())...)
 	hubComponents = append(hubComponents, hr.getWebhookComponents_hub()...)
 
 	// Reconcile hub components
@@ -260,7 +262,7 @@ func (hr *HypershiftAgentServiceConfigReconciler) reconcileHubComponents(ctx con
 			component.fn = newHypershiftAssistedServiceDeployment
 		}
 
-		log.Infof(fmt.Sprintf("Reconcile hub component: %s", component.name))
+		log.Infof("Reconcile hub component: %s", component.name)
 		if result, err := reconcileComponent(ctx, log, asc, component); err != nil {
 			log.WithError(err).Errorf("Failed to reconcile hub component %s", component.name)
 			return result, err
@@ -318,7 +320,7 @@ func (hr *HypershiftAgentServiceConfigReconciler) reconcileSpokeComponents(ctx c
 
 	// Reconcile spoke components
 	for _, component := range spokeComponents {
-		log.Infof(fmt.Sprintf("Reconcile spoke component: %s", component.name))
+		log.Infof("Reconcile spoke component: %s", component.name)
 		if result, err := reconcileComponent(ctx, log, asc, component); err != nil {
 			log.WithError(err).Errorf("Failed to reconcile spoke component %s", component.name)
 			return result, err
@@ -372,7 +374,7 @@ func (hr *HypershiftAgentServiceConfigReconciler) getKubeconfigSecret(ctx contex
 	if err != nil {
 		msg := fmt.Sprintf("Failed to get '%s' secret in '%s' namespace (check `kubeconfigSecretRef` property)", secretRef.Name, secretRef.Namespace)
 		log.WithError(err).Error(msg)
-		return nil, pkgerror.Errorf(msg)
+		return nil, pkgerror.New(msg)
 	}
 	_, ok := secret.Data["kubeconfig"]
 	if !ok {

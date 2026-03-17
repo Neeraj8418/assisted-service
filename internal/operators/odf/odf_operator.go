@@ -3,6 +3,7 @@ package odf
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"unicode"
 
@@ -47,8 +48,7 @@ var Operator = models.MonitoredOperator{
 	SubscriptionName: "odf-operator",
 	TimeoutSeconds:   30 * 60,
 	Bundles: pq.StringArray{
-		operatorscommon.BundleOpenShiftAINVIDIA.ID,
-		operatorscommon.BundleOpenShiftAIAMD.ID,
+		operatorscommon.BundleOpenShiftAI.ID,
 	},
 }
 
@@ -84,21 +84,33 @@ func (o *operator) GetDependencies(cluster *common.Cluster) ([]string, error) {
 	return []string{lso.Operator.Name}, nil
 }
 
-// GetClusterValidationID returns cluster validation ID for the Operator
-func (o *operator) GetClusterValidationID() string {
-	return string(models.ClusterValidationIDOdfRequirementsSatisfied)
+func (o *operator) GetDependenciesFeatureSupportID() []models.FeatureSupportLevelID {
+	return []models.FeatureSupportLevelID{models.FeatureSupportLevelIDLSO}
+}
+
+// GetClusterValidationIDs returns cluster validation IDs for the Operator
+func (o *operator) GetClusterValidationIDs() []string {
+	return []string{clusterValidationID}
 }
 
 // GetHostValidationID returns host validation ID for the Operator
 func (o *operator) GetHostValidationID() string {
-	return string(models.HostValidationIDOdfRequirementsSatisfied)
+	return hostValidationID
 }
 
 // ValidateCluster verifies whether this operator is valid for given cluster
-func (o *operator) ValidateCluster(_ context.Context, cluster *common.Cluster) (api.ValidationResult, error) {
+func (o *operator) ValidateCluster(_ context.Context, cluster *common.Cluster) ([]api.ValidationResult, error) {
 	status, message := o.validateRequirements(&cluster.Cluster)
+	result := []api.ValidationResult{{
+		Status:       status,
+		ValidationId: clusterValidationID,
+	}}
 
-	return api.ValidationResult{Status: status, ValidationId: o.GetClusterValidationID(), Reasons: []string{message}}, nil
+	if message != "" {
+		result[0].Reasons = []string{message}
+	}
+
+	return result, nil
 }
 
 func (o *operator) StorageClassName() string {
@@ -272,7 +284,6 @@ func (o *operator) GetHostRequirements(_ context.Context, cluster *common.Cluste
 		CPUCores: o.config.ODFPerHostCPUStandardMode + (diskCount * o.config.ODFPerDiskCPUCount),
 		RAMMib:   conversions.GibToMib(o.config.ODFPerHostMemoryGiBStandardMode + (diskCount * o.config.ODFPerDiskRAMGiB)),
 	}, nil
-
 }
 
 // GetPreflightRequirements returns operator hardware requirements that can be determined with cluster data only
@@ -317,8 +328,14 @@ func (o *operator) GetFeatureSupportID() models.FeatureSupportLevelID {
 	return models.FeatureSupportLevelIDODF
 }
 
-// GetBundleLabels returns the bundle labels for the LSO operator
-func (l *operator) GetBundleLabels() []string {
+// GetBundleLabels returns the bundle labels for the ODF operator
+func (o *operator) GetBundleLabels(featureIDs []models.FeatureSupportLevelID) []string {
+	// For SNO feature, exclude from openshift-ai bundle
+	if slices.Contains(featureIDs, models.FeatureSupportLevelIDSNO) {
+		return []string{}
+	}
+
+	// For non-SNO deployments, use the default bundle behavior
 	return []string(Operator.Bundles)
 }
 

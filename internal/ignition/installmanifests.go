@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	config_latest_types "github.com/coreos/ignition/v2/config/v3_2/types"
@@ -20,10 +21,14 @@ import (
 	"github.com/go-openapi/swag"
 	"github.com/google/uuid"
 	bmh_v1alpha1 "github.com/metal3-io/baremetal-operator/apis/metal3.io/v1alpha1"
+	v1 "github.com/openshift/api/config/v1"
+	"github.com/openshift/api/features"
 	"github.com/openshift/assisted-service/internal/common"
+	ignitioncommon "github.com/openshift/assisted-service/internal/common/ignition"
 	"github.com/openshift/assisted-service/internal/constants"
 	eventsapi "github.com/openshift/assisted-service/internal/events/api"
 	"github.com/openshift/assisted-service/internal/host/hostutil"
+	"github.com/openshift/assisted-service/internal/installcfg"
 	"github.com/openshift/assisted-service/internal/installercache"
 	"github.com/openshift/assisted-service/internal/manifests"
 	manifestsapi "github.com/openshift/assisted-service/internal/manifests/api"
@@ -50,6 +55,7 @@ import (
 
 const (
 	masterIgn      = "master.ign"
+	arbiterIgn     = "arbiter.ign"
 	workerIgn      = "worker.ign"
 	nodeIpHintFile = "/etc/default/nodeip-configuration"
 )
@@ -58,44 +64,6 @@ const highlyAvailableInfrastructureTopologyPatch = `---
 - op: replace
   path: /status/infrastructureTopology
   value: HighlyAvailable
-`
-
-/*
-Contents of the base64 encoded file are:
-
-#!/bin/bash
-
-set -eux
-unshare --mount
-mount -oremount,rw /sysroot
-ostree admin undeploy 1
-rm -rf /sysroot/ostree/deploy/rhcos
-*/
-const cleanupDiscoveryStaterootIgnitionOverride = `{
-  "ignition": {
-    "version": "3.2.0"
-  },
-  "storage": {
-    "files": [{
-      "overwrite": true,
-      "path": "/usr/local/bin/cleanup-assisted-discovery-stateroot.sh",
-      "mode": 493,
-      "user": {
-          "name": "root"
-      },
-      "contents": { "source": "data:text/plain;charset=utf-8;base64,IyEvYmluL2Jhc2gKCnNldCAtZXV4CnVuc2hhcmUgLS1tb3VudAptb3VudCAtb3JlbW91bnQscncgL3N5c3Jvb3QKb3N0cmVlIGFkbWluIHVuZGVwbG95IDEKcm0gLXJmIC9zeXNyb290L29zdHJlZS9kZXBsb3kvcmhjb3MK" }
-    }]
-  },
-  "systemd": {
-    "units": [
-      {
-        "contents": "[Unit]\nDescription=Cleanup Assisted Installer discovery stateroot\nConditionFirstBoot=yes\nConditionPathExists=/sysroot/ostree/deploy/rhcos\nBefore=first-boot-complete.target\nWants=first-boot-complete.target\n\n[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=/usr/local/bin/cleanup-assisted-discovery-stateroot.sh\n\n[Install]\nWantedBy=basic.target\n",
-        "enabled": true,
-        "name": "cleanup-assisted-discovery-stateroot.service"
-      }
-    ]
-  }
-}
 `
 
 type clusterVersion struct {
@@ -113,7 +81,7 @@ type clusterVersion struct {
 
 // Generator can generate ignition files and upload them to an S3-like service
 type Generator interface {
-	Generate(ctx context.Context, installConfig []byte) error
+	Generate(ctx context.Context, installConfig []byte, forceInsecurePolicyJson bool) error
 	UploadToS3(ctx context.Context) error
 }
 
@@ -134,6 +102,8 @@ type installerGenerator struct {
 	installerCache                *installercache.Installers
 	nodeIpAllocations             map[strfmt.UUID]*network.NodeIpAllocation
 	manifestApi                   manifestsapi.ManifestsAPI
+	iriPatcher                    internalReleaseImagePatcher
+	rawInstallConfig              []byte
 }
 
 var fileNames = [...]string{
@@ -165,6 +135,7 @@ func NewGenerator(workDir string, cluster *common.Cluster, releaseImage string, 
 		clusterTLSCertOverrideDir:     clusterTLSCertOverrideDir,
 		installerCache:                installerCache,
 		manifestApi:                   manifestApi,
+		iriPatcher:                    NewInternalReleaseImagePatcher(cluster, s3Client, manifestApi, log),
 	}
 }
 
@@ -172,6 +143,18 @@ func NewGenerator(workDir string, cluster *common.Cluster, releaseImage string, 
 // S3-compatible storage
 func (g *installerGenerator) UploadToS3(ctx context.Context) error {
 	return uploadToS3(ctx, g.workDir, g.cluster, g.s3Client, g.log)
+}
+
+func (g *installerGenerator) patchInternalReleaseManifests(ctx context.Context, manifestFiles []s3wrapper.ObjectInfo) error {
+	if !g.isFeatureGateEnabled(features.FeatureGateNoRegistryClusterInstall) {
+		return nil
+	}
+
+	if err := g.iriPatcher.PatchManifests(ctx, manifestFiles); err != nil {
+		g.log.WithError(err).Errorf("failed to process manifests for cluster %s", g.cluster.ID)
+		return err
+	}
+	return nil
 }
 
 func (g *installerGenerator) allocateNodeIpsIfNeeded(log logrus.FieldLogger) {
@@ -186,9 +169,10 @@ func (g *installerGenerator) allocateNodeIpsIfNeeded(log logrus.FieldLogger) {
 }
 
 // Generate generates ignition files and applies modifications.
-func (g *installerGenerator) Generate(ctx context.Context, installConfig []byte) error {
+func (g *installerGenerator) Generate(ctx context.Context, installConfig []byte, forceInsecurePolicyJson bool) error {
 	var err error
 	log := logutil.FromContext(ctx, g.log)
+	g.rawInstallConfig = installConfig
 
 	defer func() {
 		if err != nil {
@@ -202,7 +186,7 @@ func (g *installerGenerator) Generate(ctx context.Context, installConfig []byte)
 		g.installerReleaseImageOverride = g.releaseImage
 	}
 
-	mirrorRegistriesBuilder := mirrorregistries.New()
+	mirrorRegistriesBuilder := mirrorregistries.New(forceInsecurePolicyJson)
 	ocRelease := oc.NewRelease(
 		&executer.CommonExecuter{},
 		oc.Config{MaxTries: oc.DefaultTries, RetryDelay: oc.DefaltRetryDelay},
@@ -220,7 +204,7 @@ func (g *installerGenerator) Generate(ctx context.Context, installConfig []byte)
 	defer func() {
 		e := release.Cleanup(ctx)
 		if e != nil {
-			err = errors.Wrapf(err, "unable to clean up release due to error: %s", e.Error())
+			log.WithError(e).Warnf("Failed to clean up installer release %s", release.Path)
 		}
 	}()
 
@@ -263,6 +247,10 @@ func (g *installerGenerator) Generate(ctx context.Context, installConfig []byte)
 	manifestFiles, err := manifests.GetClusterManifests(ctx, g.cluster.ID, g.s3Client)
 	if err != nil {
 		log.WithError(err).Errorf("failed to check if cluster %s has manifests", g.cluster.ID)
+		return err
+	}
+	err = g.patchInternalReleaseManifests(ctx, manifestFiles)
+	if err != nil {
 		return err
 	}
 
@@ -317,7 +305,7 @@ func (g *installerGenerator) Generate(ctx context.Context, installConfig []byte)
 		return err
 	}
 
-	if swag.StringValue(g.cluster.HighAvailabilityMode) == models.ClusterHighAvailabilityModeNone {
+	if g.cluster.ControlPlaneCount == 1 {
 		err = g.bootstrapInPlaceIgnitionsCreate(ctx, installerPath, envVars)
 	} else {
 		err = g.runCreateCommand(ctx, installerPath, "ignition-configs", envVars)
@@ -477,7 +465,7 @@ func (g *installerGenerator) applyInfrastructureCRPatch(ctx context.Context) err
 	log := logutil.FromContext(ctx, g.log)
 
 	// hosts roles are known at this stage
-	_, workers, _ := common.GetHostsByEachRole(&g.cluster.Cluster, false)
+	_, _, workers, _ := common.GetHostsByEachRole(&g.cluster.Cluster, false)
 	// Patch the InfrastructureCR only if there is exactly one worker.
 	// For multiple workers, the OpenShift installer will handle assigning 'infrastructureTopology: HighlyAvailable'.
 	// When there are no workers, the control plane nodes also act as workers, so 'infrastructureTopology: HighlyAvailable' is set automatically.
@@ -578,7 +566,7 @@ func (g *installerGenerator) bootstrapInPlaceIgnitionsCreate(ctx context.Context
 		return errors.Wrapf(err, "Failed to rename bootstrap-in-place-for-live-iso.ign")
 	}
 
-	bootstrapConfig, err := parseIgnitionFile(bootstrapPath)
+	bootstrapConfig, err := ignitioncommon.ParseIgnitionFile(bootstrapPath)
 	if err != nil {
 		return err
 	}
@@ -586,7 +574,7 @@ func (g *installerGenerator) bootstrapInPlaceIgnitionsCreate(ctx context.Context
 	// To that end we set the dummy master ignition version to the same version as the bootstrap ignition
 	config := config_latest_types.Config{Ignition: config_latest_types.Ignition{Version: bootstrapConfig.Ignition.Version}}
 	for _, file := range []string{masterIgn, workerIgn} {
-		err = writeIgnitionFile(filepath.Join(g.workDir, file), &config)
+		err = ignitioncommon.WriteIgnitionFile(filepath.Join(g.workDir, file), &config)
 		if err != nil {
 			return errors.Wrapf(err, "Failed to create %s", file)
 		}
@@ -717,8 +705,8 @@ func (g *installerGenerator) expandMultiDocYaml(ctx context.Context, manifestPat
 // bootstrap ignition file
 func (g *installerGenerator) updateBootstrap(ctx context.Context, bootstrapPath string) error {
 	log := logutil.FromContext(ctx, g.log)
-	//nolint:shadow
-	config, err := parseIgnitionFile(bootstrapPath)
+
+	config, err := ignitioncommon.ParseIgnitionFile(bootstrapPath)
 	if err != nil {
 		g.log.Error(err)
 		return err
@@ -726,7 +714,7 @@ func (g *installerGenerator) updateBootstrap(ctx context.Context, bootstrapPath 
 
 	newFiles := []config_latest_types.File{}
 
-	masters, workers := sortHosts(g.cluster.Hosts)
+	masters, arbiters, workers := sortHosts(g.cluster.Hosts)
 	for i, file := range config.Storage.Files {
 		switch {
 		case isBaremetalProvisioningConfig(&config.Storage.Files[i]):
@@ -739,7 +727,7 @@ func (g *installerGenerator) updateBootstrap(ctx context.Context, bootstrapPath 
 			g.fixMOTDFile(&config.Storage.Files[i])
 		case isBMHFile(&config.Storage.Files[i]):
 			// extract bmh
-			bmh, err2 := fileToBMH(&config.Storage.Files[i]) //nolint,shadow
+			bmh, err2 := fileToBMH(&config.Storage.Files[i])
 			if err2 != nil {
 				log.Errorf("error parsing File contents to BareMetalHost: %v", err2)
 				return err2
@@ -748,20 +736,20 @@ func (g *installerGenerator) updateBootstrap(ctx context.Context, bootstrapPath 
 			// get corresponding host
 			var host *models.Host
 			masterHostnames := getHostnames(masters)
+			arbiterHostnames := getHostnames(arbiters)
 			workerHostnames := getHostnames(workers)
 
-			// The BMH files in the ignition are sorted according to hostname (please see the implementation in installcfg/installcfg.go).
-			// The masters and workers are also sorted by hostname.  This enables us to correlate correctly the host and the BMH file
-			if bmhIsMaster(bmh, masterHostnames, workerHostnames) {
-				if len(masters) == 0 {
-					return errors.Errorf("Not enough registered masters to match with BareMetalHosts")
-				}
-				host, masters = masters[0], masters[1:]
+			// Ensure that there are enough hosts for the role
+			role := getBmhRole(bmh, masterHostnames, arbiterHostnames, workerHostnames)
+			if role == models.HostRoleMaster {
+				host, masters = removeHostFromSlice(bmh.Name, masters)
+			} else if role == models.HostRoleArbiter {
+				host, arbiters = removeHostFromSlice(bmh.Name, arbiters)
 			} else {
-				if len(workers) == 0 {
-					return errors.Errorf("Not enough registered workers to match with BareMetalHosts")
-				}
-				host, workers = workers[0], workers[1:]
+				host, workers = removeHostFromSlice(bmh.Name, workers)
+			}
+			if host == nil {
+				return errors.Errorf("Not enough registered hosts in role %s to match with BareMetalHosts", role)
 			}
 
 			// modify bmh
@@ -775,8 +763,8 @@ func (g *installerGenerator) updateBootstrap(ctx context.Context, bootstrapPath 
 	}
 
 	config.Storage.Files = newFiles
-	if swag.StringValue(g.cluster.HighAvailabilityMode) != models.ClusterHighAvailabilityModeNone {
-		setFileInIgnition(config, "/opt/openshift/assisted-install-bootstrap", "data:,", false, 420, false)
+	if g.cluster.ControlPlaneCount != 1 {
+		ignitioncommon.SetFileInIgnition(config, "/opt/openshift/assisted-install-bootstrap", "data:,", false, 420, false)
 	}
 
 	// add new Network Manager config file that disables handling of /etc/resolv.conf
@@ -785,7 +773,14 @@ func (g *installerGenerator) updateBootstrap(ctx context.Context, bootstrapPath 
 		setNMConfigration(config)
 	}
 
-	err = writeIgnitionFile(bootstrapPath, config)
+	if g.isFeatureGateEnabled(features.FeatureGateNoRegistryClusterInstall) {
+		err = g.iriPatcher.UpdateBootstrap(config)
+		if err != nil {
+			return err
+		}
+	}
+
+	err = ignitioncommon.WriteIgnitionFile(bootstrapPath, config)
 	if err != nil {
 		log.Error(err)
 		return err
@@ -793,6 +788,21 @@ func (g *installerGenerator) updateBootstrap(ctx context.Context, bootstrapPath 
 	log.Infof("Updated file %s", bootstrapPath)
 
 	return nil
+}
+
+func removeHostFromSlice(bmhName string, hosts []*models.Host) (*models.Host, []*models.Host) {
+	if len(hosts) == 0 {
+		return nil, nil
+	}
+
+	for i, host := range hosts {
+		if bmhName == hostutil.GetHostnameForMsg(host) {
+			hosts = append(hosts[:i], hosts[i+1:]...)
+			return host, hosts
+		}
+	}
+	// If host not found, remove first entry in list for backwards compatibility
+	return hosts[0], hosts[1:]
 }
 
 // fixMOTDFile is a workaround for a bug in machine-config-operator, where it
@@ -833,24 +843,41 @@ func (g *installerGenerator) modifyBMHFile(file *config_latest_types.File, bmh *
 			Count:          int(inventory.CPU.Count),
 		},
 		Hostname: host.RequestedHostname,
-		NIC:      make([]bmh_v1alpha1.NIC, len(inventory.Interfaces)),
+		NIC:      []bmh_v1alpha1.NIC{},
 		Storage:  make([]bmh_v1alpha1.Storage, len(inventory.Disks)),
 	}
 	if inventory.Memory != nil {
 		hw.RAMMebibytes = int(inventory.Memory.PhysicalBytes / 1024 / 1024)
 	}
-	for i, iface := range inventory.Interfaces {
-		hw.NIC[i] = bmh_v1alpha1.NIC{
+
+	for _, iface := range inventory.Interfaces {
+		baseNIC := bmh_v1alpha1.NIC{
 			Name:      iface.Name,
 			Model:     iface.Product,
 			MAC:       iface.MacAddress,
 			SpeedGbps: int(iface.SpeedMbps / 1024),
 		}
+
+		// Helper function to create and append NIC for addresses
+		addNICForAddresses := func(addresses []string) {
+			if len(addresses) > 0 {
+				nic := baseNIC
+				nic.IP = g.selectInterfaceIPInsideMachineCIDR(addresses)
+				hw.NIC = append(hw.NIC, nic)
+			}
+		}
 		switch {
+		case g.cluster.PrimaryIPStack != nil:
+			// For dual-stack, we need to create NICs for each IP family
+			// Reference: https://github.com/metal3-io/baremetal-operator/pull/758
+			addNICForAddresses(iface.IPV4Addresses)
+			addNICForAddresses(iface.IPV6Addresses)
 		case len(iface.IPV4Addresses) > 0:
-			hw.NIC[i].IP = g.selectInterfaceIPInsideMachineCIDR(iface.IPV4Addresses)
+			// Single stack ipv4
+			addNICForAddresses(iface.IPV4Addresses)
 		case len(iface.IPV6Addresses) > 0:
-			hw.NIC[i].IP = g.selectInterfaceIPInsideMachineCIDR(iface.IPV6Addresses)
+			// Single stack ipv6
+			addNICForAddresses(iface.IPV6Addresses)
 		}
 	}
 	for i, disk := range inventory.Disks {
@@ -914,20 +941,20 @@ func (g *installerGenerator) modifyBMHFile(file *config_latest_types.File, bmh *
 
 func (g *installerGenerator) updateDhcpFiles() error {
 	path := filepath.Join(g.workDir, masterIgn)
-	config, err := parseIgnitionFile(path)
+	config, err := ignitioncommon.ParseIgnitionFile(path)
 	if err != nil {
 		return err
 	}
-	setFileInIgnition(config, "/etc/keepalived/unsupported-monitor.conf", g.encodedDhcpFileContents, false, 0o644, false)
+	ignitioncommon.SetFileInIgnition(config, "/etc/keepalived/unsupported-monitor.conf", g.encodedDhcpFileContents, false, 0o644, false)
 	encodedApiVip := network.GetEncodedApiVipLease(g.cluster)
 	if encodedApiVip != "" {
-		setFileInIgnition(config, "/etc/keepalived/lease-api", encodedApiVip, false, 0o644, false)
+		ignitioncommon.SetFileInIgnition(config, "/etc/keepalived/lease-api", encodedApiVip, false, 0o644, false)
 	}
 	encodedIngressVip := network.GetEncodedIngressVipLease(g.cluster)
 	if encodedIngressVip != "" {
-		setFileInIgnition(config, "/etc/keepalived/lease-ingress", encodedIngressVip, false, 0o644, false)
+		ignitioncommon.SetFileInIgnition(config, "/etc/keepalived/lease-ingress", encodedIngressVip, false, 0o644, false)
 	}
-	err = writeIgnitionFile(path, config)
+	err = ignitioncommon.WriteIgnitionFile(path, config)
 	if err != nil {
 		return err
 	}
@@ -938,7 +965,7 @@ func (g *installerGenerator) updateDhcpFiles() error {
 // consistent client identification.
 func (g *installerGenerator) addIpv6FileInIgnition(ignition string) error {
 	path := filepath.Join(g.workDir, ignition)
-	config, err := parseIgnitionFile(path)
+	config, err := ignitioncommon.ParseIgnitionFile(path)
 	if err != nil {
 		return err
 	}
@@ -950,8 +977,8 @@ func (g *installerGenerator) addIpv6FileInIgnition(ignition string) error {
 	if is410Version {
 		v6config = common.Ipv6DuidRuntimeConf
 	}
-	setFileInIgnition(config, "/etc/NetworkManager/conf.d/01-ipv6.conf", encodeIpv6Contents(v6config), false, 0o644, false)
-	err = writeIgnitionFile(path, config)
+	ignitioncommon.SetFileInIgnition(config, "/etc/NetworkManager/conf.d/01-ipv6.conf", encodeIpv6Contents(v6config), false, 0o644, false)
+	err = ignitioncommon.WriteIgnitionFile(path, config)
 	if err != nil {
 		return err
 	}
@@ -975,6 +1002,18 @@ func (g *installerGenerator) updateIgnitions() error {
 		}
 	}
 
+	// An ignition for arbiter nodes will only be generated for clusters that include arbiter nodes
+	isArbiterCluster := common.IsClusterTopologyHighlyAvailableArbiter(g.cluster)
+	if isArbiterCluster {
+		arbiterPath := filepath.Join(g.workDir, arbiterIgn)
+		if caCertFile != "" {
+			err := setCACertInIgnition(models.HostRoleArbiter, arbiterPath, g.workDir, caCertFile)
+			if err != nil {
+				return errors.Wrapf(err, "error adding CA cert to ignition %s", arbiterPath)
+			}
+		}
+	}
+
 	workerPath := filepath.Join(g.workDir, workerIgn)
 	if caCertFile != "" {
 		err := setCACertInIgnition(models.HostRoleWorker, workerPath, g.workDir, caCertFile)
@@ -988,7 +1027,11 @@ func (g *installerGenerator) updateIgnitions() error {
 		return err
 	}
 	if ipv6 {
-		for _, ignition := range []string{masterIgn, workerIgn} {
+		ignitions := []string{masterIgn, workerIgn}
+		if isArbiterCluster {
+			ignitions = append(ignitions, arbiterIgn)
+		}
+		for _, ignition := range ignitions {
 			if err = g.addIpv6FileInIgnition(ignition); err != nil {
 				return err
 			}
@@ -1084,7 +1127,7 @@ func (g *installerGenerator) clusterHasMCP(poolName string, clusterId *strfmt.UU
 }
 
 func (g *installerGenerator) updatePointerIgnitionMCP(poolName string, ignitionStr string) (string, error) {
-	config, err := ParseToLatest([]byte(ignitionStr))
+	config, err := ignitioncommon.ParseToLatest([]byte(ignitionStr))
 	if err != nil {
 		return "", err
 	}
@@ -1124,7 +1167,7 @@ func (g *installerGenerator) modifyPointerIgnitionMCP(poolName string, ignitionS
 }
 
 func (g *installerGenerator) writeSingleHostFile(host *models.Host, baseFile string, workDir string) error {
-	config, err := parseIgnitionFile(filepath.Join(workDir, baseFile))
+	config, err := ignitioncommon.ParseIgnitionFile(filepath.Join(workDir, baseFile))
 	if err != nil {
 		return err
 	}
@@ -1134,18 +1177,18 @@ func (g *installerGenerator) writeSingleHostFile(host *models.Host, baseFile str
 		return errors.Wrapf(err, "failed to get hostname for host %s", host.ID)
 	}
 
-	setFileInIgnition(config, "/etc/hostname", fmt.Sprintf("data:,%s", hostname), false, 420, true)
+	ignitioncommon.SetFileInIgnition(config, "/etc/hostname", fmt.Sprintf("data:,%s", hostname), false, 420, true)
 	if common.IsSingleNodeCluster(g.cluster) {
 		machineCidr := g.cluster.MachineNetworks[0]
 		ip, _, errP := net.ParseCIDR(string(machineCidr.Cidr))
 		if errP != nil {
 			return errors.Wrapf(errP, "Failed to parse machine cidr for node ip hint content")
 		}
-		setFileInIgnition(config, nodeIpHintFile, fmt.Sprintf("data:,KUBELET_NODEIP_HINT=%s", ip), false, 420, true)
+		ignitioncommon.SetFileInIgnition(config, nodeIpHintFile, fmt.Sprintf("data:,KUBELET_NODEIP_HINT=%s", ip), false, 420, true)
 	} else if g.nodeIpAllocations != nil && (common.IsMultiNodeNonePlatformCluster(g.cluster) || network.IsLoadBalancerUserManaged(g.cluster)) {
 		allocation, ok := g.nodeIpAllocations[lo.FromPtr(host.ID)]
 		if ok {
-			setFileInIgnition(config, nodeIpHintFile, fmt.Sprintf("data:,KUBELET_NODEIP_HINT=%s", allocation.HintIp), false, 420, true)
+			ignitioncommon.SetFileInIgnition(config, nodeIpHintFile, fmt.Sprintf("data:,KUBELET_NODEIP_HINT=%s", allocation.HintIp), false, 420, true)
 			g.log.Infof("Set KUBELET_NODEIP_HINT=%s for host %s", allocation.HintIp, lo.FromPtr(host.ID))
 		}
 	}
@@ -1156,7 +1199,7 @@ func (g *installerGenerator) writeSingleHostFile(host *models.Host, baseFile str
 	}
 
 	if host.IgnitionConfigOverrides != "" {
-		merged, mergeErr := MergeIgnitionConfig(configBytes, []byte(host.IgnitionConfigOverrides))
+		merged, mergeErr := ignitioncommon.MergeIgnitionConfig(configBytes, []byte(host.IgnitionConfigOverrides))
 		if mergeErr != nil {
 			return errors.Wrapf(mergeErr, "failed to apply ignition config overrides for host %s", host.ID)
 		}
@@ -1173,19 +1216,9 @@ func (g *installerGenerator) writeSingleHostFile(host *models.Host, baseFile str
 		configBytes = []byte(override)
 	}
 
-	inventory := models.Inventory{}
-	if host.Inventory != "" {
-		if err = json.Unmarshal([]byte(host.Inventory), &inventory); err != nil {
-			return err
-		}
-	}
-	if inventory.Boot != nil && inventory.Boot.DeviceType == models.BootDeviceTypePersistent {
-		g.log.Infof("Adding stateroot cleanup ignition override for host %s", host.ID)
-		merged, mergeErr := MergeIgnitionConfig(configBytes, []byte(cleanupDiscoveryStaterootIgnitionOverride))
-		if mergeErr != nil {
-			return errors.Wrapf(mergeErr, "failed to apply stateroot cleanup ignition override for host %s", host.ID)
-		}
-		configBytes = []byte(merged)
+	configBytes, err = AddStateRootCleanupToIgnition(g.log, configBytes, host)
+	if err != nil {
+		return errors.Wrapf(err, "failed to add state root cleanup to ignition for host %s", host.ID)
 	}
 
 	err = os.WriteFile(filepath.Join(workDir, hostutil.IgnitionFileName(host)), configBytes, 0600)
@@ -1210,11 +1243,16 @@ func (g *installerGenerator) writeHostFiles(hosts []*models.Host, baseFile strin
 
 // createHostIgnitions builds an ignition file for each host in the cluster based on the generated <role>.ign file
 func (g *installerGenerator) createHostIgnitions() error {
-	masters, workers := sortHosts(g.cluster.Hosts)
+	masters, arbiters, workers := sortHosts(g.cluster.Hosts)
 
 	err := g.writeHostFiles(masters, masterIgn, g.workDir)
 	if err != nil {
 		return errors.Wrapf(err, "error writing master host ignition files")
+	}
+
+	err = g.writeHostFiles(arbiters, arbiterIgn, g.workDir)
+	if err != nil {
+		return errors.Wrapf(err, "error writing arbiter host ignition files")
 	}
 
 	err = g.writeHostFiles(workers, workerIgn, g.workDir)
@@ -1268,11 +1306,44 @@ func (g *installerGenerator) downloadManifest(ctx context.Context, manifest stri
 	return nil
 }
 
+func (g *installerGenerator) isFeatureGateEnabled(feature v1.FeatureGateName) bool {
+	var installConfig installcfg.InstallerConfigBaremetal
+
+	if err := json.Unmarshal(g.rawInstallConfig, &installConfig); err != nil {
+		g.log.Errorf("cannot convert install config data while checking feature gate %s", string(feature))
+		return false
+	}
+	for _, fg := range installConfig.FeatureGates {
+		// Parse feature gate
+		featureParts := strings.Split(fg, "=")
+		if len(featureParts) != 2 {
+			g.log.Debugf("Cannot parse feature gate %s, skipping", fg)
+			continue
+		}
+		featureName := featureParts[0]
+		featureEnabled, err := strconv.ParseBool(featureParts[1])
+		if err != nil {
+			g.log.Debugf("Unsupported feature value %s, skipping", fg)
+			continue
+		}
+
+		if featureName == string(feature) && featureEnabled {
+			g.log.Debugf("Feature gate %s is enabled", string(feature))
+			return true
+		}
+	}
+	return false
+}
+
 // UploadToS3 uploads the generated files to S3
 func uploadToS3(ctx context.Context, workDir string, cluster *common.Cluster, s3Client s3wrapper.API, log logrus.FieldLogger) error {
 	toUpload := fileNames[:]
 	for _, host := range cluster.Hosts {
 		toUpload = append(toUpload, hostutil.IgnitionFileName(host))
+	}
+	// An ignition for arbiter nodes will only be generated for clusters that include arbiter nodes
+	if common.IsClusterTopologyHighlyAvailableArbiter(cluster) {
+		toUpload = append(toUpload, arbiterIgn)
 	}
 
 	for _, fileName := range toUpload {
@@ -1302,16 +1373,22 @@ func getHostnames(hosts []*models.Host) []string {
 
 }
 
-func bmhIsMaster(bmh *bmh_v1alpha1.BareMetalHost, masterHostnames, workerHostnames []string) bool {
+func getBmhRole(bmh *bmh_v1alpha1.BareMetalHost, masterHostnames, arbiterHostnames, workerHostnames []string) models.HostRole {
 	if funk.ContainsString(masterHostnames, bmh.Name) {
-		return true
+		return models.HostRoleMaster
+	}
+	if funk.ContainsString(arbiterHostnames, bmh.Name) {
+		return models.HostRoleArbiter
 	}
 	if funk.ContainsString(workerHostnames, bmh.Name) {
-		return false
+		return models.HostRoleWorker
 	}
 
-	// For backward compatibility in case the name is not in the (masterHostnames, workerHostnames)
-	return strings.Contains(bmh.Name, "-master-")
+	// For backward compatibility in case the name is not in found
+	if strings.Contains(bmh.Name, "-master-") {
+		return models.HostRoleMaster
+	}
+	return models.HostRoleWorker
 }
 
 // ExtractClusterID gets a local path of a "bootstrap.ign" file and extracts the OpenShift cluster ID
@@ -1321,7 +1398,7 @@ func ExtractClusterID(reader io.ReadCloser) (string, error) {
 		return "", err
 	}
 
-	config, err := ParseToLatest(bs)
+	config, err := ignitioncommon.ParseToLatest(bs)
 	if err != nil {
 		return "", err
 	}
@@ -1354,7 +1431,8 @@ func ExtractClusterID(reader io.ReadCloser) (string, error) {
 }
 
 func isBMHFile(file *config_latest_types.File) bool {
-	return strings.Contains(file.Node.Path, "openshift-cluster-api_hosts")
+	return strings.Contains(file.Node.Path, "openshift-cluster-api_hosts") ||
+		strings.Contains(file.Node.Path, "openshift-cluster-api_arbiter_hosts")
 }
 
 func isMOTD(file *config_latest_types.File) bool {
@@ -1388,14 +1466,17 @@ func encodeIpv6Contents(config string) string {
 	return fmt.Sprintf("data:,%s", url.PathEscape(config))
 }
 
-// sortHosts sorts hosts into masters and workers, excluding disabled hosts
-func sortHosts(hosts []*models.Host) ([]*models.Host, []*models.Host) {
+// sortHosts sorts hosts into masters, arbiters and workers, excluding disabled hosts
+func sortHosts(hosts []*models.Host) ([]*models.Host, []*models.Host, []*models.Host) {
 	masters := []*models.Host{}
+	arbiters := []*models.Host{}
 	workers := []*models.Host{}
 	for i := range hosts {
 		switch {
 		case common.GetEffectiveRole(hosts[i]) == models.HostRoleMaster:
 			masters = append(masters, hosts[i])
+		case common.GetEffectiveRole(hosts[i]) == models.HostRoleArbiter:
+			arbiters = append(arbiters, hosts[i])
 		default:
 			workers = append(workers, hosts[i])
 		}
@@ -1405,19 +1486,22 @@ func sortHosts(hosts []*models.Host) ([]*models.Host, []*models.Host) {
 	sort.SliceStable(masters, func(i, j int) bool {
 		return hostutil.GetHostnameForMsg(masters[i]) < hostutil.GetHostnameForMsg(masters[j])
 	})
+	sort.SliceStable(arbiters, func(i, j int) bool {
+		return hostutil.GetHostnameForMsg(arbiters[i]) < hostutil.GetHostnameForMsg(arbiters[j])
+	})
 	sort.SliceStable(workers, func(i, j int) bool {
 		return hostutil.GetHostnameForMsg(workers[i]) < hostutil.GetHostnameForMsg(workers[j])
 	})
-	return masters, workers
+	return masters, arbiters, workers
 }
 
 func setNMConfigration(config *config_latest_types.Config) {
 	fileContents := "data:text/plain;charset=utf-8;base64," + base64.StdEncoding.EncodeToString([]byte(common.UnmanagedResolvConf))
-	setFileInIgnition(config, "/etc/NetworkManager/conf.d/99-kni.conf", fileContents, false, 420, false)
+	ignitioncommon.SetFileInIgnition(config, "/etc/NetworkManager/conf.d/99-kni.conf", fileContents, false, 420, false)
 }
 
 func setCACertInIgnition(role models.HostRole, path string, workDir string, caCertFile string) error {
-	config, err := parseIgnitionFile(path)
+	config, err := ignitioncommon.ParseIgnitionFile(path)
 	if err != nil {
 		return err
 	}
@@ -1428,10 +1512,10 @@ func setCACertInIgnition(role models.HostRole, path string, workDir string, caCe
 		return err
 	}
 
-	setFileInIgnition(config, common.HostCACertPath, fmt.Sprintf("data:,%s", url.PathEscape(string(caCertData))), false, 420, false)
+	ignitioncommon.SetFileInIgnition(config, common.HostCACertPath, fmt.Sprintf("data:,%s", url.PathEscape(string(caCertData))), false, 420, false)
 
 	fileName := fmt.Sprintf("%s.ign", role)
-	err = writeIgnitionFile(filepath.Join(workDir, fileName), config)
+	err = ignitioncommon.WriteIgnitionFile(filepath.Join(workDir, fileName), config)
 	if err != nil {
 		return err
 	}

@@ -65,6 +65,17 @@ const (
 	AreNmstateRequirementsSatisfied                = validationID(models.HostValidationIDNmstateRequirementsSatisfied)
 	AreAMDGPURequirementsSatisfied                 = validationID(models.HostValidationIDAmdGpuRequirementsSatisfied)
 	AreKMMRequirementsSatisfied                    = validationID(models.HostValidationIDKmmRequirementsSatisfied)
+	AreNodeHealthcheckRequirementsSatisfied        = validationID(models.HostValidationIDNodeHealthcheckRequirementsSatisfied)
+	AreSelfNodeRemediationRequirementsSatisfied    = validationID(models.HostValidationIDSelfNodeRemediationRequirementsSatisfied)
+	AreFenceAgentsRemediationRequirementsSatisfied = validationID(models.HostValidationIDFenceAgentsRemediationRequirementsSatisfied)
+	AreNodeMaintenanceRequirementsSatisfied        = validationID(models.HostValidationIDNodeMaintenanceRequirementsSatisfied)
+	AreKubeDeschedulerRequirementsSatisfied        = validationID(models.HostValidationIDKubeDeschedulerRequirementsSatisfied)
+	AreClusterObservabilityRequirementsSatisfied   = validationID(models.HostValidationIDClusterObservabilityRequirementsSatisfied)
+	AreNUMAResourcesRequirementsSatisfied          = validationID(models.HostValidationIDNumaResourcesRequirementsSatisfied)
+	AreOADPRequirementsSatisfied                   = validationID(models.HostValidationIDOadpRequirementsSatisfied)
+	AreMetalLBRequirementsSatisfied                = validationID(models.HostValidationIDMetallbRequirementsSatisfied)
+	AreLokiRequirementsSatisfied                   = validationID(models.HostValidationIDLokiRequirementsSatisfied)
+	AreOpenShiftLoggingRequirementsSatisfied       = validationID(models.HostValidationIDOpenshiftLoggingRequirementsSatisfied)
 )
 
 func (v validationID) category() (string, error) {
@@ -124,7 +135,18 @@ func (v validationID) category() (string, error) {
 		AreOscRequirementsSatisfied,
 		AreNmstateRequirementsSatisfied,
 		AreAMDGPURequirementsSatisfied,
-		AreKMMRequirementsSatisfied:
+		AreKMMRequirementsSatisfied,
+		AreNodeHealthcheckRequirementsSatisfied,
+		AreSelfNodeRemediationRequirementsSatisfied,
+		AreFenceAgentsRemediationRequirementsSatisfied,
+		AreNodeMaintenanceRequirementsSatisfied,
+		AreKubeDeschedulerRequirementsSatisfied,
+		AreClusterObservabilityRequirementsSatisfied,
+		AreNUMAResourcesRequirementsSatisfied,
+		AreOADPRequirementsSatisfied,
+		AreMetalLBRequirementsSatisfied,
+		AreLokiRequirementsSatisfied,
+		AreOpenShiftLoggingRequirementsSatisfied:
 		return "operators", nil
 	}
 	return "", common.NewApiError(http.StatusInternalServerError, errors.Errorf("Unexpected validation id %s", string(v)))

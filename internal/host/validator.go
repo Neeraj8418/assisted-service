@@ -158,7 +158,7 @@ func (v *validator) getBootDeviceInfo(host *models.Host) (*models.DiskInfo, erro
 
 func (c *validationContext) validateRole() error {
 	switch common.GetEffectiveRole(c.host) {
-	case models.HostRoleMaster, models.HostRoleWorker, models.HostRoleAutoAssign:
+	case models.HostRoleMaster, models.HostRoleArbiter, models.HostRoleWorker, models.HostRoleAutoAssign:
 		return nil
 	default:
 		return errors.Errorf("Illegal role defined: %s", common.GetEffectiveRole(c.host))
@@ -177,19 +177,19 @@ func (c *validationContext) validateMachineCIDR() error {
 }
 
 func (c *validationContext) loadClusterHostRequirements(hwValidator hardware.Validator) error {
-	requirements, err := hwValidator.GetClusterHostRequirements(context.TODO(), c.cluster, c.host)
+	requirements, err := hwValidator.GetClusterHostRequirements(c.ctx, c.cluster, c.host)
 	c.clusterHostRequirements = requirements
 	return err
 }
 
 func (c *validationContext) loadInfraEnvHostRequirements(hwValidator hardware.Validator) error {
-	requirements, err := hwValidator.GetInfraEnvHostRequirements(context.TODO(), c.infraEnv)
+	requirements, err := hwValidator.GetInfraEnvHostRequirements(c.ctx, c.infraEnv)
 	c.clusterHostRequirements = requirements
 	return err
 }
 
 func (c *validationContext) loadGeneralMinRequirements(hwValidator hardware.Validator) error {
-	requirements, err := hwValidator.GetPreflightHardwareRequirements(context.TODO(), c.cluster)
+	requirements, err := hwValidator.GetPreflightHardwareRequirements(c.ctx, c.cluster)
 	if err != nil {
 		return err
 	}
@@ -201,7 +201,7 @@ func (c *validationContext) loadGeneralMinRequirements(hwValidator hardware.Vali
 }
 
 func (c *validationContext) loadGeneralInfraEnvMinRequirements(hwValidator hardware.Validator) error {
-	requirements, err := hwValidator.GetPreflightInfraEnvHardwareRequirements(context.TODO(), c.infraEnv)
+	requirements, err := hwValidator.GetPreflightInfraEnvHardwareRequirements(c.ctx, c.infraEnv)
 	if err != nil {
 		return err
 	}
@@ -213,6 +213,10 @@ func (c *validationContext) loadGeneralInfraEnvMinRequirements(hwValidator hardw
 }
 
 func newValidationContext(ctx context.Context, host *models.Host, c *common.Cluster, i *common.InfraEnv, db *gorm.DB, inventoryCache InventoryCache, hwValidator hardware.Validator, kubeApiEnabled bool, objectHandler s3wrapper.API, softTimeoutsEnabled bool) (*validationContext, error) {
+	if ctx == nil {
+		// Fallback to a non-nil context to avoid forwarding nil; mirrors old context.TODO() semantics.
+		ctx = context.Background()
+	}
 	ret := &validationContext{
 		ctx:                 ctx,
 		host:                host,
@@ -422,7 +426,14 @@ func (v *validator) hasMinMemory(c *validationContext) (ValidationStatus, string
 	if c.inventory == nil {
 		return status, "Missing inventory"
 	}
-	status = boolValue(c.inventory.Memory.PhysicalBytes >= conversions.MibToBytes(c.minRAMMibRequirement-HostMemoryRequirementToleranceMiB))
+	tolerance := HostMemoryRequirementToleranceMiB
+	if c.inventory.Memory.PhysicalBytesMethod == models.MemoryMethodMeminfo {
+		// We are using the usable memory as a proxy for the physical memory, so
+		// allow for an extra 2% of physical memory that is present but not
+		// usable (because it is allocated for e.g. the BIOS).
+		tolerance += c.minRAMMibRequirement / 50
+	}
+	status = boolValue(c.inventory.Memory.PhysicalBytes >= conversions.MibToBytes(c.minRAMMibRequirement-tolerance))
 	if status == ValidationSuccess {
 		return status, "Sufficient minimum RAM"
 	}
@@ -843,8 +854,12 @@ func (v *validator) belongsToMajorityGroup(c *validationContext) (ValidationStat
 	} else {
 		status = v.belongsToL2MajorityGroup(c, connectivity.MajorityGroups)
 	}
-	if status == ValidationFailure && len(c.cluster.Hosts) < 3 {
-		return ValidationPending, "Not enough hosts in cluster to calculate connectivity groups"
+	if status == ValidationFailure {
+		isFencing := common.IsClusterTopologyTwoNodesWithFencing(c.cluster)
+		if (!isFencing && len(c.cluster.Hosts) < 3) ||
+			(isFencing && len(c.cluster.Hosts) < common.AllowedNumberOfMasterHostsInTwoNodesWithFencing) {
+			return ValidationPending, "Not enough hosts in cluster to calculate connectivity groups"
+		}
 	}
 
 	switch status {
@@ -1774,7 +1789,10 @@ func (v *validator) isVSphereDiskUUIDEnabled(c *validationContext) (ValidationSt
 		// if any of them doesn't have that flag, it's likely because the user has forgotten to
 		// enable `disk.EnableUUID` for this virtual machine
 		// See https://access.redhat.com/solutions/4606201
-		if v.hwValidator.IsValidStorageDeviceType(disk, c.inventory.CPU.Architecture, "") && !disk.HasUUID {
+		// Additionally checking if the disk is eligible for installation before verifying the UUID flag
+		if disk.InstallationEligibility.Eligible &&
+			v.hwValidator.IsValidStorageDeviceType(disk, c.inventory.CPU.Architecture, "") &&
+			!disk.HasUUID {
 			return ValidationFailure, "VSphere disk.EnableUUID isn't enabled for this virtual machine, it's necessary for disks to be mounted properly"
 		}
 	}
@@ -1865,7 +1883,7 @@ func (v *validator) noIPCollisionsInNetwork(c *validationContext) (ValidationSta
 	err := json.Unmarshal([]byte(c.cluster.IPCollisions), &ipCollisions)
 	if err != nil {
 		message := "Unable to unmarshall ip collision report for cluster"
-		v.log.Errorf(message)
+		v.log.Error(message)
 		return ValidationError, message
 	}
 
@@ -1875,13 +1893,13 @@ func (v *validator) noIPCollisionsInNetwork(c *validationContext) (ValidationSta
 		hasIP, err := v.inventoryHasIP(c.inventory, ip)
 		if err != nil {
 			message := fmt.Sprintf("inventory of host %s contains bad CIDR: %s", c.host.ID, err.Error())
-			v.log.Errorf(message)
+			v.log.Error(message)
 			return ValidationError, message
 		}
 		if hasIP {
 			hasCollisions = true
 			message := fmt.Sprintf("Collisions detected for host ID %s, IP address: %s Mac addresses: %s", c.host.ID, ip, strings.Join(macs[:], ","))
-			v.log.Errorf(message)
+			v.log.Error(message)
 			collisionValidationText += fmt.Sprintf("%s\n", message)
 		}
 	}

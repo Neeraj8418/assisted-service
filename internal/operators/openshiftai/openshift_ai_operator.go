@@ -10,10 +10,17 @@ import (
 	"github.com/openshift/assisted-service/internal/common"
 	"github.com/openshift/assisted-service/internal/operators/api"
 	operatorscommon "github.com/openshift/assisted-service/internal/operators/common"
+	"github.com/openshift/assisted-service/internal/operators/lvm"
 	"github.com/openshift/assisted-service/internal/templating"
 	"github.com/openshift/assisted-service/models"
 	"github.com/openshift/assisted-service/pkg/conversions"
 	"github.com/sirupsen/logrus"
+)
+
+const (
+	clusterValidationID    = string(models.ClusterValidationIDOpenshiftAiRequirementsSatisfied)
+	clusterGPUValidationID = string(models.ClusterValidationIDOpenshiftAiGpuRequirementsSatisfied)
+	hostValidationID       = string(models.HostValidationIDOpenshiftAiRequirementsSatisfied)
 )
 
 var Operator = models.MonitoredOperator{
@@ -23,8 +30,7 @@ var Operator = models.MonitoredOperator{
 	SubscriptionName: "rhods-operator",
 	TimeoutSeconds:   30 * 60,
 	Bundles: pq.StringArray{
-		operatorscommon.BundleOpenShiftAINVIDIA.ID,
-		operatorscommon.BundleOpenShiftAIAMD.ID,
+		operatorscommon.BundleOpenShiftAI.ID,
 	},
 }
 
@@ -33,10 +39,18 @@ type operator struct {
 	log       logrus.FieldLogger
 	config    *Config
 	templates *template.Template
+	vendors   []GPUVendor
+}
+
+//go:generate mockgen --build_flags=--mod=mod -package openshiftai -destination mock_gpu_vendor.go . GPUVendor
+type GPUVendor interface {
+	ClusterHasGPU(c *common.Cluster) (bool, error)
+	GetName() string
+	GetFeatureSupportID() models.FeatureSupportLevelID
 }
 
 // NewOpenShiftAIOperator creates new OpenShift AI operator.
-func NewOpenShiftAIOperator(log logrus.FieldLogger) *operator {
+func NewOpenShiftAIOperator(log logrus.FieldLogger, vendors ...GPUVendor) *operator {
 	config := &Config{}
 	err := envconfig.Process(common.EnvConfigPrefix, config)
 	if err != nil {
@@ -50,6 +64,7 @@ func NewOpenShiftAIOperator(log logrus.FieldLogger) *operator {
 		log:       log,
 		config:    config,
 		templates: templates,
+		vendors:   vendors,
 	}
 }
 
@@ -64,42 +79,119 @@ func (o *operator) GetFullName() string {
 
 // GetDependencies provides a list of dependencies of the Operator
 func (o *operator) GetDependencies(c *common.Cluster) (result []string, err error) {
-	return nil, nil
+	ret := make([]string, 0)
+
+	if common.IsSingleNodeCluster(c) {
+		ret = append(ret, lvm.Operator.Name)
+	}
+
+	// If there is no hosts in the cluster, add all vendors as dependencies
+	if len(c.Hosts) == 0 {
+		for _, vendor := range o.vendors {
+			ret = append(ret, vendor.GetName())
+		}
+
+		return ret, nil
+	}
+
+	for _, vendor := range o.vendors {
+		hasGPU, err := vendor.ClusterHasGPU(c)
+		if err != nil {
+			return ret, fmt.Errorf("failed to check if cluster has GPU for %s: %w", vendor.GetName(), err)
+		}
+
+		if !hasGPU {
+			continue
+		}
+
+		ret = append(ret, vendor.GetName())
+	}
+
+	return ret, nil
 }
 
-// GetClusterValidationID returns cluster validation ID for the operator.
-func (o *operator) GetClusterValidationID() string {
-	return string(models.ClusterValidationIDOpenshiftAiRequirementsSatisfied)
+func (o *operator) GetDependenciesFeatureSupportID() []models.FeatureSupportLevelID {
+	ret := make([]models.FeatureSupportLevelID, 0, len(o.vendors))
+
+	ret = append(ret, models.FeatureSupportLevelIDLVM)
+
+	for _, vendor := range o.vendors {
+		ret = append(ret, vendor.GetFeatureSupportID())
+	}
+
+	return ret
+}
+
+// GetClusterValidationIDs returns cluster validation IDs for the operator.
+func (o *operator) GetClusterValidationIDs() []string {
+	return []string{clusterValidationID}
 }
 
 // GetHostValidationID returns host validation ID for the operator.
 func (o *operator) GetHostValidationID() string {
-	return string(models.HostValidationIDOpenshiftAiRequirementsSatisfied)
+	return hostValidationID
 }
 
 // ValidateCluster checks if the cluster satisfies the requirements to install the operator.
-func (o *operator) ValidateCluster(ctx context.Context, cluster *common.Cluster) (result api.ValidationResult,
-	err error) {
-	result.ValidationId = o.GetClusterValidationID()
+func (o *operator) ValidateCluster(ctx context.Context, cluster *common.Cluster) ([]api.ValidationResult, error) {
+	workerValidation := o.validateWorkers(cluster)
+
+	gpuValidation, err := o.validateGPU(cluster)
+	if err != nil {
+		return nil, fmt.Errorf("failed to validate GPU: %w", err)
+	}
+
+	return []api.ValidationResult{workerValidation, gpuValidation}, nil
+}
+
+func (o *operator) validateWorkers(cluster *common.Cluster) api.ValidationResult {
+	result := api.ValidationResult{
+		ValidationId: clusterValidationID,
+		Status:       api.Success,
+	}
+
+	if common.IsSingleNodeCluster(cluster) {
+		return result
+	}
 
 	// Check the number of worker nodes:
 	workerCount := int64(common.NumberOfWorkers(cluster))
 	if workerCount < o.config.MinWorkerNodes {
-		result.Reasons = append(
-			result.Reasons,
+		result.Status = api.Failure
+		result.Reasons = []string{
 			fmt.Sprintf(
 				"OpenShift AI requires at least %d worker nodes, but the cluster has %d.",
 				o.config.MinWorkerNodes, workerCount,
 			),
-		)
+		}
+
+		return result
 	}
 
-	if len(result.Reasons) > 0 {
-		result.Status = api.Failure
-	} else {
-		result.Status = api.Success
+	return result
+}
+
+func (o *operator) validateGPU(cluster *common.Cluster) (api.ValidationResult, error) {
+	result := api.ValidationResult{
+		ValidationId: clusterGPUValidationID,
+		Status:       api.Success,
 	}
-	return
+
+	for _, vendor := range o.vendors {
+		hasGPU, err := vendor.ClusterHasGPU(cluster)
+		if err != nil {
+			return result, fmt.Errorf("failed to check if cluster has GPU for %s: %w", vendor.GetName(), err)
+		}
+
+		if hasGPU {
+			return result, nil
+		}
+	}
+
+	result.Status = api.Failure
+	result.Reasons = []string{"Cluster doesn't have any supported GPU"}
+
+	return result, nil
 }
 
 // ValidateHost returns validationResult based on node type requirements such as memory and CPU.
@@ -240,7 +332,7 @@ func (o *operator) GetFeatureSupportID() models.FeatureSupportLevelID {
 	return models.FeatureSupportLevelIDOPENSHIFTAI
 }
 
-// GetBundleLabels returns the bundle labels for the LSO operator
-func (l *operator) GetBundleLabels() []string {
+// GetBundleLabels returns the bundle labels for the OpenShift AI operator
+func (o *operator) GetBundleLabels(featureIDs []models.FeatureSupportLevelID) []string {
 	return []string(Operator.Bundles)
 }

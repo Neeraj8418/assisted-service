@@ -1,7 +1,6 @@
 contentOrigin:
   repofiles: ["./redhat.repo"]
 packages:
-  - libvirt-libs
   - nmstate
   - nmstate-devel
   - nmstate-libs
@@ -9,9 +8,12 @@ packages:
   - openshift-clients
   - gcc
   - git
-  - openssl-devel  
+  - openssl-devel
+  - libseccomp  
 arches:
   - aarch64
   - x86_64
   - ppc64le
   - s390x
+context:
+  containerfile: ../../Dockerfile.assisted-service-rhel9-mce

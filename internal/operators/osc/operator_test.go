@@ -8,6 +8,7 @@ import (
 	. "github.com/onsi/gomega"
 	"github.com/openshift/assisted-service/internal/common"
 	"github.com/openshift/assisted-service/internal/operators/api"
+	"github.com/openshift/assisted-service/internal/operators/nodefeaturediscovery"
 	"github.com/openshift/assisted-service/models"
 	"github.com/openshift/assisted-service/pkg/conversions"
 	"github.com/sirupsen/logrus"
@@ -30,13 +31,25 @@ var _ = Describe("OSC Operator", func() {
 		})
 
 		It("should return the right validations ids", func() {
-			Expect(operator.GetClusterValidationID()).To(Equal(string(models.ClusterValidationIDOscRequirementsSatisfied)))
+			Expect(operator.GetClusterValidationIDs()).To(Equal([]string{string(models.ClusterValidationIDOscRequirementsSatisfied)}))
 			Expect(operator.GetHostValidationID()).To(Equal(string(models.HostValidationIDOscRequirementsSatisfied)))
 		})
 
 		It("should return the right feature support id", func() {
 			Expect(operator.GetFeatureSupportID()).To(Equal(models.FeatureSupportLevelIDOSC))
 		})
+
+		It("should return the right NFD operator name", func() {
+			cluster := common.Cluster{
+				Cluster: models.Cluster{ControlPlaneCount: common.MinMasterHostsNeededForInstallationInHaMode},
+			}
+
+			deps, err := operator.GetDependencies(&cluster)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(deps).To(HaveLen(1))
+			Expect(deps[0]).To(Equal(nodefeaturediscovery.Operator.Name))
+		})
+
 	})
 
 	Context("host requirements", func() {
@@ -47,9 +60,8 @@ var _ = Describe("OSC Operator", func() {
 		var cluster common.Cluster
 
 		BeforeEach(func() {
-			mode := models.ClusterHighAvailabilityModeFull
 			cluster = common.Cluster{
-				Cluster: models.Cluster{HighAvailabilityMode: &mode},
+				Cluster: models.Cluster{ControlPlaneCount: common.MinMasterHostsNeededForInstallationInHaMode},
 			}
 		})
 
@@ -77,9 +89,8 @@ var _ = Describe("OSC Operator", func() {
 		var cluster common.Cluster
 
 		BeforeEach(func() {
-			mode := models.ClusterHighAvailabilityModeFull
 			cluster = common.Cluster{
-				Cluster: models.Cluster{HighAvailabilityMode: &mode},
+				Cluster: models.Cluster{ControlPlaneCount: common.MinMasterHostsNeededForInstallationInHaMode},
 			}
 		})
 

@@ -17,9 +17,12 @@ limitations under the License.
 package controllers
 
 import (
+	"bytes"
 	"context"
+	"crypto/x509"
 	_ "embed"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"net/url"
 	"os"
@@ -34,6 +37,7 @@ import (
 	"github.com/openshift/assisted-service/internal/cluster/validations"
 	"github.com/openshift/assisted-service/internal/common"
 	"github.com/openshift/assisted-service/internal/gencrypto"
+	"github.com/openshift/assisted-service/internal/kubernetes"
 	"github.com/openshift/assisted-service/internal/versions"
 	"github.com/openshift/assisted-service/models"
 	logutil "github.com/openshift/assisted-service/pkg/log"
@@ -87,12 +91,14 @@ const (
 
 	configmapAnnotation                 = "unsupported.agent-install.openshift.io/assisted-service-configmap"
 	imageServiceSkipVerifyTLSAnnotation = "unsupported.agent-install.openshift.io/assisted-image-service-skip-verify-tls"
+	allowUnrestrictedImagePulls         = "unsupported.agent-install.openshift.io/assisted-service-allow-unrestricted-image-pulls"
 
 	assistedConfigHashAnnotation                 = "agent-install.openshift.io/config-hash"
 	mirrorConfigHashAnnotation                   = "agent-install.openshift.io/mirror-hash"
 	userConfigHashAnnotation                     = "agent-install.openshift.io/user-config-hash"
 	osImagesAdditionalParamsConfigHashAnnotation = "agent-install.openshift.io/os-images-additional-params-config-hash"
 	osImagesCAConfigHashAnnotation               = "agent-install.openshift.io/os-images-ca-hash"
+	enableImageServiceAnnotation                 = "agent-install.openshift.io/enable-image-service"
 	imageServiceStatefulSetFinalizerName         = imageServiceName + "." + aiv1beta1.Group + "/ai-deprovision"
 	agentServiceConfigFinalizerName              = "agentserviceconfig." + aiv1beta1.Group + "/ai-deprovision"
 
@@ -100,8 +106,7 @@ const (
 	injectCABundleAnnotation = "service.beta.openshift.io/inject-cabundle"
 	injectTrustedCALabel     = "config.openshift.io/inject-trusted-cabundle"
 
-	defaultNamespace                 = "default"
-	osImageDownloadTrustedCAFilename = "tls.crt"
+	defaultNamespace = "default"
 
 	osImageAdditionalParamsHeadersEnvVar     = "OS_IMAGES_REQUEST_HEADERS"
 	osImageAdditionalParamsQueryParamsEnvVar = "OS_IMAGES_REQUEST_QUERY_PARAMS"
@@ -130,7 +135,8 @@ type AgentServiceConfigReconcileContext struct {
 	NodeSelector map[string]string
 	Tolerations  []corev1.Toleration
 
-	Recorder record.EventRecorder
+	Recorder        record.EventRecorder
+	PodIntrospector kubernetes.PodIntrospector
 
 	// flag to indicate if the operator is running on an OpenShift cluster or some other flavor of Kubernetes
 	IsOpenShift bool
@@ -171,6 +177,7 @@ type ASC struct {
 	spec *aiv1beta1.AgentServiceConfigSpec
 
 	/* Status part of AgentServiceConfig CRD family */
+	status     *aiv1beta1.AgentServiceConfigStatus
 	conditions *[]conditionsv1.Condition
 
 	/* properties. use this field for cross cluster communication */
@@ -185,6 +192,7 @@ func initASC(r *AgentServiceConfigReconciler, instance *aiv1beta1.AgentServiceCo
 	asc.Object = instance
 	asc.spec = &instance.Spec
 	asc.conditions = &instance.Status.Conditions
+	asc.status = &instance.Status
 	return asc
 }
 
@@ -227,10 +235,10 @@ func (r *AgentServiceConfigReconciler) Reconcile(origCtx context.Context, req ct
 		})
 
 	defer func() {
-		log.Info("AgentServiceConfig Reconcile ended")
+		log.Debug("AgentServiceConfig Reconcile ended")
 	}()
 
-	log.Info("AgentServiceConfig Reconcile started")
+	log.Debug("AgentServiceConfig Reconcile started")
 
 	instance := &aiv1beta1.AgentServiceConfig{}
 	asc = initASC(r, instance)
@@ -286,13 +294,20 @@ func (r *AgentServiceConfigReconciler) Reconcile(origCtx context.Context, req ct
 		return ctrl.Result{}, nil
 	}
 
+	// If image service is disabled and osImages is populated, add error condition
+	if !isImageServiceEnabled(asc.Object.GetAnnotations()) && len(asc.spec.OSImages) > 0 {
+		osImagesError := fmt.Errorf("osImages should be empty when image service is disabled")
+		registerOSImageError(ctx, osImagesError, asc)
+		return ctrl.Result{}, osImagesError
+	}
+
 	// Remove IPXE HTTP routes if not needed
 	if err := cleanHTTPRoute(ctx, log, asc); err != nil {
 		return ctrl.Result{Requeue: true}, err
 	}
 
 	// Reconcile components
-	for _, component := range getComponents(asc.spec, asc.rec.IsOpenShift) {
+	for _, component := range getComponents(asc.spec, asc.rec.IsOpenShift, asc.Object.GetAnnotations()) {
 		if result, err := reconcileComponent(ctx, log, asc, component); err != nil {
 			return result, err
 		}
@@ -303,10 +318,11 @@ func (r *AgentServiceConfigReconciler) Reconcile(origCtx context.Context, req ct
 		}
 	}
 
-	// Ensure image-service StatefulSet is reconciled
-	if err := ensureImageServiceStatefulSet(ctx, log, asc); err != nil {
-		return ctrl.Result{Requeue: true}, err
-
+	// Ensure image-service StatefulSet is reconciled (only if image service is not disabled)
+	if isImageServiceEnabled(asc.Object.GetAnnotations()) {
+		if err := ensureImageServiceStatefulSet(ctx, log, asc); err != nil {
+			return ctrl.Result{Requeue: true}, err
+		}
 	}
 
 	return updateConditions(ctx, log, asc)
@@ -362,44 +378,62 @@ func updateConditions(ctx context.Context, log *logrus.Entry, asc ASC) (ctrl.Res
 	return ctrl.Result{}, nil
 }
 
-func getComponents(spec *aiv1beta1.AgentServiceConfigSpec, isOpenshift bool) []component {
+func getComponents(spec *aiv1beta1.AgentServiceConfigSpec, isOpenshift bool, annotations map[string]string) []component {
+	imageServiceEnabled := isImageServiceEnabled(annotations)
+
 	components := []component{
 		{"FilesystemStorage", aiv1beta1.ReasonStorageFailure, newFilesystemPVC},
 		{"DatabaseStorage", aiv1beta1.ReasonStorageFailure, newDatabasePVC},
-		{"ImageServiceService", aiv1beta1.ReasonImageHandlerServiceFailure, newImageServiceService},
 		{"AgentService", aiv1beta1.ReasonAgentServiceFailure, newAgentService},
 		{"AgentLocalAuthSecret", aiv1beta1.ReasonAgentLocalAuthSecretFailure, newAgentLocalAuthSecret},
 		{"DatabaseSecret", aiv1beta1.ReasonPostgresSecretFailure, newPostgresSecret},
-		{"ImageServiceServiceAccount", aiv1beta1.ReasonImageHandlerServiceAccountFailure, newImageServiceServiceAccount},
-		{"ImageServiceRoute", aiv1beta1.ReasonImageHandlerRouteFailure, newImageServiceRoute},
 		{"AgentRoute", aiv1beta1.ReasonAgentRouteFailure, newAgentRoute},
-		// needs to be created after the route to pull the hostname into the configmap
-		{"AssistedServiceConfigMap", aiv1beta1.ReasonConfigFailure, newAssistedCM},
 	}
+
+	if imageServiceEnabled {
+		components = append(components,
+			component{"ImageServiceService", aiv1beta1.ReasonImageHandlerServiceFailure, newImageServiceService},
+			component{"ImageServiceServiceAccount", aiv1beta1.ReasonImageHandlerServiceAccountFailure, newImageServiceServiceAccount},
+			component{"ImageServiceRoute", aiv1beta1.ReasonImageHandlerRouteFailure, newImageServiceRoute},
+		)
+	}
+
 	if isOpenshift {
 		components = append(components,
 			component{"ServiceMonitor", aiv1beta1.ReasonAgentServiceMonitorFailure, newServiceMonitor},
 			component{"IngressCertConfigMap", aiv1beta1.ReasonIngressCertFailure, newIngressCertCM},
-			// this is only for mounting in the https certs
-			component{"ImageServiceConfigMap", aiv1beta1.ReasonConfigFailure, newImageServiceConfigMap},
 			component{"ClusterTrustedCAConfigMap", aiv1beta1.ReasonConfigFailure, newClusterTrustedCACM},
 			component{"AssistedTrustedCAConfigMap", aiv1beta1.ReasonConfigFailure, newAssistedTrustedCACM},
 		)
+
+		if imageServiceEnabled {
+			components = append(components,
+				// this is only for mounting in the https certs
+				component{"ImageServiceConfigMap", aiv1beta1.ReasonConfigFailure, newImageServiceConfigMap},
+			)
+		}
+
 		// Additional routes need to be synced if HTTP iPXE routes are exposed
 		if exposeIPXEHTTPRoute(spec) {
 			components = append(components,
-				component{"ImageServiceIPXERoute", aiv1beta1.ReasonImageHandlerRouteFailure, newImageServiceIPXERoute},
 				component{"AgentIPXERoute", aiv1beta1.ReasonAgentRouteFailure, newAgentIPXERoute},
 			)
+			if imageServiceEnabled {
+				components = append(components,
+					component{"ImageServiceIPXERoute", aiv1beta1.ReasonImageHandlerRouteFailure, newImageServiceIPXERoute},
+				)
+			}
 		}
 	} else {
 		components = append(components, certManagerComponents()...)
 	}
+	// needs to be created after all routes to pull the hostnames into the configmap
+	components = append(components,
+		component{"AssistedServiceConfigMap", aiv1beta1.ReasonConfigFailure, newAssistedCM})
 	components = append(components,
 		// needs to be created after all of the configmaps to calculate the config hash and ensure the correct data exists
 		component{"AssistedServiceDeployment", aiv1beta1.ReasonDeploymentFailure, newAssistedServiceDeployment})
 	return components
-
 }
 
 func (r *AgentServiceConfigReconciler) getWebhookComponents() []component {
@@ -517,6 +551,31 @@ func (r *AgentServiceConfigReconciler) SetupWithManager(mgr ctrl.Manager) error 
 		Owns(&rbacv1.ClusterRole{}).
 		Owns(&apiregv1.APIService{})
 
+	mirrorRegistryCMPredicates := builder.WithPredicates(predicate.Funcs{
+		CreateFunc:  func(e event.CreateEvent) bool { return e.Object.GetNamespace() == r.Namespace },
+		UpdateFunc:  func(e event.UpdateEvent) bool { return e.ObjectNew.GetNamespace() == r.Namespace },
+		DeleteFunc:  func(e event.DeleteEvent) bool { return e.Object.GetNamespace() == r.Namespace },
+		GenericFunc: func(e event.GenericEvent) bool { return e.Object.GetNamespace() == r.Namespace },
+	})
+	mirrorRegistryCMHandler := handler.EnqueueRequestsFromMapFunc(
+		func(ctx context.Context, cm client.Object) []reconcile.Request {
+			log := logutil.FromContext(ctx, r.Log).WithFields(
+				logrus.Fields{
+					"mirror_registry": cm.GetName(),
+				})
+			instance := &aiv1beta1.AgentServiceConfig{}
+			if err := r.Get(ctx, types.NamespacedName{Name: AgentServiceConfigName}, instance); err != nil {
+				log.Debugf("failed to get AgentServiceConfig")
+				return []reconcile.Request{}
+			}
+			if instance.Spec.MirrorRegistryRef != nil && instance.Spec.MirrorRegistryRef.Name == cm.GetName() {
+				return []reconcile.Request{{NamespacedName: types.NamespacedName{Name: AgentServiceConfigName}}}
+			}
+			return []reconcile.Request{}
+		},
+	)
+	b = b.Watches(&corev1.ConfigMap{}, mirrorRegistryCMHandler, mirrorRegistryCMPredicates)
+
 	if r.IsOpenShift {
 		ingressCMPredicates := builder.WithPredicates(predicate.Funcs{
 			CreateFunc:  func(e event.CreateEvent) bool { return checkIngressCMName(e.Object) },
@@ -576,12 +635,18 @@ func monitorOperands(ctx context.Context, log logrus.FieldLogger, asc ASC) (stri
 		}
 	}
 
-	// monitor statefulset
+	return monitorImageServiceStatefulSet(ctx, log, asc)
+}
+
+// Monitor Image Service StatefulSet. NOOP if image service is disabled.
+func monitorImageServiceStatefulSet(ctx context.Context, log logrus.FieldLogger, asc ASC) (string, error) {
+	if !isImageServiceEnabled(asc.Object.GetAnnotations()) {
+		return "", nil
+	}
 	ss := &appsv1.StatefulSet{}
 	if err := asc.Client.Get(ctx, types.NamespacedName{Name: imageServiceName, Namespace: asc.namespace}, ss); err != nil {
 		return "", err
 	}
-
 	desiredReplicas := *ss.Spec.Replicas
 	for kind, replicas := range map[string]int32{
 		"created": ss.Status.Replicas,
@@ -593,14 +658,13 @@ func monitorOperands(ctx context.Context, log logrus.FieldLogger, asc ASC) (stri
 			return fmt.Sprintf("StatefulSet %s %s replicas does not match desired replicas", imageServiceName, kind), nil
 		}
 	}
-
 	return "", nil
 }
 
 func newFilesystemPVC(ctx context.Context, log logrus.FieldLogger, asc ASC) (client.Object, controllerutil.MutateFn, error) {
 	pvc := &corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      serviceName,
+			Name:      getPVCName(asc.Object.GetAnnotations(), serviceName),
 			Namespace: asc.namespace,
 		},
 		Spec: asc.spec.FileSystemStorage,
@@ -623,7 +687,7 @@ func newFilesystemPVC(ctx context.Context, log logrus.FieldLogger, asc ASC) (cli
 func newDatabasePVC(ctx context.Context, log logrus.FieldLogger, asc ASC) (client.Object, controllerutil.MutateFn, error) {
 	pvc := &corev1.PersistentVolumeClaim{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      databaseName,
+			Name:      getPVCName(asc.Object.GetAnnotations(), databaseName),
 			Namespace: asc.namespace,
 		},
 		Spec: asc.spec.DatabaseStorage,
@@ -664,11 +728,11 @@ func newAgentService(ctx context.Context, log logrus.FieldLogger, asc ASC) (clie
 			svc.Spec.Ports = append(svc.Spec.Ports, corev1.ServicePort{}, corev1.ServicePort{})
 		}
 		svc.Spec.Ports[0].Name = serviceName
-		svc.Spec.Ports[0].Port = int32(servicePort.IntValue())
+		svc.Spec.Ports[0].Port = int32(servicePort.IntValue()) // nolint: gosec
 		svc.Spec.Ports[0].TargetPort = servicePort
 		svc.Spec.Ports[0].Protocol = corev1.ProtocolTCP
 		svc.Spec.Ports[1].Name = fmt.Sprintf("%s-http", serviceName)
-		svc.Spec.Ports[1].Port = int32(serviceHTTPPort.IntValue())
+		svc.Spec.Ports[1].Port = int32(serviceHTTPPort.IntValue()) // nolint: gosec
 		svc.Spec.Ports[1].TargetPort = serviceHTTPPort
 		svc.Spec.Ports[1].Protocol = corev1.ProtocolTCP
 		svc.Spec.Selector = map[string]string{"app": serviceName}
@@ -700,11 +764,11 @@ func newImageServiceService(ctx context.Context, log logrus.FieldLogger, asc ASC
 			svc.Spec.Ports = append(svc.Spec.Ports, corev1.ServicePort{}, corev1.ServicePort{})
 		}
 		svc.Spec.Ports[0].Name = imageServiceName
-		svc.Spec.Ports[0].Port = int32(imageHandlerPort.IntValue())
+		svc.Spec.Ports[0].Port = int32(imageHandlerPort.IntValue()) // nolint: gosec
 		svc.Spec.Ports[0].TargetPort = imageHandlerPort
 		svc.Spec.Ports[0].Protocol = corev1.ProtocolTCP
 		svc.Spec.Ports[1].Name = fmt.Sprintf("%s-http", imageServiceName)
-		svc.Spec.Ports[1].Port = int32(imageHandlerHTTPPort.IntValue())
+		svc.Spec.Ports[1].Port = int32(imageHandlerHTTPPort.IntValue()) // nolint: gosec
 		svc.Spec.Ports[1].TargetPort = imageHandlerHTTPPort
 		svc.Spec.Ports[1].Protocol = corev1.ProtocolTCP
 		svc.Spec.Selector = map[string]string{"app": imageServiceName}
@@ -753,7 +817,7 @@ func newAgentRoute(ctx context.Context, log logrus.FieldLogger, asc ASC) (client
 		if asc.spec.Ingress == nil {
 			return nil, nil, fmt.Errorf("ingress config is required for non-OpenShift deployments")
 		}
-		return newIngress(asc, serviceName, asc.spec.Ingress.AssistedServiceHostname, int32(servicePort.IntValue()))
+		return newIngress(asc, serviceName, asc.spec.Ingress.AssistedServiceHostname, int32(servicePort.IntValue())) // nolint: gosec
 	}
 	weight := int32(100)
 	route := &routev1.Route{
@@ -876,7 +940,7 @@ func newImageServiceRoute(ctx context.Context, log logrus.FieldLogger, asc ASC) 
 		if asc.spec.Ingress == nil {
 			return nil, nil, fmt.Errorf("ingress config is required for non-OpenShift deployments")
 		}
-		return newIngress(asc, imageServiceName, asc.spec.Ingress.ImageServiceHostname, int32(imageHandlerPort.IntValue()))
+		return newIngress(asc, imageServiceName, asc.spec.Ingress.ImageServiceHostname, int32(imageHandlerPort.IntValue())) // nolint: gosec
 	}
 	weight := int32(100)
 	route := &routev1.Route{
@@ -923,7 +987,7 @@ func newImageServiceIPXERoute(ctx context.Context, log logrus.FieldLogger, asc A
 func newAgentLocalAuthSecret(ctx context.Context, log logrus.FieldLogger, asc ASC) (client.Object, controllerutil.MutateFn, error) {
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      agentLocalAuthSecretName,
+			Name:      getSecretName(asc.Object.GetAnnotations(), agentLocalAuthSecretName),
 			Namespace: asc.namespace,
 			Labels: map[string]string{
 				BackupLabel: BackupLabelValue,
@@ -958,7 +1022,7 @@ func newAgentLocalAuthSecret(ctx context.Context, log logrus.FieldLogger, asc AS
 func newPostgresSecret(ctx context.Context, log logrus.FieldLogger, asc ASC) (client.Object, controllerutil.MutateFn, error) {
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      databaseName,
+			Name:      getSecretName(asc.Object.GetAnnotations(), databaseName),
 			Namespace: asc.namespace,
 			Labels: map[string]string{
 				BackupLabel: BackupLabelValue,
@@ -1092,6 +1156,15 @@ func newAssistedTrustedCACM(ctx context.Context, log logrus.FieldLogger, asc ASC
 		}
 	}
 
+	// Ensure no duplicate certificates in the CA bundle
+	caBundle, numOfDuplicates, err := common.RemoveDuplicatesFromCaBundle(b.String())
+	if err != nil {
+		return nil, nil, err
+	}
+	if numOfDuplicates > 0 {
+		log.Infof("Removed %d duplicate certificates from CA bundle", numOfDuplicates)
+	}
+
 	cm := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      assistedCAConfigMapName,
@@ -1104,7 +1177,7 @@ func newAssistedTrustedCACM(ctx context.Context, log logrus.FieldLogger, asc ASC
 			return err
 		}
 		cm.Data = map[string]string{
-			caBundleKey: b.String(),
+			caBundleKey: caBundle,
 		}
 		return nil
 	}
@@ -1205,6 +1278,19 @@ func unauthenticatedRegistries(ctx context.Context, asc ASC) string {
 //go:embed default_controller_hw_requirements.json
 var defaultControllerHardwareRequirements string
 
+var defaultWaitingForControlPlaneHostStageTimeout = "90m"
+
+func getWaitingForControlPlaneHostStageTimeout() string {
+	if timeout := os.Getenv("HOST_STAGE_WAITING_FOR_CONTROL_PLANE_TIMEOUT"); timeout != "" {
+		return timeout
+	}
+
+	// The defualt timeout for all deployment modes is 60m, we want to increase it to 90m for operator deployment
+	// because lately we see more failures due to timeout in this host installation stage. There is an open Jira issue
+	// for investigating this timeout issue: https://issues.redhat.com/browse/MGMT-20662
+	return defaultWaitingForControlPlaneHostStageTimeout
+}
+
 func newAssistedCM(ctx context.Context, log logrus.FieldLogger, asc ASC) (client.Object, controllerutil.MutateFn, error) {
 	serviceURL, err := urlForRoute(ctx, asc, serviceName)
 	if err != nil {
@@ -1212,10 +1298,14 @@ func newAssistedCM(ctx context.Context, log logrus.FieldLogger, asc ASC) (client
 		return nil, nil, err
 	}
 
-	imageServiceURL, err := urlForRoute(ctx, asc, imageServiceName)
-	if err != nil {
-		log.WithError(err).Warnf("Failed to get URL for route %s", imageServiceName)
-		return nil, nil, err
+	// When image service is disabled, set to empty string
+	var imageServiceURL string
+	if isImageServiceEnabled(asc.Object.GetAnnotations()) {
+		imageServiceURL, err = urlForRoute(ctx, asc, imageServiceName)
+		if err != nil {
+			log.WithError(err).Warnf("Failed to get URL for route %s", imageServiceName)
+			return nil, nil, err
+		}
 	}
 
 	cm := &corev1.ConfigMap{
@@ -1239,7 +1329,7 @@ func newAssistedCM(ctx context.Context, log logrus.FieldLogger, asc ASC) (client
 			"CONTROLLER_IMAGE":       ControllerImage(),
 			"INSTALLER_IMAGE":        InstallerImage(),
 			"SELF_VERSION":           ServiceImage(asc.Object),
-			"OS_IMAGES":              getOSImages(log, asc.spec),
+			"OS_IMAGES":              getOSImages(log, asc.spec, asc.Object.GetAnnotations()),
 			"MUST_GATHER_IMAGES":     getMustGatherImages(log, asc.spec),
 			"ISO_IMAGE_TYPE":         "minimal-iso",
 			"S3_USE_SSL":             "false",
@@ -1250,7 +1340,6 @@ func newAssistedCM(ctx context.Context, log logrus.FieldLogger, asc ASC) (client
 			"DEPLOY_TARGET":          "k8s",
 			"STORAGE":                "filesystem",
 			"ISO_WORKSPACE_BASE_DIR": "/data",
-			"ISO_CACHE_DIR":          "/data/cache",
 
 			// from configmap
 			"AUTH_TYPE":                   "local",
@@ -1271,6 +1360,8 @@ func newAssistedCM(ctx context.Context, log logrus.FieldLogger, asc ASC) (client
 			"NAMESPACE":              asc.namespace,
 			"INSTALL_INVOKER":        "assisted-installer-operator",
 			"SKIP_CERT_VERIFICATION": "False",
+			"HOST_STAGE_WAITING_FOR_CONTROL_PLANE_TIMEOUT": getWaitingForControlPlaneHostStageTimeout(),
+			"EVENT_RATE_LIMITS":                            "",
 		}
 		// serve https only on OCP
 		if asc.rec.IsOpenShift {
@@ -1282,12 +1373,34 @@ func newAssistedCM(ctx context.Context, log logrus.FieldLogger, asc ASC) (client
 			cm.Data["SERVICE_CA_CERT_PATH"] = "/etc/assisted-ingress-cert/ca.crt"
 		}
 
+		if forceInsecurePolicy, ok := asc.Object.GetAnnotations()[allowUnrestrictedImagePulls]; ok {
+			if forceInsecurePolicy == "true" {
+				log.Infof("ForceInsecurePolicyJson annotation found with value 'true', setting FORCE_INSECURE_POLICY_JSON=true")
+				cm.Data["FORCE_INSECURE_POLICY_JSON"] = forceInsecurePolicy
+				asc.rec.Recorder.Event(asc.Object, "Normal", "ForceInsecurePolicyEnabled", "FORCE_INSECURE_POLICY_JSON environment variable enabled via annotation")
+			} else {
+				log.Infof("ForceInsecurePolicyJson annotation found with value '%s' (not 'true'), skipping FORCE_INSECURE_POLICY_JSON", forceInsecurePolicy)
+				asc.rec.Recorder.Event(asc.Object, "Warning", "ForceInsecurePolicyInvalidValue", fmt.Sprintf("ForceInsecurePolicy annotation has invalid value '%s', expected 'true'", forceInsecurePolicy))
+			}
+		} else {
+			log.Debugf("ForceInsecurePolicyJson annotation not found, FORCE_INSECURE_POLICY_JSON will not be set")
+		}
+
 		copyEnv(cm.Data, "HTTP_PROXY")
 		copyEnv(cm.Data, "HTTPS_PROXY")
 		copyEnv(cm.Data, "NO_PROXY")
 		copyEnv(cm.Data, "DEPLOYMENT_TYPE")
 		copyEnv(cm.Data, "DEPLOYMENT_VERSION")
 		getDeploymentData(ctx, cm, asc)
+
+		cm.Data["ENABLE_IMAGE_SERVICE"] = "true"
+		// Set ENABLE_IMAGE_SERVICE environment variable based on annotation
+		if !isImageServiceEnabled(asc.Object.GetAnnotations()) {
+			cm.Data["ENABLE_IMAGE_SERVICE"] = "false"
+			log.Infof("Image service disabled via annotation, setting ENABLE_IMAGE_SERVICE=false")
+			asc.rec.Recorder.Event(asc.Object, "Normal", "ImageServiceDisabled", "Image service has been disabled via annotation")
+		}
+
 		return nil
 	}
 
@@ -1373,17 +1486,22 @@ func newImageServiceStatefulSet(ctx context.Context, log logrus.FieldLogger, asc
 		"app": imageServiceName,
 	}
 
+	// Use consistent PVC name with prefix support
+	imageServiceDataPVCName := getPVCName(asc.Object.GetAnnotations(), "image-service-data")
+
 	imageServiceBaseURL := getImageService(ctx, log, asc)
 	containerEnv := []corev1.EnvVar{
 		{Name: "LISTEN_PORT", Value: imageHandlerPort.String()},
-		{Name: "RHCOS_VERSIONS", Value: getOSImages(log, asc.spec)},
+		{Name: "RHCOS_VERSIONS", Value: getOSImages(log, asc.spec, asc.Object.GetAnnotations())},
 		{Name: "ASSISTED_SERVICE_HOST", Value: serviceName + "." + asc.namespace + ".svc:" + servicePort.String()},
 		{Name: "IMAGE_SERVICE_BASE_URL", Value: imageServiceBaseURL},
 		{Name: "INSECURE_SKIP_VERIFY", Value: skipVerifyTLS},
 		{Name: "DATA_DIR", Value: "/data"},
+		{Name: "DATA_TEMP_DIR", Value: "/data_temp"},
 	}
 	volumeMounts := []corev1.VolumeMount{
-		{Name: "image-service-data", MountPath: "/data"},
+		{Name: imageServiceDataPVCName, MountPath: "/data"},
+		{Name: "data-temp-volume", MountPath: "/data_temp"},
 	}
 	var healthCheckScheme corev1.URIScheme
 
@@ -1413,11 +1531,11 @@ func newImageServiceStatefulSet(ctx context.Context, log logrus.FieldLogger, asc
 		Image: ImageServiceImage(),
 		Ports: []corev1.ContainerPort{
 			{
-				ContainerPort: int32(imageHandlerPort.IntValue()),
+				ContainerPort: int32(imageHandlerPort.IntValue()), // nolint: gosec
 				Protocol:      corev1.ProtocolTCP,
 			},
 			{
-				ContainerPort: int32(imageHandlerHTTPPort.IntValue()),
+				ContainerPort: int32(imageHandlerHTTPPort.IntValue()), // nolint: gosec
 				Protocol:      corev1.ProtocolTCP,
 			},
 		},
@@ -1491,6 +1609,8 @@ func newImageServiceStatefulSet(ctx context.Context, log logrus.FieldLogger, asc
 			}
 		}
 
+		injectImagePullSecretsWhenNonOCP(ctx, &statefulSet.Spec.Template, asc)
+
 		volumes := statefulSet.Spec.Template.Spec.Volumes
 		if asc.rec.IsOpenShift {
 			volumes = ensureVolume(volumes, corev1.Volume{
@@ -1525,8 +1645,25 @@ func newImageServiceStatefulSet(ctx context.Context, log logrus.FieldLogger, asc
 				return err
 			}
 			setAnnotation(&statefulSet.ObjectMeta, osImagesCAConfigHashAnnotation, osImagesCAConfigHash)
-			container.Env = append(container.Env, corev1.EnvVar{Name: "OS_IMAGE_DOWNLOAD_TRUSTED_CA_FILE", Value: filepath.Join("/etc/image-service/os-images-ca-bundle", osImageDownloadTrustedCAFilename)})
-			container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{Name: "os-images-ca-bundle", MountPath: "/etc/image-service/os-images-ca-bundle"})
+
+			// Pick first and only key as CA bundle
+			var trustedCAKey string
+			for k := range cm.Data {
+				trustedCAKey = k
+				break
+			}
+			if trustedCAKey == "" {
+				return fmt.Errorf("config map %s has no data keys", namespacedName)
+			}
+
+			container.Env = append(container.Env, corev1.EnvVar{
+				Name:  "OS_IMAGE_DOWNLOAD_TRUSTED_CA_FILE",
+				Value: filepath.Join("/etc/image-service/os-images-ca-bundle", trustedCAKey),
+			})
+			container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{
+				Name:      "os-images-ca-bundle",
+				MountPath: "/etc/image-service/os-images-ca-bundle",
+			})
 			volumes = ensureVolume(volumes, corev1.Volume{
 				Name: "os-images-ca-bundle",
 				VolumeSource: corev1.VolumeSource{
@@ -1552,10 +1689,10 @@ func newImageServiceStatefulSet(ctx context.Context, log logrus.FieldLogger, asc
 			}
 			setAnnotation(&statefulSet.ObjectMeta, osImagesAdditionalParamsConfigHashAnnotation, osImagesAdditionalParamsConfigHash)
 			if secret.Data[osImageAdditionalParamsHeadersKey] != nil {
-				container.Env = append(container.Env, newSecretEnvVar(osImageAdditionalParamsHeadersEnvVar, osImageAdditionalParamsHeadersKey, asc.spec.OSImageAdditionalParamsRef.Name))
+				container.Env = append(container.Env, newStaticSecretEnvVar(osImageAdditionalParamsHeadersEnvVar, osImageAdditionalParamsHeadersKey, asc.spec.OSImageAdditionalParamsRef.Name))
 			}
 			if secret.Data[osImageAdditionalParamsQueryParamsKey] != nil {
-				container.Env = append(container.Env, newSecretEnvVar(osImageAdditionalParamsQueryParamsEnvVar, osImageAdditionalParamsQueryParamsKey, asc.spec.OSImageAdditionalParamsRef.Name))
+				container.Env = append(container.Env, newStaticSecretEnvVar(osImageAdditionalParamsQueryParamsEnvVar, osImageAdditionalParamsQueryParamsKey, asc.spec.OSImageAdditionalParamsRef.Name))
 			}
 		}
 
@@ -1564,7 +1701,7 @@ func newImageServiceStatefulSet(ctx context.Context, log logrus.FieldLogger, asc
 		if asc.spec.ImageStorage != nil {
 			var found bool
 			for i, claim := range statefulSet.Spec.VolumeClaimTemplates {
-				if claim.ObjectMeta.Name == "image-service-data" {
+				if claim.ObjectMeta.Name == imageServiceDataPVCName {
 					found = true
 					statefulSet.Spec.VolumeClaimTemplates[i].Spec.Resources.Requests = getStorageRequests(asc.spec.ImageStorage)
 				}
@@ -1573,7 +1710,7 @@ func newImageServiceStatefulSet(ctx context.Context, log logrus.FieldLogger, asc
 				statefulSet.Spec.VolumeClaimTemplates = []corev1.PersistentVolumeClaim{
 					{
 						ObjectMeta: metav1.ObjectMeta{
-							Name: "image-service-data",
+							Name: imageServiceDataPVCName,
 						},
 						Spec: *asc.spec.ImageStorage,
 					},
@@ -1581,7 +1718,7 @@ func newImageServiceStatefulSet(ctx context.Context, log logrus.FieldLogger, asc
 			}
 			newVols := make([]corev1.Volume, 0)
 			for i := range volumes {
-				if volumes[i].Name != "image-service-data" {
+				if volumes[i].Name != imageServiceDataPVCName {
 					newVols = append(newVols, volumes[i])
 				}
 			}
@@ -1590,12 +1727,19 @@ func newImageServiceStatefulSet(ctx context.Context, log logrus.FieldLogger, asc
 			statefulSet.Spec.VolumeClaimTemplates = nil
 
 			volumes = ensureVolume(volumes, corev1.Volume{
-				Name: "image-service-data",
+				Name: imageServiceDataPVCName,
 				VolumeSource: corev1.VolumeSource{
 					EmptyDir: &corev1.EmptyDirVolumeSource{},
 				},
 			})
 		}
+
+		volumes = ensureVolume(volumes, corev1.Volume{
+			Name: "data-temp-volume",
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{},
+			},
+		})
 
 		statefulSet.Spec.Template.Spec.Volumes = volumes
 
@@ -1739,15 +1883,15 @@ func newAssistedServiceDeployment(ctx context.Context, log logrus.FieldLogger, a
 
 	envSecrets := []corev1.EnvVar{
 		// database
-		newSecretEnvVar("DB_HOST", "db.host", databaseName),
-		newSecretEnvVar("DB_NAME", "db.name", databaseName),
-		newSecretEnvVar("DB_PASS", "db.password", databaseName),
-		newSecretEnvVar("DB_PORT", "db.port", databaseName),
-		newSecretEnvVar("DB_USER", "db.user", databaseName),
+		newSecretEnvVar(asc.Object.GetAnnotations(), "DB_HOST", "db.host", databaseName),
+		newSecretEnvVar(asc.Object.GetAnnotations(), "DB_NAME", "db.name", databaseName),
+		newSecretEnvVar(asc.Object.GetAnnotations(), "DB_PASS", "db.password", databaseName),
+		newSecretEnvVar(asc.Object.GetAnnotations(), "DB_PORT", "db.port", databaseName),
+		newSecretEnvVar(asc.Object.GetAnnotations(), "DB_USER", "db.user", databaseName),
 
 		// local auth secret
-		newSecretEnvVar("EC_PUBLIC_KEY_PEM", "ec-public-key.pem", agentLocalAuthSecretName),
-		newSecretEnvVar("EC_PRIVATE_KEY_PEM", "ec-private-key.pem", agentLocalAuthSecretName),
+		newSecretEnvVar(asc.Object.GetAnnotations(), "EC_PUBLIC_KEY_PEM", "ec-public-key.pem", agentLocalAuthSecretName),
+		newSecretEnvVar(asc.Object.GetAnnotations(), "EC_PRIVATE_KEY_PEM", "ec-private-key.pem", agentLocalAuthSecretName),
 	}
 
 	if exposeIPXEHTTPRoute(asc.spec) {
@@ -1792,7 +1936,7 @@ func newAssistedServiceDeployment(ctx context.Context, log logrus.FieldLogger, a
 			Name: "bucket-filesystem",
 			VolumeSource: corev1.VolumeSource{
 				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-					ClaimName: serviceName,
+					ClaimName: getPVCName(asc.Object.GetAnnotations(), serviceName),
 				},
 			},
 		},
@@ -1800,7 +1944,7 @@ func newAssistedServiceDeployment(ctx context.Context, log logrus.FieldLogger, a
 			Name: "postgresdb",
 			VolumeSource: corev1.VolumeSource{
 				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-					ClaimName: databaseName,
+					ClaimName: getPVCName(asc.Object.GetAnnotations(), databaseName),
 				},
 			},
 		},
@@ -1845,7 +1989,7 @@ func newAssistedServiceDeployment(ctx context.Context, log logrus.FieldLogger, a
 					ConfigMap: &corev1.ConfigMapVolumeSource{
 						Items: []corev1.KeyToPath{{
 							Key:  caBundleKey,
-							Path: common.MirrorRegistriesCertificateFile,
+							Path: common.SystemCertificateBundle,
 						}},
 						LocalObjectReference: corev1.LocalObjectReference{
 							Name: assistedCAConfigMapName,
@@ -1859,8 +2003,8 @@ func newAssistedServiceDeployment(ctx context.Context, log logrus.FieldLogger, a
 			corev1.VolumeMount{Name: "tls-certs", MountPath: "/etc/assisted-tls-config"},
 			corev1.VolumeMount{
 				Name:      "trusted-ca-certs",
-				MountPath: common.MirrorRegistriesCertificatePath,
-				SubPath:   common.MirrorRegistriesCertificateFile,
+				MountPath: common.SystemCertificateBundlePath,
+				SubPath:   common.SystemCertificateBundle,
 			},
 		)
 		healthCheckScheme = corev1.URISchemeHTTPS
@@ -1883,11 +2027,11 @@ func newAssistedServiceDeployment(ctx context.Context, log logrus.FieldLogger, a
 		Image: ServiceImage(asc.Object),
 		Ports: []corev1.ContainerPort{
 			{
-				ContainerPort: int32(servicePort.IntValue()),
+				ContainerPort: int32(servicePort.IntValue()), // nolint: gosec
 				Protocol:      corev1.ProtocolTCP,
 			},
 			{
-				ContainerPort: int32(serviceHTTPPort.IntValue()),
+				ContainerPort: int32(serviceHTTPPort.IntValue()), // nolint: gosec
 				Protocol:      corev1.ProtocolTCP,
 			},
 		},
@@ -1924,17 +2068,22 @@ func newAssistedServiceDeployment(ctx context.Context, log logrus.FieldLogger, a
 	postgresContainer := corev1.Container{
 		Name:  databaseName,
 		Image: DatabaseImage(),
+		// Use a wrapper script that conditionally enables pg_upgrade only when a version
+		// mismatch is detected. This allows automatic upgrades while avoiding failures
+		// on normal restarts. See docs/dev/postgresql-upgrade.md for details.
+		Command: []string{"/bin/bash", "-c"},
+		Args:    []string{PostgresStartupScript},
 		Ports: []corev1.ContainerPort{
 			{
 				Name:          databaseName,
-				ContainerPort: int32(databasePort.IntValue()),
+				ContainerPort: int32(databasePort.IntValue()), // nolint: gosec
 				Protocol:      corev1.ProtocolTCP,
 			},
 		},
 		Env: []corev1.EnvVar{
-			newSecretEnvVar("POSTGRESQL_DATABASE", "db.name", databaseName),
-			newSecretEnvVar("POSTGRESQL_USER", "db.user", databaseName),
-			newSecretEnvVar("POSTGRESQL_PASSWORD", "db.password", databaseName),
+			newSecretEnvVar(asc.Object.GetAnnotations(), "POSTGRESQL_DATABASE", "db.name", databaseName),
+			newSecretEnvVar(asc.Object.GetAnnotations(), "POSTGRESQL_USER", "db.user", databaseName),
+			newSecretEnvVar(asc.Object.GetAnnotations(), "POSTGRESQL_PASSWORD", "db.password", databaseName),
 		},
 		VolumeMounts: []corev1.VolumeMount{
 			{
@@ -1974,7 +2123,7 @@ func newAssistedServiceDeployment(ctx context.Context, log logrus.FieldLogger, a
 			return nil, nil, pkgerror.Wrapf(err, "Unable to mark mirror configmap for backup")
 		}
 
-		volume := corev1.Volume{
+		registriesConfVolume := corev1.Volume{
 			Name: mirrorRegistryConfigVolume,
 			VolumeSource: corev1.VolumeSource{
 				ConfigMap: &corev1.ConfigMapVolumeSource{
@@ -1999,7 +2148,40 @@ func newAssistedServiceDeployment(ctx context.Context, log logrus.FieldLogger, a
 		)
 
 		// add our mirror registry config to volumes
-		volumes = append(volumes, volume)
+		volumes = append(volumes, registriesConfVolume)
+
+		// add mirror registry CA bundle to volumes if exists
+		if cm.Data[mirrorRegistryRefCertKey] != "" {
+			// add CA bundle volume to list
+			volumes = append(
+				volumes,
+				corev1.Volume{
+					Name: mirrorRegistryCertBundleVolume,
+					VolumeSource: corev1.VolumeSource{
+						ConfigMap: &corev1.ConfigMapVolumeSource{
+							LocalObjectReference: *asc.spec.MirrorRegistryRef,
+							DefaultMode:          swag.Int32(420),
+							Items: []corev1.KeyToPath{
+								{
+									Key:  mirrorRegistryRefCertKey,
+									Path: common.MirrorRegistriesCertificateFile,
+								},
+							},
+						},
+					},
+				},
+			)
+
+			// add volume mount with the CA bundle
+			serviceContainer.VolumeMounts = append(
+				serviceContainer.VolumeMounts,
+				corev1.VolumeMount{
+					Name:      mirrorRegistryCertBundleVolume,
+					MountPath: common.MirrorRegistriesCertificatePath,
+					SubPath:   common.MirrorRegistriesCertificateFile,
+				},
+			)
+		}
 	}
 
 	deploymentLabels := map[string]string{
@@ -2054,6 +2236,8 @@ func newAssistedServiceDeployment(ctx context.Context, log logrus.FieldLogger, a
 			}
 		}
 
+		injectImagePullSecretsWhenNonOCP(ctx, &deployment.Spec.Template, asc)
+
 		if asc.rec.NodeSelector != nil {
 			deployment.Spec.Template.Spec.NodeSelector = asc.rec.NodeSelector
 		} else {
@@ -2069,6 +2253,33 @@ func newAssistedServiceDeployment(ctx context.Context, log logrus.FieldLogger, a
 		return nil
 	}
 	return deployment, mutateFn, nil
+}
+
+func getSecretName(annotations map[string]string, secretID string) string {
+	if prefix, ok := annotations[aiv1beta1.SecretsPrefixAnnotation]; ok {
+		return prefix + secretID
+	}
+	return secretID
+}
+
+func getPVCName(annotations map[string]string, pvcID string) string {
+	if prefix, ok := annotations[aiv1beta1.PVCPrefixAnnotation]; ok {
+		return prefix + pvcID
+	}
+	return pvcID
+}
+
+// injectImagePullSecretsWhenNonOCP injects imagePullSecrets from the current pod into the pod template spec
+// This is only done for non-OpenShift environments (Kubernetes mode)
+func injectImagePullSecretsWhenNonOCP(ctx context.Context, podTemplateSpec *corev1.PodTemplateSpec, asc ASC) {
+	if !asc.rec.IsOpenShift {
+		if asc.rec.PodIntrospector == nil {
+			return
+		}
+		if imagePullSecrets := asc.rec.PodIntrospector.GetImagePullSecrets(ctx); len(imagePullSecrets) > 0 {
+			podTemplateSpec.Spec.ImagePullSecrets = imagePullSecrets
+		}
+	}
 }
 
 func copyEnv(config map[string]string, key string) {
@@ -2126,17 +2337,25 @@ func getMustGatherImages(log logrus.FieldLogger, spec *aiv1beta1.AgentServiceCon
 // getOSImages returns the value of OS_IMAGES variable
 // to be stored in the service's ConfigMap
 //
-//  1. If osImages field is not present in the AgentServiceConfig's Spec
+//  1. If image service is disabled via annotation, returns empty JSON array "[]"
+//
+//  2. If osImages field is not present in the AgentServiceConfig's Spec
 //     it returns the value of OS_IMAGES env variable.
 //     This is also the fallback behavior in case of a processing error.
 //
-//  2. If osImages field is present in the AgentServiceConfig's Spec it
+//  3. If osImages field is present in the AgentServiceConfig's Spec it
 //     converts the structure to the one that can be recognize by the service
 //     and returns it as a JSON string.
 //
-//  3. In case both sources are present, the Spec values overrides the env
+//  4. In case both sources are present, the Spec values overrides the env
 //     values.
-func getOSImages(log logrus.FieldLogger, spec *aiv1beta1.AgentServiceConfigSpec) string {
+func getOSImages(log logrus.FieldLogger, spec *aiv1beta1.AgentServiceConfigSpec, annotations map[string]string) string {
+	// If image service is disabled, return empty array
+	if !isImageServiceEnabled(annotations) {
+		log.Info("Image service is disabled, returning empty OS images list")
+		return "[]"
+	}
+
 	if spec.OSImages == nil {
 		return OSImages()
 	}
@@ -2178,6 +2397,19 @@ func exposeIPXEHTTPRoute(spec *aiv1beta1.AgentServiceConfigSpec) bool {
 	}
 }
 
+// isImageServiceEnabled returns true if the enable-image-service annotation is set to "true" or not present (default enabled)
+func isImageServiceEnabled(annotations map[string]string) bool {
+	if annotations == nil {
+		return true
+	}
+	value := annotations[enableImageServiceAnnotation]
+	// If annotation is not set, default to enabled
+	if value == "" {
+		return true
+	}
+	return value == "true"
+}
+
 func getCMHash(ctx context.Context, asc ASC, namespacedName types.NamespacedName) (string, error) {
 	cm := &corev1.ConfigMap{}
 	if err := asc.Client.Get(ctx, namespacedName, cm); err != nil {
@@ -2196,7 +2428,7 @@ func getVersionKey(openshiftVersion string) (string, error) {
 	return fmt.Sprintf("%d.%d", v.Segments()[0], v.Segments()[1]), nil
 }
 
-func newSecretEnvVar(name, key, secretName string) corev1.EnvVar {
+func newStaticSecretEnvVar(name, key, secretName string) corev1.EnvVar {
 	return corev1.EnvVar{
 		Name: name,
 		ValueFrom: &corev1.EnvVarSource{
@@ -2208,6 +2440,10 @@ func newSecretEnvVar(name, key, secretName string) corev1.EnvVar {
 			},
 		},
 	}
+}
+
+func newSecretEnvVar(annotations map[string]string, name, key, secretName string) corev1.EnvVar {
+	return newStaticSecretEnvVar(name, key, getSecretName(annotations, secretName))
 }
 
 func newInfraEnvWebHook(ctx context.Context, log logrus.FieldLogger, asc ASC) (client.Object, controllerutil.MutateFn, error) {
@@ -2514,6 +2750,17 @@ func newWebHookClusterRole(ctx context.Context, log logrus.FieldLogger, asc ASC)
 				"create",
 			},
 		},
+		{
+			APIGroups: []string{
+				"hive.openshift.io",
+			},
+			Resources: []string{
+				"clusterdeployments",
+			},
+			Verbs: []string{
+				"get",
+			},
+		},
 	}
 	cr := rbacv1.ClusterRole{
 		ObjectMeta: metav1.ObjectMeta{
@@ -2679,6 +2926,8 @@ func newWebHookDeployment(ctx context.Context, log logrus.FieldLogger, asc ASC) 
 		deployment.Spec.Template.Spec.Volumes = volumes
 		deployment.Spec.Template.Spec.ServiceAccountName = serviceAccountName
 
+		injectImagePullSecretsWhenNonOCP(ctx, &deployment.Spec.Template, asc)
+
 		return nil
 	}
 	return deployment, mutateFn, nil
@@ -2718,6 +2967,17 @@ func registerCACertFailureCondition(ctx context.Context, log logrus.FieldLogger,
 	return nil
 }
 
+func registerOSImageError(ctx context.Context, err error, asc ASC) bool {
+	return conditionsv1.SetStatusConditionNoHeartbeat(
+		asc.conditions, conditionsv1.Condition{
+			Type:    aiv1beta1.ConditionReconcileCompleted,
+			Status:  corev1.ConditionFalse,
+			Reason:  aiv1beta1.ReasonOSImagesShouldBeEmptyFailure,
+			Message: err.Error(),
+		},
+	)
+}
+
 func registerOSImagesAdditionalParamsFailureCondition(ctx context.Context, log logrus.FieldLogger, err error, asc ASC) error {
 	conditionsv1.SetStatusConditionNoHeartbeat(
 		asc.conditions, conditionsv1.Condition{
@@ -2735,7 +2995,7 @@ func registerOSImagesAdditionalParamsFailureCondition(ctx context.Context, log l
 	return nil
 }
 
-func validate(ctx context.Context, log logrus.FieldLogger, asc ASC, supportsCertManager bool) (bool, error) {
+func validateOSImageCACertRef(ctx context.Context, log logrus.FieldLogger, asc ASC) (bool, error) {
 	if asc.spec.OSImageCACertRef != nil && asc.spec.OSImageCACertRef.Name != "" {
 		osImageCACertConfigMap := &corev1.ConfigMap{}
 		err := asc.Client.Get(ctx, types.NamespacedName{
@@ -2745,11 +3005,134 @@ func validate(ctx context.Context, log logrus.FieldLogger, asc ASC, supportsCert
 		if err != nil {
 			return false, registerCACertFailureCondition(ctx, log, err, asc)
 		}
-		_, ok := osImageCACertConfigMap.Data[osImageDownloadTrustedCAFilename]
-		if !ok || len(osImageCACertConfigMap.Data) != 1 {
-			err = fmt.Errorf("ConfigMap referenced by OSImgaeCACertRef is expected to contain a single key named \"%s\"", osImageDownloadTrustedCAFilename)
+		if len(osImageCACertConfigMap.Data) != 1 {
+			err = fmt.Errorf("ConfigMap referenced by OSImageCACertRef must contain exactly one key")
 			return false, registerCACertFailureCondition(ctx, log, err, asc)
 		}
+
+		var trustedCAKey string
+		for k := range osImageCACertConfigMap.Data {
+			trustedCAKey = k
+			break
+		}
+
+		if err = validateCABundle(osImageCACertConfigMap.Data[trustedCAKey]); err != nil {
+			err = fmt.Errorf("file %s does not contain a valid PEM certificate, %s", trustedCAKey, err.Error())
+			return false, registerCACertFailureCondition(ctx, log, err, asc)
+		}
+	}
+	return true, nil
+}
+
+func validateCABundle(bundle string) error {
+	data := []byte(bundle)
+	if len(bytes.TrimSpace(data)) == 0 {
+		return fmt.Errorf("certificate bundle is empty")
+	}
+
+	for {
+		var block *pem.Block
+		block, data = pem.Decode(data)
+		if block == nil {
+			if len(bytes.TrimSpace(data)) > 0 {
+				return fmt.Errorf("trailing content found after the last certificate block")
+			}
+			break
+		}
+		if block.Type != "CERTIFICATE" {
+			return fmt.Errorf("unexpected PEM block type found %q, expected CERTIFICATE", block.Type)
+		}
+		if _, err := x509.ParseCertificate(block.Bytes); err != nil {
+			return fmt.Errorf("failed to parse x509 certificate block with error %q", err.Error())
+		}
+	}
+	return nil
+}
+
+// validateImmutableAnnotations ensures that prefix annotations are immutable once set
+// Returns true if the immutable annotations are valid, false if they are invalid, and an error if there is an error
+func validateImmutableAnnotations(ctx context.Context, log logrus.FieldLogger, asc ASC) (bool, error) {
+	if _, ok := asc.Object.(*aiv1beta1.AgentServiceConfig); !ok {
+		// if it's not AgentServiceConfig object, we don't need to validate immutable annotations
+		return true, nil
+	}
+	immutableAnnotations := []string{
+		aiv1beta1.PVCPrefixAnnotation,
+		aiv1beta1.SecretsPrefixAnnotation,
+		enableImageServiceAnnotation,
+	}
+
+	// Check if we have stored the initial state in a special annotation
+	currentAnnotations := asc.Object.GetAnnotations()
+	if currentAnnotations == nil {
+		currentAnnotations = make(map[string]string)
+	}
+
+	if asc.status.ImmutableAnnotations == nil {
+		asc.status.ImmutableAnnotations = make(map[string]string)
+		// if the immutable annotations are not set, we store the current annotations as the initial state
+
+		for _, annotation := range immutableAnnotations {
+			asc.status.ImmutableAnnotations[annotation] = currentAnnotations[annotation]
+		}
+		if err := asc.Client.Status().Update(ctx, asc.Object); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+
+	// Validate each immutable annotation against the initial state
+	for _, annotation := range immutableAnnotations {
+		initialValue := asc.status.ImmutableAnnotations[annotation]
+		initialExists := initialValue != ""
+		currentValue, currentExists := currentAnnotations[annotation]
+
+		// If the annotation was not set initially, it can never be added
+		if !initialExists && currentExists {
+			err := fmt.Errorf("annotation %s cannot be added after AgentServiceConfig creation", annotation)
+			return false, registerImmutableAnnotationFailureCondition(ctx, log, err, asc)
+		}
+
+		// If the annotation exists, its value cannot change
+		if initialExists && currentExists && initialValue != currentValue {
+			err := fmt.Errorf("annotation %s value cannot be changed from %q to %q", annotation, initialValue, currentValue)
+			return false, registerImmutableAnnotationFailureCondition(ctx, log, err, asc)
+		}
+
+		// If the annotation was set, it cannot be removed
+		if initialExists && !currentExists {
+			err := fmt.Errorf("annotation %s cannot be removed once set", annotation)
+			return false, registerImmutableAnnotationFailureCondition(ctx, log, err, asc)
+		}
+	}
+
+	return true, nil
+}
+
+// registerImmutableAnnotationFailureCondition registers a failure condition for immutable annotation validation
+func registerImmutableAnnotationFailureCondition(ctx context.Context, log logrus.FieldLogger, err error, asc ASC) error {
+	conditionsv1.SetStatusConditionNoHeartbeat(
+		asc.conditions, conditionsv1.Condition{
+			Type:    aiv1beta1.ConditionReconcileCompleted,
+			Status:  corev1.ConditionFalse,
+			Reason:  aiv1beta1.ReasonImmutableAnnotationFailure,
+			Message: err.Error(),
+		},
+	)
+	updateErr := asc.Client.Status().Update(ctx, asc.Object)
+	if updateErr != nil {
+		return updateErr
+	}
+	return nil
+}
+
+func validate(ctx context.Context, log logrus.FieldLogger, asc ASC, supportsCertManager bool) (bool, error) {
+	if valid, err := validateOSImageCACertRef(ctx, log, asc); !valid {
+		return false, err
+	}
+
+	if valid, err := validateImmutableAnnotations(ctx, log, asc); !valid {
+		return false, err
 	}
 
 	if asc.spec.OSImageAdditionalParamsRef != nil && asc.spec.OSImageAdditionalParamsRef.Name != "" {
@@ -2833,12 +3216,13 @@ func validate(ctx context.Context, log logrus.FieldLogger, asc ASC, supportsCert
 	}
 
 	// If we are here then all the validations succeeded, so we may need to
-	// remove a previous failure condition:
+	// remove previous failure conditions:
 	condition := conditionsv1.FindStatusCondition(
 		*asc.conditions,
 		aiv1beta1.ConditionReconcileCompleted,
 	)
-	if condition != nil && condition.Reason == aiv1beta1.ReasonStorageFailure {
+	if condition != nil && (condition.Reason == aiv1beta1.ReasonStorageFailure ||
+		condition.Reason == aiv1beta1.ReasonImmutableAnnotationFailure) {
 		conditionsv1.RemoveStatusCondition(
 			asc.conditions,
 			aiv1beta1.ConditionReconcileCompleted,
@@ -2873,7 +3257,7 @@ func validateStorage(ctx context.Context, log logrus.FieldLogger, asc ASC) (warn
 		warnings = append(warnings, message)
 		key := client.ObjectKey{
 			Namespace: asc.namespace,
-			Name:      databaseName,
+			Name:      getPVCName(asc.Object.GetAnnotations(), databaseName),
 		}
 		var tmp corev1.PersistentVolumeClaim
 		err = asc.Client.Get(ctx, key, &tmp)
@@ -2896,7 +3280,7 @@ func validateStorage(ctx context.Context, log logrus.FieldLogger, asc ASC) (warn
 		warnings = append(warnings, message)
 		key := client.ObjectKey{
 			Namespace: asc.namespace,
-			Name:      serviceName,
+			Name:      getPVCName(asc.Object.GetAnnotations(), serviceName),
 		}
 		var tmp corev1.PersistentVolumeClaim
 		err = asc.Client.Get(ctx, key, &tmp)

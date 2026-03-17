@@ -14,6 +14,8 @@ func MigratePre(db *gorm.DB) error {
 func pre() []*gormigrate.Migration {
 	preMigrations := []*gormigrate.Migration{
 		modifyEventsId(),
+		convertPrimaryIPStackColumnType(),
+		convertNetworkColumnsToNativeTypes(),
 	}
 
 	sort.SliceStable(preMigrations, func(i, j int) bool { return preMigrations[i].ID < preMigrations[j].ID })
@@ -46,6 +48,9 @@ func post() []*gormigrate.Migration {
 		updateOciToExternalPlatformType(),
 		dropClusterPlatformIsExternal(),
 		updateNewColumnControlPlaneCountValueForExistingClusterRecords(),
+		addHostsByClusterIdIndex(),
+		addHostsByInfraEnvIdIndex(),
+		populatePrimaryIPStackForExistingClusters(),
 	}
 
 	sort.SliceStable(postMigrations, func(i, j int) bool { return postMigrations[i].ID < postMigrations[j].ID })

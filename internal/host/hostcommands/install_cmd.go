@@ -13,7 +13,6 @@ import (
 	"github.com/openshift/assisted-service/internal/common"
 	eventgen "github.com/openshift/assisted-service/internal/common/events"
 	eventsapi "github.com/openshift/assisted-service/internal/events/api"
-	"github.com/openshift/assisted-service/internal/featuresupport"
 	"github.com/openshift/assisted-service/internal/hardware"
 	"github.com/openshift/assisted-service/internal/host/hostutil"
 	"github.com/openshift/assisted-service/internal/network"
@@ -23,6 +22,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/samber/lo"
 	"github.com/sirupsen/logrus"
+	"github.com/thoas/go-funk"
 	"gorm.io/gorm"
 )
 
@@ -117,26 +117,32 @@ func (i *installCmd) getFullInstallerCommand(ctx context.Context, cluster *commo
 		role = models.HostRoleBootstrap
 	}
 
-	haMode := models.ClusterHighAvailabilityModeFull
-	if cluster.HighAvailabilityMode != nil {
-		haMode = *cluster.HighAvailabilityMode
+	request := models.InstallCmdRequest{
+		Role:              &role,
+		ClusterID:         host.ClusterID,
+		HostID:            host.ID,
+		InfraEnvID:        &host.InfraEnvID,
+		ControlPlaneCount: cluster.ControlPlaneCount,
+		ControllerImage:   swag.String(i.instructionConfig.ControllerImage),
+		CheckCvo:          swag.Bool(i.instructionConfig.CheckClusterVersion),
+		InstallerImage:    swag.String(i.instructionConfig.InstallerImage),
+		BootDevice:        swag.String(bootdevice),
 	}
 
-	request := models.InstallCmdRequest{
-		Role:                 &role,
-		ClusterID:            host.ClusterID,
-		HostID:               host.ID,
-		InfraEnvID:           &host.InfraEnvID,
-		HighAvailabilityMode: &haMode,
-		ControllerImage:      swag.String(i.instructionConfig.ControllerImage),
-		CheckCvo:             swag.Bool(i.instructionConfig.CheckClusterVersion),
-		InstallerImage:       swag.String(i.instructionConfig.InstallerImage),
-		BootDevice:           swag.String(bootdevice),
+	deviceMapperDevice, err := isHostInstallationDiskDeviceMapperDevice(host)
+	if err != nil {
+		return "", errors.Wrap(err, "failed checking if the host's installation disk is a device mapper device")
 	}
-	if i.enableSkipMcoReboot {
-		request.EnableSkipMcoReboot = featuresupport.IsFeatureAvailable(models.FeatureSupportLevelIDSKIPMCOREBOOT,
-			cluster.OpenshiftVersion, swag.String(cluster.CPUArchitecture))
+
+	skipMCORebootVersionSupported, err := common.BaseVersionGreaterOrEqual(common.MinimalVersionForSKipMCOReboot, cluster.OpenshiftVersion)
+	if err != nil {
+		skipMCORebootVersionSupported = false
 	}
+
+	request.EnableSkipMcoReboot = i.enableSkipMcoReboot &&
+		cluster.CPUArchitecture != models.ClusterCPUArchitectureS390x &&
+		skipMCORebootVersionSupported &&
+		!lo.FromPtr(deviceMapperDevice)
 	request.NotifyNumReboots = i.notifyNumReboots
 
 	cpuArch := cluster.CPUArchitecture
@@ -149,7 +155,6 @@ func (i *installCmd) getFullInstallerCommand(ctx context.Context, cluster *commo
 
 	// Get release image for host only if it's either not a day-2 host or it's installing to disk
 	var releaseImage *models.ReleaseImage
-	var err error
 	if installToDisk || swag.StringValue(cluster.Kind) != models.ClusterKindAddHostsCluster {
 		releaseImage, err = i.versionsHandler.GetReleaseImage(ctx, cluster.OpenshiftVersion, cpuArch, cluster.PullSecret)
 		if err != nil {
@@ -238,7 +243,7 @@ func (i *installCmd) getProxyArguments(clusterName, baseDNSDomain, httpProxy, ht
 	} else {
 		noProxyUpdated := []string{}
 		if noProxyTrim != "" {
-			noProxyUpdated = append(noProxyUpdated, noProxyTrim)
+			noProxyUpdated = strings.Split(noProxyTrim, ",")
 		}
 		// if we set proxy we need to update assisted installer no proxy with no proxy params as installer.
 		// it must be able to connect to api int. Added this way for not to pass name and base domain
@@ -248,7 +253,7 @@ func (i *installCmd) getProxyArguments(clusterName, baseDNSDomain, httpProxy, ht
 			".svc",
 			".cluster.local",
 			fmt.Sprintf("api-int.%s.%s", clusterName, baseDNSDomain))
-		proxy.NoProxy = swag.String(strings.Join(noProxyUpdated, ","))
+		proxy.NoProxy = swag.String(strings.Join(funk.UniqString(noProxyUpdated), ","))
 	}
 
 	return &proxy
@@ -318,17 +323,22 @@ func constructHostInstallerArgs(cluster *common.Cluster, host *models.Host, inve
 	}
 
 	hasUserConfiguredIP := hasUserConfiguredIP(installerArgs)
+	hasDay2UnknownMachineNetwork := hasDay2UnknownMachineNetwork(cluster, host, log)
 	installerArgs, hasIPConfigOverride = appends390xArgs(inventory, installerArgs, log)
-	hasIPConfigOverride = hasIPConfigOverride || hasUserConfiguredIP
+	hasIPConfigOverride = hasIPConfigOverride || hasUserConfiguredIP || hasDay2UnknownMachineNetwork
 
 	// append kargs depending on installation drive type
 	installationDisk := hostutil.GetDiskByInstallationPath(inventory.Disks, hostutil.GetHostInstallationPath(host))
 	if installationDisk != nil {
-		installerArgs, err = appendMultipathArgs(installerArgs, installationDisk, inventory, hasUserConfiguredIP)
+		installerArgs, err = appendMultipathArgs(installerArgs, installationDisk, inventory, hasIPConfigOverride)
 		if err != nil {
 			return "", err
 		}
-		installerArgs, err = appendISCSIArgs(installerArgs, installationDisk, inventory, hasUserConfiguredIP)
+		installerArgs, err = appendISCSIArgs(installerArgs, installationDisk, inventory, hasIPConfigOverride)
+		if err != nil {
+			return "", err
+		}
+		installerArgs, err = appendRaidArgs(installerArgs, installationDisk)
 		if err != nil {
 			return "", err
 		}
@@ -391,7 +401,7 @@ func appendCopyNetwork(installerArgs []string) []string {
 	return installerArgs
 }
 
-func appendISCSIArgs(installerArgs []string, installationDisk *models.Disk, inventory *models.Inventory, hasUserConfiguredIP bool) ([]string, error) {
+func appendISCSIArgs(installerArgs []string, installationDisk *models.Disk, inventory *models.Inventory, hasIPConfigOverride bool) ([]string, error) {
 	if installationDisk.DriveType != models.DriveTypeISCSI {
 		return installerArgs, nil
 	}
@@ -401,7 +411,7 @@ func appendISCSIArgs(installerArgs []string, installationDisk *models.Disk, inve
 		installerArgs = append(installerArgs, "--append-karg", "rd.iscsi.firmware=1")
 	}
 
-	if hasUserConfiguredIP {
+	if hasIPConfigOverride {
 		return installerArgs, nil
 	}
 
@@ -421,26 +431,44 @@ func appendISCSIArgs(installerArgs []string, installationDisk *models.Disk, inve
 		dhcp = "dhcp6"
 	}
 
-	netArgs := fmt.Sprintf("ip=%s:%s", nic.Name, dhcp)
-	if !lo.Contains(installerArgs, fmt.Sprintf("ip=%s:%s", nic.Name, dhcp)) {
-		installerArgs = append(installerArgs, "--append-karg", netArgs)
+	netArg := formatNetKarg(nic, dhcp)
+	if !lo.Contains(installerArgs, netArg) {
+		installerArgs = append(installerArgs, "--append-karg", netArg)
 	}
 
 	return installerArgs, nil
 }
 
-func appendMultipathArgs(installerArgs []string, installationDisk *models.Disk, inventory *models.Inventory, hasUserConfiguredIP bool) ([]string, error) {
+func appendRaidArgs(installerArgs []string, installationDisk *models.Disk) ([]string, error) {
+	// Add kernel args for Intel VROC
+	if installationDisk.DriveType != models.DriveTypeRAID {
+		return installerArgs, nil
+	}
+	args := []string{"rd.md=1", "rd.auto=1"}
+	for _, arg := range args {
+		if !lo.Contains(installerArgs, arg) {
+			installerArgs = append(installerArgs, "--append-karg", arg)
+		}
+	}
+	return installerArgs, nil
+}
+
+func appendMultipathArgs(installerArgs []string, installationDisk *models.Disk, inventory *models.Inventory, hasIPConfigOverride bool) ([]string, error) {
 	if installationDisk.DriveType != models.DriveTypeMultipath {
 		return installerArgs, nil
 	}
 
-	installerArgs = append(installerArgs, "--append-karg", "root=/dev/disk/by-label/dm-mpath-root", "--append-karg", "rw", "--append-karg", "rd.multipath=default")
-	var err error
+	installerArgs = append(installerArgs, "--append-karg", "rw", "--append-karg", "rd.multipath=default")
+
 	iSCSIDisks := hostutil.GetDisksOfHolderByType(inventory.Disks, installationDisk, models.DriveTypeISCSI)
-	for _, iscsiDisk := range iSCSIDisks {
-		installerArgs, err = appendISCSIArgs(installerArgs, iscsiDisk, inventory, hasUserConfiguredIP)
-		if err != nil {
-			return nil, err
+
+	if len(iSCSIDisks) != 0 {
+		var err error
+		for _, iscsiDisk := range iSCSIDisks {
+			installerArgs, err = appendISCSIArgs(installerArgs, iscsiDisk, inventory, hasIPConfigOverride)
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 	return installerArgs, nil
@@ -535,10 +563,16 @@ func getDHCPArgPerNIC(network *net.IPNet, nic *models.Interface, ipv6 bool, dual
 		if dualStack {
 			dhcp = "dhcp,dhcp6"
 		}
-		log.Debugf("Host %s: Added kernel argument ip=%s:%s", hostID, nic.Name, dhcp)
-		return append(args, "--append-karg", fmt.Sprintf("ip=%s:%s", nic.Name, dhcp)), nil
+		netArg := formatNetKarg(nic, dhcp)
+		log.Debugf("Host %s: Added kernel argument %s", hostID, netArg)
+		return append(args, "--append-karg", netArg), nil
 	}
 	return args, nil
+}
+
+func formatNetKarg(nic *models.Interface, arg string) string {
+	macWithDashes := strings.ReplaceAll(nic.MacAddress, ":", "-")
+	return fmt.Sprintf("ip=%s:%s", macWithDashes, arg)
 }
 
 func findAnyInCIDR(network *net.IPNet, addresses []string) (bool, error) {
@@ -563,6 +597,20 @@ func hasUserConfiguredIP(args []string) bool {
 	return result
 }
 
+// When true, iSCSI ip= kernel args should be skipped to allow RHCOS to auto-configure all
+// interfaces, preventing partial network configuration where only the iSCSI NIC comes up.
+func hasDay2UnknownMachineNetwork(cluster *common.Cluster, host *models.Host, log logrus.FieldLogger) bool {
+	if swag.StringValue(cluster.Kind) != models.ClusterKindAddHostsCluster {
+		return false
+	}
+	machineNetworkCIDR := network.GetPrimaryMachineCidrForUserManagedNetwork(cluster, log)
+	if machineNetworkCIDR == "" {
+		log.Infof("Host %s in cluster %s: skipping iSCSI ip= kernel args (Day2 iSCSI/multipath with unknown machine network)", host.ID, *cluster.ID)
+		return true
+	}
+	return false
+}
+
 func hasStaticNetwork(cluster *common.Cluster, infraEnv *common.InfraEnv) bool {
 	return (infraEnv != nil && infraEnv.StaticNetworkConfig != "") || (cluster != nil && cluster.StaticNetworkConfigured)
 }
@@ -576,4 +624,24 @@ func toJSONString(args []string) (string, error) {
 		return "", err
 	}
 	return string(argsBytes), nil
+}
+
+func isHostInstallationDiskDeviceMapperDevice(host *models.Host) (*bool, error) {
+	var hostInventory models.Inventory
+	if err := json.Unmarshal([]byte(host.Inventory), &hostInventory); err != nil {
+		return nil, errors.Wrapf(err, "failed unmarshaling host %s inventory", lo.FromPtr(host.ID))
+	}
+
+	installationDisk, ok := lo.Find(hostInventory.Disks, func(disk *models.Disk) bool {
+		return disk.ID == host.InstallationDiskID
+	})
+	if !ok {
+		return nil, fmt.Errorf(
+			"failed finding disk in host %s which matches installation disk %s", lo.FromPtr(host.ID), host.InstallationDiskID,
+		)
+	}
+
+	deviceName := strings.Replace(lo.FromPtr(installationDisk).Path, "/dev/", "", 1)
+
+	return lo.ToPtr(strings.HasPrefix(deviceName, "dm-")), nil
 }

@@ -107,38 +107,34 @@ var _ = Describe("V2ListFeatureSupportLevels API", func() {
 				Expect(fmt.Sprintf("id: %d, result: %s", test.id, resultSupportLevel)).To(Equal(fmt.Sprintf("id: %d, result: %s", test.id, test.expected)))
 			}
 		})
-		It("Validate Compacompatible Features", func() {
-			incompatibleFeatures := make(map[string]*[]models.FeatureSupportLevelID)
+		It("Validate Incompatible Features", func() {
+			incompatibleFeatures := make(map[string][]models.FeatureSupportLevelID)
 
-			incompatibleFeatures["4.11"] = &[]models.FeatureSupportLevelID{
+			incompatibleFeatures["4.11"] = []models.FeatureSupportLevelID{
 				models.FeatureSupportLevelIDNUTANIXINTEGRATION,
 				models.FeatureSupportLevelIDVSPHEREINTEGRATION,
 				models.FeatureSupportLevelIDODF,
-				models.FeatureSupportLevelIDOPENSHIFTAI,
 				models.FeatureSupportLevelIDVIPAUTOALLOC,
 				models.FeatureSupportLevelIDCLUSTERMANAGEDNETWORKING,
 			}
 
-			incompatibleFeatures["4.12"] = &[]models.FeatureSupportLevelID{
+			incompatibleFeatures["4.12"] = []models.FeatureSupportLevelID{
 				models.FeatureSupportLevelIDNUTANIXINTEGRATION,
 				models.FeatureSupportLevelIDVSPHEREINTEGRATION,
 				models.FeatureSupportLevelIDODF,
-				models.FeatureSupportLevelIDOPENSHIFTAI,
 				models.FeatureSupportLevelIDVIPAUTOALLOC,
 				models.FeatureSupportLevelIDCLUSTERMANAGEDNETWORKING,
 			}
 
-			incompatibleFeatures["4.15"] = &[]models.FeatureSupportLevelID{
+			incompatibleFeatures["4.15"] = []models.FeatureSupportLevelID{
 				models.FeatureSupportLevelIDNUTANIXINTEGRATION,
 				models.FeatureSupportLevelIDVSPHEREINTEGRATION,
 				models.FeatureSupportLevelIDODF,
-				models.FeatureSupportLevelIDOPENSHIFTAI,
 			}
-			incompatibleFeatures["4.16.0-rc0"] = &[]models.FeatureSupportLevelID{
+			incompatibleFeatures["4.16.0-rc0"] = []models.FeatureSupportLevelID{
 				models.FeatureSupportLevelIDNUTANIXINTEGRATION,
 				models.FeatureSupportLevelIDVSPHEREINTEGRATION,
 				models.FeatureSupportLevelIDODF,
-				models.FeatureSupportLevelIDOPENSHIFTAI,
 			}
 
 			testIncompatibleFeatures := []struct {
@@ -197,7 +193,14 @@ var _ = Describe("V2ListFeatureSupportLevels API", func() {
 				nil,
 			)
 
-			Expect(featureSupportLevels[string(models.FeatureSupportLevelIDCNV)]).To(Equal(models.SupportLevelUnavailable))
+			for _, feature := range featureSupportLevels {
+				if feature.FeatureSupportLevelID != models.FeatureSupportLevelIDCNV {
+					continue
+				}
+
+				Expect(feature.SupportLevel).To(Equal(models.SupportLevelUnavailable))
+				Expect(feature.Reason).To(Equal(models.IncompatibilityReasonPlatform))
+			}
 		})
 
 		It("MCE should be unavailable", func() {
@@ -208,7 +211,14 @@ var _ = Describe("V2ListFeatureSupportLevels API", func() {
 				nil,
 			)
 
-			Expect(featureSupportLevels[string(models.FeatureSupportLevelIDMCE)]).To(Equal(models.SupportLevelUnavailable))
+			for _, feature := range featureSupportLevels {
+				if feature.FeatureSupportLevelID != models.FeatureSupportLevelIDMCE {
+					continue
+				}
+
+				Expect(feature.SupportLevel).To(Equal(models.SupportLevelUnavailable))
+				Expect(feature.Reason).To(Equal(models.IncompatibilityReasonPlatform))
+			}
 		})
 	})
 
@@ -221,7 +231,14 @@ var _ = Describe("V2ListFeatureSupportLevels API", func() {
 				nil,
 			)
 
-			Expect(featureSupportLevels[string(models.FeatureSupportLevelIDCNV)]).To(Equal(models.SupportLevelUnavailable))
+			for _, feature := range featureSupportLevels {
+				if feature.FeatureSupportLevelID != models.FeatureSupportLevelIDCNV {
+					continue
+				}
+
+				Expect(feature.SupportLevel).To(Equal(models.SupportLevelUnavailable))
+				Expect(feature.Reason).To(Equal(models.IncompatibilityReasonPlatform))
+			}
 		})
 	})
 
@@ -264,7 +281,14 @@ var _ = Describe("V2ListFeatureSupportLevels API", func() {
 				common.PlatformTypePtr(platformType),
 				nil,
 			)
-			Expect(featureSupportLevels[string(models.FeatureSupportLevelIDMTV)]).To(Equal(expectedResult))
+
+			for _, feature := range featureSupportLevels {
+				if feature.FeatureSupportLevelID != models.FeatureSupportLevelIDMTV {
+					continue
+				}
+
+				Expect(feature.SupportLevel).To(Equal(expectedResult))
+			}
 		},
 			Entry("on Vsphere", "4.14", common.X86CPUArchitecture, models.PlatformTypeVsphere, models.SupportLevelUnavailable),
 			Entry("on Nutanix", "4.14", common.X86CPUArchitecture, models.PlatformTypeNutanix, models.SupportLevelUnavailable),
@@ -296,12 +320,19 @@ var _ = Describe("V2ListFeatureSupportLevels API", func() {
 				common.PlatformTypePtr(platformType),
 				nil,
 			)
-			Expect(featureSupportLevels[string(models.FeatureSupportLevelIDOSC)]).To(Equal(expectedResult))
+
+			for _, feature := range featureSupportLevels {
+				if feature.FeatureSupportLevelID != models.FeatureSupportLevelIDOSC {
+					continue
+				}
+
+				Expect(feature.SupportLevel).To(Equal(expectedResult))
+			}
 		},
 			Entry("on Vsphere", "4.10", common.X86CPUArchitecture, models.PlatformTypeVsphere, models.SupportLevelUnavailable),
 			Entry("on Nutanix", "4.10", common.X86CPUArchitecture, models.PlatformTypeNutanix, models.SupportLevelUnavailable),
-			Entry("on none", "4.10", common.X86CPUArchitecture, models.PlatformTypeNone, models.SupportLevelTechPreview),
-			Entry("on baremetal", "4.10", common.X86CPUArchitecture, models.PlatformTypeBaremetal, models.SupportLevelTechPreview),
+			Entry("on none", "4.10", common.X86CPUArchitecture, models.PlatformTypeNone, models.SupportLevelSupported),
+			Entry("on baremetal", "4.10", common.X86CPUArchitecture, models.PlatformTypeBaremetal, models.SupportLevelSupported),
 		)
 	})
 
@@ -328,7 +359,14 @@ var _ = Describe("V2ListFeatureSupportLevels API", func() {
 				common.PlatformTypePtr(platformType),
 				nil,
 			)
-			Expect(featureSupportLevels[string(models.FeatureSupportLevelIDNMSTATE)]).To(Equal(expectedResult))
+
+			for _, feature := range featureSupportLevels {
+				if feature.FeatureSupportLevelID != models.FeatureSupportLevelIDNMSTATE {
+					continue
+				}
+
+				Expect(feature.SupportLevel).To(Equal(expectedResult))
+			}
 		},
 			Entry("on Vsphere", "4.12", common.X86CPUArchitecture, models.PlatformTypeVsphere, models.SupportLevelSupported),
 			Entry("on none", "4.12", common.X86CPUArchitecture, models.PlatformTypeNone, models.SupportLevelSupported),

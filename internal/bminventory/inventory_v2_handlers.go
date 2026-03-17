@@ -15,14 +15,18 @@ import (
 	"github.com/go-openapi/strfmt"
 	"github.com/go-openapi/swag"
 	"github.com/google/uuid"
+	"github.com/hashicorp/go-version"
 	"github.com/openshift/assisted-service/internal/common"
 	eventgen "github.com/openshift/assisted-service/internal/common/events"
 	"github.com/openshift/assisted-service/internal/constants"
+	"github.com/openshift/assisted-service/internal/featuresupport"
 	"github.com/openshift/assisted-service/internal/gencrypto"
 	"github.com/openshift/assisted-service/internal/host/hostutil"
 	"github.com/openshift/assisted-service/internal/imageservice"
+	"github.com/openshift/assisted-service/internal/operators"
 	"github.com/openshift/assisted-service/models"
 	"github.com/openshift/assisted-service/pkg/auth"
+	ctxparams "github.com/openshift/assisted-service/pkg/context"
 	"github.com/openshift/assisted-service/pkg/filemiddleware"
 	logutil "github.com/openshift/assisted-service/pkg/log"
 	"github.com/openshift/assisted-service/pkg/ocm"
@@ -50,6 +54,45 @@ func (b *bareMetalInventory) V2RegisterCluster(ctx context.Context, params insta
 	return installer.NewV2RegisterClusterCreated().WithPayload(&c.Cluster)
 }
 
+func (b *bareMetalInventory) V2RegisterDisconnectedCluster(ctx context.Context, params installer.V2RegisterDisconnectedClusterParams) middleware.Responder {
+	id := strfmt.UUID(uuid.New().String())
+	url := installer.V2GetClusterURL{ClusterID: id}
+	log := logutil.FromContext(ctx, b.log).WithField(ctxparams.ClusterId, id)
+
+	log.Infof("Register disconnected cluster: %s with id %s", swag.StringValue(params.NewClusterParams.Name), id)
+
+	if swag.StringValue(params.NewClusterParams.Name) == "" {
+		err := errors.New("cluster name is required")
+		return common.GenerateErrorResponder(common.NewApiError(http.StatusBadRequest, err))
+	}
+
+	if swag.StringValue(params.NewClusterParams.OpenshiftVersion) == "" {
+		err := errors.New("OpenShift version is required")
+		return common.GenerateErrorResponder(common.NewApiError(http.StatusBadRequest, err))
+	}
+
+	cluster := &common.Cluster{
+		Cluster: models.Cluster{
+			ID:               &id,
+			Href:             swag.String(url.String()),
+			Kind:             swag.String(models.ClusterKindDisconnectedCluster),
+			Status:           swag.String(models.ClusterStatusUnmonitored),
+			Name:             swag.StringValue(params.NewClusterParams.Name),
+			OpenshiftVersion: swag.StringValue(params.NewClusterParams.OpenshiftVersion),
+			UserName:         ocm.UserNameFromContext(ctx),
+			OrgID:            ocm.OrgIDFromContext(ctx),
+			EmailDomain:      ocm.EmailDomainFromContext(ctx),
+		},
+	}
+
+	err := b.clusterApi.RegisterCluster(ctx, cluster)
+	if err != nil {
+		return common.GenerateErrorResponder(common.NewApiError(http.StatusInternalServerError, err))
+	}
+
+	return installer.NewV2RegisterDisconnectedClusterCreated().WithPayload(&cluster.Cluster)
+}
+
 func (b *bareMetalInventory) GetSupportedFeatures(ctx context.Context, params installer.GetSupportedFeaturesParams) middleware.Responder {
 	supportLevelList, err := b.GetFeatureSupportLevelListInternal(ctx, params)
 	if err != nil {
@@ -57,6 +100,79 @@ func (b *bareMetalInventory) GetSupportedFeatures(ctx context.Context, params in
 	}
 
 	return installer.NewGetSupportedFeaturesOK().WithPayload(&installer.GetSupportedFeaturesOKBody{Features: supportLevelList})
+}
+
+func (b *bareMetalInventory) GetDetailedSupportedFeatures(ctx context.Context, params installer.GetDetailedSupportedFeaturesParams) middleware.Responder {
+	// Check parameters
+	_, err := version.NewVersion(params.OpenshiftVersion)
+	if err != nil {
+		return common.NewApiError(http.StatusBadRequest, fmt.Errorf("invalid openshift version: %w", err))
+	}
+
+	if params.CPUArchitecture == nil {
+		return common.NewApiError(http.StatusBadRequest, fmt.Errorf("cpu architecture is required"))
+	}
+
+	archSupported, err := featuresupport.IsArchitectureSupported(*params.CPUArchitecture, params.OpenshiftVersion)
+	if err != nil {
+		return common.NewApiError(http.StatusInternalServerError, err)
+	}
+
+	if !archSupported {
+		return common.NewApiError(http.StatusBadRequest, fmt.Errorf("cpu architecture %s is not supported for openshift version %s", *params.CPUArchitecture, params.OpenshiftVersion))
+	}
+
+	if params.PlatformType != nil {
+		platformSupported, err := featuresupport.IsPlatformSupported(models.PlatformType(*params.PlatformType), params.ExternalPlatformName, params.OpenshiftVersion, *params.CPUArchitecture)
+		if err != nil {
+			return common.NewApiError(http.StatusBadRequest, err)
+		}
+
+		if !platformSupported {
+			return common.NewApiError(http.StatusBadRequest, fmt.Errorf("platform %s is not supported for openshift version %s and cpu architecture %s", *params.PlatformType, params.OpenshiftVersion, *params.CPUArchitecture))
+		}
+	}
+
+	// Get features and operators
+	featureSupportList := featuresupport.GetFeatureSupportList(params.OpenshiftVersion, params.CPUArchitecture, (*models.PlatformType)(params.PlatformType), params.ExternalPlatformName)
+	operatorList := b.operatorManagerApi.GetOperatorDependenciesFeatureID()
+
+	// Reorder operators as a map
+	operatorMap := make(map[models.FeatureSupportLevelID]operators.OperatorFeatureSupportID)
+	for _, operator := range operatorList {
+		operatorMap[operator.FeatureSupportID] = operator
+	}
+
+	// Compute response
+	features := make([]*models.Feature, 0)
+	operators := make([]*models.Operator, 0)
+
+	for _, feature := range featureSupportList {
+		operator, isOperator := operatorMap[feature.FeatureSupportLevelID]
+
+		if isOperator {
+			operators = append(operators, &models.Operator{
+				FeatureSupportLevelID: feature.FeatureSupportLevelID,
+				SupportLevel:          feature.SupportLevel,
+				Reason:                feature.Reason,
+				Incompatibilities:     feature.Incompatibilities,
+				Name:                  &operator.OperatorName,
+				Dependencies:          operator.Dependencies,
+			})
+		} else {
+			features = append(features, &models.Feature{
+				FeatureSupportLevelID: feature.FeatureSupportLevelID,
+				SupportLevel:          feature.SupportLevel,
+				Reason:                feature.Reason,
+				Incompatibilities:     feature.Incompatibilities,
+			})
+		}
+	}
+
+	return installer.NewGetDetailedSupportedFeaturesOK().WithPayload(&installer.GetDetailedSupportedFeaturesOKBody{
+		Features:  features,
+		Operators: operators,
+	})
 }
 
 func (b *bareMetalInventory) GetSupportedArchitectures(ctx context.Context, params installer.GetSupportedArchitecturesParams) middleware.Responder {
@@ -472,7 +588,7 @@ func (b *bareMetalInventory) v2uploadLogs(ctx context.Context, params installer.
 
 	if params.LogsType == string(models.LogsTypeHost) {
 		if common.StrFmtUUIDPtr(params.ClusterID) == nil || params.HostID == nil {
-			return common.NewApiError(http.StatusInternalServerError,
+			return common.NewApiError(http.StatusBadRequest,
 				errors.Errorf("cluster_id and host_id are required for upload %s logs", params.LogsType))
 		}
 
@@ -733,6 +849,10 @@ func (b *bareMetalInventory) GetInfraEnvDownloadURL(ctx context.Context, params 
 	infraEnv, err := common.GetInfraEnvFromDB(b.db, params.InfraEnvID)
 	if err != nil {
 		return common.GenerateErrorResponder(err)
+	}
+
+	if !b.EnableImageService {
+		return common.GenerateErrorResponder(common.NewApiError(http.StatusBadRequest, errors.New("image service is disabled")))
 	}
 
 	osImage, err := b.osImages.GetOsImageOrLatest(infraEnv.OpenshiftVersion, infraEnv.CPUArchitecture)

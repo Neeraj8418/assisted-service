@@ -8,10 +8,16 @@ import (
 	"github.com/openshift/assisted-service/internal/common"
 	"github.com/openshift/assisted-service/internal/featuresupport"
 	"github.com/openshift/assisted-service/internal/operators/api"
+	"github.com/openshift/assisted-service/internal/operators/nodefeaturediscovery"
 	"github.com/openshift/assisted-service/models"
 	"github.com/openshift/assisted-service/pkg/conversions"
 	logutil "github.com/openshift/assisted-service/pkg/log"
 	"github.com/sirupsen/logrus"
+)
+
+const (
+	clusterValidationID = string(models.ClusterValidationIDOscRequirementsSatisfied)
+	hostValidationID    = string(models.HostValidationIDOscRequirementsSatisfied)
 )
 
 type operator struct {
@@ -49,32 +55,54 @@ func (o *operator) GetFullName() string {
 }
 
 func (o *operator) GetDependencies(cluster *common.Cluster) ([]string, error) {
-	return make([]string, 0), nil
+	return []string{nodefeaturediscovery.Operator.Name}, nil
 }
 
-// GetClusterValidationID returns cluster validation ID for the Operator
-func (o *operator) GetClusterValidationID() string {
-	return string(models.ClusterValidationIDOscRequirementsSatisfied)
+func (o *operator) GetDependenciesFeatureSupportID() []models.FeatureSupportLevelID {
+	return nil
+}
+
+// GetClusterValidationIDs returns cluster validation IDs for the Operator
+func (o *operator) GetClusterValidationIDs() []string {
+	return []string{clusterValidationID}
 }
 
 // GetHostValidationID returns host validation ID for the Operator
 func (o *operator) GetHostValidationID() string {
-	return string(models.HostValidationIDOscRequirementsSatisfied)
+	return hostValidationID
 }
 
 // ValidateCluster verifies whether this operator is valid for given cluster
-func (o *operator) ValidateCluster(_ context.Context, cluster *common.Cluster) (api.ValidationResult, error) {
+func (o *operator) ValidateCluster(_ context.Context, cluster *common.Cluster) ([]api.ValidationResult, error) {
+	result := []api.ValidationResult{{
+		Status:       api.Success,
+		ValidationId: clusterValidationID,
+	}}
+
 	if !featuresupport.IsFeatureCompatibleWithArchitecture(models.FeatureSupportLevelIDOSC, cluster.OpenshiftVersion, cluster.CPUArchitecture) {
-		return api.ValidationResult{Status: api.Failure, ValidationId: o.GetClusterValidationID(), Reasons: []string{fmt.Sprintf(
-			"%s is not supported for %s CPU architecture.", o.GetFullName(), cluster.CPUArchitecture)}}, nil
+		result[0].Status = api.Failure
+		result[0].Reasons = []string{
+			fmt.Sprintf("%s is not supported for %s CPU architecture.", o.GetFullName(), cluster.CPUArchitecture),
+		}
+
+		return result, nil
 	}
 
-	if ok, _ := common.BaseVersionLessThan(OscMinOpenshiftVersion, cluster.OpenshiftVersion); ok {
-		message := fmt.Sprintf("%s is only supported for openshift versions %s and above", o.GetFullName(), OscMinOpenshiftVersion)
-		return api.ValidationResult{Status: api.Failure, ValidationId: o.GetClusterValidationID(), Reasons: []string{message}}, nil
+	ok, err := common.BaseVersionLessThan(OscMinOpenshiftVersion, cluster.OpenshiftVersion)
+	if err != nil {
+		return nil, fmt.Errorf("failed to compare openshift versions: %w", err)
 	}
 
-	return api.ValidationResult{Status: api.Success, ValidationId: o.GetClusterValidationID(), Reasons: []string{}}, nil
+	if ok {
+		result[0].Status = api.Failure
+		result[0].Reasons = []string{
+			fmt.Sprintf("%s is only supported for openshift versions %s and above", o.GetFullName(), OscMinOpenshiftVersion),
+		}
+
+		return result, nil
+	}
+
+	return result, nil
 }
 
 // ValidateHost returns validationResult based on node type requirements such as memory and cpu
@@ -123,6 +151,8 @@ func (o *operator) GetHostRequirements(ctx context.Context, cluster *common.Clus
 	switch role {
 	case models.HostRoleMaster:
 		return preflightRequirements.Requirements.Master.Quantitative, nil
+	case models.HostRoleArbiter:
+		return &models.ClusterHostRequirementsDetails{}, nil
 	case models.HostRoleWorker, models.HostRoleAutoAssign:
 		return preflightRequirements.Requirements.Worker.Quantitative, nil
 	}
@@ -184,6 +214,6 @@ func (o *operator) GetFeatureSupportID() models.FeatureSupportLevelID {
 }
 
 // GetBundleLabels returns the bundle labels for the OSC operator
-func (o *operator) GetBundleLabels() []string {
+func (o *operator) GetBundleLabels(featureIDs []models.FeatureSupportLevelID) []string {
 	return []string(Operator.Bundles)
 }

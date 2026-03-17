@@ -141,10 +141,10 @@ func (r *ClusterDeploymentsReconciler) Reconcile(origCtx context.Context, req ct
 	log := logutil.FromContext(ctx, r.Log).WithFields(logFields)
 
 	defer func() {
-		log.Info("ClusterDeployment Reconcile ended")
+		log.Debug("ClusterDeployment Reconcile ended")
 	}()
 
-	log.Info("ClusterDeployment Reconcile started")
+	log.Debug("ClusterDeployment Reconcile started")
 
 	clusterDeployment := &hivev1.ClusterDeployment{}
 	clusterInstallDeleted := false
@@ -161,7 +161,7 @@ func (r *ClusterDeploymentsReconciler) Reconcile(origCtx context.Context, req ct
 
 	clusterInstall := &hiveext.AgentClusterInstall{}
 	if clusterDeployment.Spec.ClusterInstallRef == nil {
-		log.Infof("AgentClusterInstall not set for ClusterDeployment %s", clusterDeployment.Name)
+		log.Debugf("AgentClusterInstall not set for ClusterDeployment %s", clusterDeployment.Name)
 		return ctrl.Result{}, nil
 	}
 
@@ -176,7 +176,7 @@ func (r *ClusterDeploymentsReconciler) Reconcile(origCtx context.Context, req ct
 		if k8serrors.IsNotFound(err) {
 			// mark that clusterInstall was already deleted so we skip it if needed.
 			clusterInstallDeleted = true
-			log.WithField("AgentClusterInstall", aciName).Infof("AgentClusterInstall does not exist for ClusterDeployment %s", clusterDeployment.Name)
+			log.WithField("AgentClusterInstall", aciName).Debugf("AgentClusterInstall does not exist for ClusterDeployment %s", clusterDeployment.Name)
 			if clusterDeployment.ObjectMeta.DeletionTimestamp.IsZero() {
 				// we have no agentClusterInstall and clusterDeployment is not being deleted. stop reconciliation.
 				return ctrl.Result{}, nil
@@ -212,9 +212,10 @@ func (r *ClusterDeploymentsReconciler) Reconcile(origCtx context.Context, req ct
 		log.WithError(err).Errorf("failed to get pull secret for cluster deployment %s", clusterDeployment.Name)
 		return r.updateStatus(ctx, log, clusterInstall, clusterDeployment, nil, err)
 	}
-	releaseImage, err := r.getReleaseImage(ctx, clusterDeployment, clusterInstall, pullSecret)
+
+	clusterImageSet, err := r.ensureClusterImageSetRef(ctx, log, clusterDeployment, clusterInstall)
 	if err != nil {
-		log.WithError(err).Errorf("failed to get release image for cluster %s, ensure AgentClusterInstall.Spec.ImageSetRef references a ClusterImageSet", clusterDeployment.Name)
+		log.WithError(err).Errorf("failed to ensure release image for cluster %s, AgentClusterInstall.Spec.ImageSetRef must reference a valid ClusterImageSet", clusterDeployment.Name)
 		return r.updateStatus(ctx, log, clusterInstall, clusterDeployment, nil, err)
 	}
 
@@ -223,12 +224,17 @@ func (r *ClusterDeploymentsReconciler) Reconcile(origCtx context.Context, req ct
 		log.Infof("Found MirrorRegistry referenace on AgentClusterInstall %s %s", clusterInstall.Name, clusterInstall.Namespace)
 		mirrorRegistryConfiguration, err = r.processMirrorRegistryConfig(ctx, log, clusterInstall)
 		if err != nil {
-			return r.updateStatus(ctx, log, clusterInstall, clusterDeployment, nil, newInputError(err.Error()))
+			return r.updateStatus(ctx, log, clusterInstall, clusterDeployment, nil, newInputError("%s", err.Error()))
 		}
 	}
 
 	cluster, err := r.Installer.GetClusterByKubeKey(req.NamespacedName)
 	if errors.Is(err, gorm.ErrRecordNotFound) {
+		releaseImage, releaseImageErr := r.getReleaseImage(ctx, clusterImageSet, pullSecret)
+		if releaseImageErr != nil {
+			log.WithError(releaseImageErr).Errorf("failed to get release image for cluster %s", clusterDeployment.Name)
+			return r.updateStatus(ctx, log, clusterInstall, clusterDeployment, nil, releaseImageErr)
+		}
 		if !isInstalled(clusterDeployment, clusterInstall) {
 			return r.createNewCluster(ctx, log, req.NamespacedName, pullSecret, releaseImage, clusterDeployment, clusterInstall, mirrorRegistryConfiguration)
 		}
@@ -405,10 +411,15 @@ func isInstalled(clusterDeployment *hivev1.ClusterDeployment, clusterInstall *hi
 
 // getHostSuggestedRoleCount returns the amount of suggested masters and workers for the given cluster.
 // It counts from DB as the hosts are not loaded to memory, and we want to avoid loading them.
-func getHostSuggestedRoleCount(clusterAPI cluster.API, clusterID strfmt.UUID) (*int64, *int64, error) {
+func getHostSuggestedRoleCount(clusterAPI cluster.API, clusterID strfmt.UUID) (*int64, *int64, *int64, error) {
 	var combinedErr error
 
 	mastersCountPtr, err := clusterAPI.GetHostCountByRole(clusterID, models.HostRoleMaster, true)
+	if err != nil {
+		combinedErr = errpkg.Join(combinedErr, err)
+	}
+
+	arbiterCountPtr, err := clusterAPI.GetHostCountByRole(clusterID, models.HostRoleArbiter, true)
 	if err != nil {
 		combinedErr = errpkg.Join(combinedErr, err)
 	}
@@ -421,10 +432,10 @@ func getHostSuggestedRoleCount(clusterAPI cluster.API, clusterID strfmt.UUID) (*
 	if combinedErr != nil {
 		// convert the err to one line
 		combinedErr = errors.New(strings.ReplaceAll(combinedErr.Error(), "\n", ", "))
-		return nil, nil, combinedErr
+		return nil, nil, nil, combinedErr
 	}
 
-	return mastersCountPtr, workersCountPtr, nil
+	return mastersCountPtr, arbiterCountPtr, workersCountPtr, nil
 }
 
 func (r *ClusterDeploymentsReconciler) installDay1(ctx context.Context, log logrus.FieldLogger, clusterDeployment *hivev1.ClusterDeployment,
@@ -711,10 +722,11 @@ func (r *ClusterDeploymentsReconciler) isReadyForInstallation(
 	log.Debugf("Calculating installation readiness, found %d unsynced agents out of total of %d agents", unsyncedHosts, len(agents))
 
 	expectedMasterCount := clusterInstall.Spec.ProvisionRequirements.ControlPlaneAgents
+	expectedArbiterCount := clusterInstall.Spec.ProvisionRequirements.ArbiterAgents
 	expectedWorkerCount := clusterInstall.Spec.ProvisionRequirements.WorkerAgents
-	expectedHostCount := expectedMasterCount + expectedWorkerCount
+	expectedHostCount := expectedMasterCount + expectedWorkerCount + expectedArbiterCount
 
-	masterCountPtr, workerCountPtr, err := getHostSuggestedRoleCount(r.ClusterApi, *c.ID)
+	masterCountPtr, arbiterCountPtr, workerCountPtr, err := getHostSuggestedRoleCount(r.ClusterApi, *c.ID)
 	if err != nil {
 		// will be shown as a SpecSynced error
 		log.WithError(err).Error("failed to fetch host suggested role count")
@@ -724,6 +736,7 @@ func (r *ClusterDeploymentsReconciler) isReadyForInstallation(
 	return approvedHosts == expectedHostCount &&
 		registered == expectedHostCount &&
 		int(swag.Int64Value(masterCountPtr)) == expectedMasterCount &&
+		int(swag.Int64Value(arbiterCountPtr)) == expectedArbiterCount &&
 		int(swag.Int64Value(workerCountPtr)) == expectedWorkerCount &&
 		unsyncedHosts == 0, nil
 }
@@ -747,23 +760,15 @@ func isUserManagedNetwork(clusterInstall *hiveext.AgentClusterInstall) bool {
 }
 
 func isDiskEncryptionEnabled(clusterInstall *hiveext.AgentClusterInstall) bool {
-	if clusterInstall.Spec.DiskEncryption == nil {
-		return false
-	}
-	switch swag.StringValue(clusterInstall.Spec.DiskEncryption.EnableOn) {
-	case models.DiskEncryptionEnableOnAll, models.DiskEncryptionEnableOnMasters, models.DiskEncryptionEnableOnWorkers:
-		return true
-	case models.DiskEncryptionEnableOnNone:
-		return false
-	default:
-		return false
-	}
+	return clusterInstall.Spec.DiskEncryption != nil &&
+		swag.StringValue(clusterInstall.Spec.DiskEncryption.EnableOn) != models.DiskEncryptionEnableOnNone
 }
 
 // see https://docs.openshift.com/container-platform/4.7/installing/installing_platform_agnostic/installing-platform-agnostic.html#installation-bare-metal-config-yaml_installing-platform-agnostic
 func hyperthreadingInSpec(clusterInstall *hiveext.AgentClusterInstall) bool {
 	//check if either master or worker pool hyperthreading settings are explicitly specified
 	return clusterInstall.Spec.ControlPlane != nil ||
+		clusterInstall.Spec.Arbiter != nil ||
 		funk.Contains(clusterInstall.Spec.Compute, func(pool hiveext.AgentMachinePool) bool {
 			return pool.Name == hiveext.WorkerAgentMachinePool
 		})
@@ -833,45 +838,43 @@ func getPlatformType(platform *models.Platform) hiveext.PlatformType {
 }
 
 func getHyperthreading(clusterInstall *hiveext.AgentClusterInstall) *string {
-	const (
-		None    = 0
-		Workers = 1
-		Masters = 2
-		All     = 3
-	)
-	var config uint = 0
-
 	//if there is no configuration of hyperthreading in the Spec then
 	//we are opting of the default behavior which is all enabled
 	if !hyperthreadingInSpec(clusterInstall) {
-		config = All
+		return swag.String(models.ClusterHyperthreadingAll)
+	}
+
+	//will keep the enabled pools in the order defined in the enum
+	//first masters and then arbiters and then workers
+	pools := make([]string, 0)
+
+	//check if the Spec enables hyperthreading for masters
+	if clusterInstall.Spec.ControlPlane != nil {
+		if clusterInstall.Spec.ControlPlane.Hyperthreading == hiveext.HyperthreadingEnabled {
+			pools = append(pools, models.ClusterHyperthreadingMasters)
+		}
+	}
+
+	//check if the Spec enables hyperthreading for arbiters
+	if clusterInstall.Spec.Arbiter != nil {
+		if clusterInstall.Spec.Arbiter.Hyperthreading == hiveext.HyperthreadingEnabled {
+			pools = append(pools, models.ClusterHyperthreadingArbiters)
+		}
 	}
 
 	//check if the Spec enables hyperthreading for workers
 	for _, machinePool := range clusterInstall.Spec.Compute {
 		if machinePool.Name == hiveext.WorkerAgentMachinePool && machinePool.Hyperthreading == hiveext.HyperthreadingEnabled {
-			config = config | Workers
+			pools = append(pools, models.ClusterHyperthreadingWorkers)
+			break
 		}
 	}
 
-	//check if the Spec enables hyperthreading for masters
-	if clusterInstall.Spec.ControlPlane != nil {
-		if clusterInstall.Spec.ControlPlane.Hyperthreading == hiveext.HyperthreadingEnabled {
-			config = config | Masters
-		}
-	}
-
-	//map between CRD Spec and cluster API
-	switch config {
-	case None:
+	if funk.IsEmpty(pools) {
 		return swag.String(models.ClusterHyperthreadingNone)
-	case Workers:
-		return swag.String(models.ClusterHyperthreadingWorkers)
-	case Masters:
-		return swag.String(models.ClusterHyperthreadingMasters)
-	default:
-		return swag.String(models.ClusterHyperthreadingAll)
 	}
+
+	return swag.String(strings.Join(pools, ","))
 }
 
 func (r *ClusterDeploymentsReconciler) getEncodedCACert(ctx context.Context,
@@ -1176,6 +1179,11 @@ func (r *ClusterDeploymentsReconciler) updateIfNeeded(
 		update = true
 	}
 
+	if label, exists := clusterInstall.GetLabels()[hiveext.ClusterConsumerLabel]; exists && label != cluster.Tags {
+		params.Tags = &label
+		update = true
+	}
+
 	if !update {
 		return cluster, nil
 	}
@@ -1376,7 +1384,7 @@ func (r *ClusterDeploymentsReconciler) addCustomManifests(ctx context.Context, l
 }
 
 func CreateClusterParams(clusterDeployment *hivev1.ClusterDeployment, clusterInstall *hiveext.AgentClusterInstall,
-	pullSecret string, releaseImageVersion string, releaseImageCPUArch string,
+	pullSecret string, releaseImage *models.ReleaseImage,
 	ignitionEndpoint *models.IgnitionEndpoint, olmOperators []*models.OperatorCreateParams) *models.ClusterCreateParams {
 	spec := clusterDeployment.Spec
 	platform, _ := getPlatform(clusterInstall.Spec)
@@ -1384,17 +1392,18 @@ func CreateClusterParams(clusterDeployment *hivev1.ClusterDeployment, clusterIns
 	clusterParams := &models.ClusterCreateParams{
 		BaseDNSDomain:         spec.BaseDomain,
 		Name:                  swag.String(spec.ClusterName),
-		OpenshiftVersion:      &releaseImageVersion,
+		OpenshiftVersion:      releaseImage.Version,
 		PullSecret:            swag.String(pullSecret),
 		VipDhcpAllocation:     swag.Bool(false),
 		APIVips:               ApiVipsEntriesToArray(clusterInstall.Spec.APIVIPs),
 		IngressVips:           IngressVipsEntriesToArray(clusterInstall.Spec.IngressVIPs),
 		SSHPublicKey:          clusterInstall.Spec.SSHPublicKey,
-		CPUArchitecture:       releaseImageCPUArch,
+		CPUArchitecture:       *releaseImage.CPUArchitecture,
 		UserManagedNetworking: swag.Bool(isUserManagedNetwork(clusterInstall)),
 		Platform:              platform,
 		SchedulableMasters:    swag.Bool(clusterInstall.Spec.MastersSchedulable),
 		ControlPlaneCount:     swag.Int64(int64(clusterInstall.Spec.ProvisionRequirements.ControlPlaneAgents)),
+		OcpReleaseImage:       *releaseImage.URL,
 	}
 
 	if len(clusterInstall.Spec.Networking.ClusterNetwork) > 0 {
@@ -1464,6 +1473,10 @@ func CreateClusterParams(clusterDeployment *hivev1.ClusterDeployment, clusterIns
 		clusterParams.OlmOperators = olmOperators
 	}
 
+	if label, exists := clusterInstall.GetLabels()[hiveext.ClusterConsumerLabel]; exists && label != "" {
+		clusterParams.Tags = &label
+	}
+
 	return clusterParams
 }
 
@@ -1478,7 +1491,10 @@ func (r *ClusterDeploymentsReconciler) createNewCluster(
 	mirrorRegistryConfiguration *common.MirrorRegistryConfiguration) (ctrl.Result, error) {
 
 	log.Infof("Creating a new cluster %s %s", clusterDeployment.Name, clusterDeployment.Namespace)
-
+	if releaseImage == nil { // releaseImage shoudn't be nil, but guard against it just in case
+		log.Errorf("release image cannot be nil for day 1 cluster %s %s", clusterDeployment.Name, clusterDeployment.Namespace)
+		return r.updateStatus(ctx, log, clusterInstall, clusterDeployment, nil, fmt.Errorf("release image cannot be nil for day 1 cluster %s %s. Ensure AgentClusterInstall.Spec.ImageSetRef references a valid ClusterImageSet", clusterDeployment.Name, clusterDeployment.Namespace))
+	}
 	var ignitionEndpoint *models.IgnitionEndpoint
 	var err error
 	if clusterInstall.Spec.IgnitionEndpoint != nil {
@@ -1489,8 +1505,7 @@ func (r *ClusterDeploymentsReconciler) createNewCluster(
 		}
 	}
 
-	clusterParams := CreateClusterParams(clusterDeployment, clusterInstall, pullSecret, *releaseImage.Version,
-		*releaseImage.CPUArchitecture, ignitionEndpoint, nil)
+	clusterParams := CreateClusterParams(clusterDeployment, clusterInstall, pullSecret, releaseImage, ignitionEndpoint, nil)
 
 	c, err := r.Installer.RegisterClusterInternal(ctx, &key, mirrorRegistryConfiguration, installer.V2RegisterClusterParams{
 		NewClusterParams: clusterParams,
@@ -1549,12 +1564,7 @@ func (r *ClusterDeploymentsReconciler) createNewDay2Cluster(
 	return r.updateStatus(ctx, log, clusterInstall, clusterDeployment, c, err)
 }
 
-func (r *ClusterDeploymentsReconciler) getReleaseImage(
-	ctx context.Context,
-	clusterDeployment *hivev1.ClusterDeployment,
-	clusterInstall *hiveext.AgentClusterInstall,
-	pullSecret string) (*models.ReleaseImage, error) {
-
+func (r *ClusterDeploymentsReconciler) ensureClusterImageSetRef(ctx context.Context, log logrus.FieldLogger, clusterDeployment *hivev1.ClusterDeployment, clusterInstall *hiveext.AgentClusterInstall) (*hivev1.ClusterImageSet, error) {
 	// Make sure that the ImageSetRef is set before continuing
 	if clusterInstall.Spec.ImageSetRef == nil {
 		// ImageSetRef is not required for already installed clusters
@@ -1571,9 +1581,23 @@ func (r *ClusterDeploymentsReconciler) getReleaseImage(
 		Name:      clusterInstall.Spec.ImageSetRef.Name,
 	}
 	if err := r.Client.Get(ctx, key, clusterImageSet); err != nil {
+		if k8serrors.IsNotFound(err) {
+			return nil, errors.Errorf("ClusterImageSet %s not found. Please ensure the ClusterImageSet exists", key.Name)
+		}
 		return nil, errors.Wrapf(err, "failed to get cluster image set %s", key.Name)
 	}
 
+	return clusterImageSet, nil
+}
+
+func (r *ClusterDeploymentsReconciler) getReleaseImage(
+	ctx context.Context,
+	clusterImageSet *hivev1.ClusterImageSet,
+	pullSecret string) (*models.ReleaseImage, error) {
+	if clusterImageSet == nil {
+		r.Log.Debugf("cluster image set is nil for cluster")
+		return nil, nil
+	}
 	releaseImage, err := r.VersionsHandler.GetReleaseImageByURL(ctx, clusterImageSet.Spec.ReleaseImage, pullSecret)
 	if err != nil {
 		errMsgSuffix := ""
@@ -1586,7 +1610,7 @@ func (r *ClusterDeploymentsReconciler) getReleaseImage(
 			}
 		}
 		errMsg := "failed to get release image '%s'. Please ensure the releaseImage field in ClusterImageSet '%s' is valid, %s (error: %s)."
-		return nil, errors.New(fmt.Sprintf(errMsg, clusterImageSet.Spec.ReleaseImage, key.Name, errMsgSuffix, err.Error()))
+		return nil, errors.New(fmt.Sprintf(errMsg, clusterImageSet.Spec.ReleaseImage, clusterImageSet.Name, errMsgSuffix, err.Error()))
 	}
 
 	return releaseImage, nil
@@ -1858,7 +1882,7 @@ func (r *ClusterDeploymentsReconciler) updateStatus(ctx context.Context, log log
 	c *common.Cluster, syncErr error) (ctrl.Result, error) {
 
 	var (
-		mastersCountPtr, workersCountPtr *int64
+		mastersCountPtr, arbiterCountPtr, workersCountPtr *int64
 	)
 
 	clusterSpecSynced(clusterInstall, syncErr)
@@ -1904,7 +1928,7 @@ func (r *ClusterDeploymentsReconciler) updateStatus(ctx context.Context, log log
 					return ctrl.Result{Requeue: true}, nil
 				}
 
-				mastersCountPtr, workersCountPtr, err = getHostSuggestedRoleCount(r.ClusterApi, *c.ID)
+				mastersCountPtr, arbiterCountPtr, workersCountPtr, err = getHostSuggestedRoleCount(r.ClusterApi, *c.ID)
 				if err != nil {
 					log.WithError(err).Error("failed to fetch host suggested role count")
 					// proceed to update the conditions (the counts will be 0)
@@ -1920,6 +1944,7 @@ func (r *ClusterDeploymentsReconciler) updateStatus(ctx context.Context, log log
 				approvedHosts,
 				unsyncedHosts,
 				int(swag.Int64Value(mastersCountPtr)),
+				int(swag.Int64Value(arbiterCountPtr)),
 				int(swag.Int64Value(workersCountPtr)),
 			)
 			clusterValidated(clusterInstall, status, c)
@@ -2066,6 +2091,7 @@ func clusterRequirementsMet(
 	approvedHosts,
 	unsyncedHosts int,
 	masterCount int,
+	arbiterCount int,
 	workerCount int,
 ) {
 	var condStatus corev1.ConditionStatus
@@ -2075,18 +2101,22 @@ func clusterRequirementsMet(
 	switch status {
 	case models.ClusterStatusReady:
 		expectedMasterCount := clusterInstall.Spec.ProvisionRequirements.ControlPlaneAgents
+		expectedArbiterCount := clusterInstall.Spec.ProvisionRequirements.ArbiterAgents
 		expectedWorkerCount := clusterInstall.Spec.ProvisionRequirements.WorkerAgents
-		expectedHostCount := expectedMasterCount + expectedWorkerCount
+		expectedHostCount := expectedMasterCount + expectedWorkerCount + expectedArbiterCount
 
 		if masterCount != expectedMasterCount ||
-			workerCount != expectedWorkerCount {
+			workerCount != expectedWorkerCount ||
+			arbiterCount != expectedArbiterCount {
 			condStatus = corev1.ConditionFalse
 			reason = hiveext.ClusterInsufficientAgentsReason
 			msg = fmt.Sprintf(
 				hiveext.ClusterInsufficientAgentsMsg,
 				expectedMasterCount,
+				expectedArbiterCount,
 				expectedWorkerCount,
 				masterCount,
+				arbiterCount,
 				workerCount,
 			)
 		} else if unsyncedHosts != 0 {
@@ -2403,6 +2433,11 @@ func FindStatusCondition(conditions []hivev1.ClusterInstallCondition, conditionT
 
 // ensureOwnerRef sets the owner reference of ClusterDeployment on AgentClusterInstall
 func (r *ClusterDeploymentsReconciler) ensureOwnerRef(ctx context.Context, log logrus.FieldLogger, cd *hivev1.ClusterDeployment, ci *hiveext.AgentClusterInstall) error {
+	for _, ref := range ci.GetOwnerReferences() {
+		if ref.UID == cd.UID {
+			return nil
+		}
+	}
 
 	if err := controllerutil.SetOwnerReference(cd, ci, r.Scheme); err != nil {
 		log.WithError(err).Error("error setting owner reference Agent Cluster Install")

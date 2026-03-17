@@ -18,20 +18,31 @@ import (
 	"github.com/openshift/assisted-service/internal/operators"
 	"github.com/openshift/assisted-service/internal/operators/amdgpu"
 	"github.com/openshift/assisted-service/internal/operators/authorino"
+	"github.com/openshift/assisted-service/internal/operators/clusterobservability"
 	"github.com/openshift/assisted-service/internal/operators/cnv"
 	operatorscommon "github.com/openshift/assisted-service/internal/operators/common"
+	"github.com/openshift/assisted-service/internal/operators/fenceagentsremediation"
 	"github.com/openshift/assisted-service/internal/operators/kmm"
+	"github.com/openshift/assisted-service/internal/operators/kubedescheduler"
+	"github.com/openshift/assisted-service/internal/operators/loki"
 	"github.com/openshift/assisted-service/internal/operators/lso"
 	"github.com/openshift/assisted-service/internal/operators/lvm"
 	"github.com/openshift/assisted-service/internal/operators/mce"
+	"github.com/openshift/assisted-service/internal/operators/metallb"
 	"github.com/openshift/assisted-service/internal/operators/mtv"
 	"github.com/openshift/assisted-service/internal/operators/nmstate"
 	"github.com/openshift/assisted-service/internal/operators/nodefeaturediscovery"
+	"github.com/openshift/assisted-service/internal/operators/nodehealthcheck"
+	"github.com/openshift/assisted-service/internal/operators/nodemaintenance"
+	"github.com/openshift/assisted-service/internal/operators/numaresources"
 	"github.com/openshift/assisted-service/internal/operators/nvidiagpu"
+	"github.com/openshift/assisted-service/internal/operators/oadp"
 	"github.com/openshift/assisted-service/internal/operators/odf"
 	"github.com/openshift/assisted-service/internal/operators/openshiftai"
+	"github.com/openshift/assisted-service/internal/operators/openshiftlogging"
 	"github.com/openshift/assisted-service/internal/operators/osc"
 	"github.com/openshift/assisted-service/internal/operators/pipelines"
+	"github.com/openshift/assisted-service/internal/operators/selfnoderemediation"
 	"github.com/openshift/assisted-service/internal/operators/serverless"
 	"github.com/openshift/assisted-service/internal/operators/servicemesh"
 	"github.com/openshift/assisted-service/models"
@@ -67,6 +78,17 @@ var _ = Describe("Operators endpoint tests", func() {
 				nmstate.Operator.Name,
 				amdgpu.Operator.Name,
 				kmm.Operator.Name,
+				nodehealthcheck.Operator.Name,
+				selfnoderemediation.Operator.Name,
+				fenceagentsremediation.Operator.Name,
+				nodemaintenance.Operator.Name,
+				kubedescheduler.Operator.Name,
+				clusterobservability.Operator.Name,
+				numaresources.Operator.Name,
+				oadp.Operator.Name,
+				metallb.Operator.Name,
+				loki.Operator.Name,
+				openshiftlogging.Operator.Name,
 			))
 		})
 
@@ -231,7 +253,7 @@ var _ = Describe("Operators endpoint tests", func() {
 
 	Context("OLM operators", func() {
 		ctx := context.Background()
-		registerNewCluster := func(openshiftVersion string, highAvailabilityMode string, operators []*models.OperatorCreateParams, cpuArchitecture *string, vipDhcpAllocation *bool) *installer.V2RegisterClusterCreated {
+		registerNewCluster := func(openshiftVersion string, ctrlPlaneCount int64, operators []*models.OperatorCreateParams, cpuArchitecture *string, vipDhcpAllocation *bool) *installer.V2RegisterClusterCreated {
 			var err error
 			var cluster *installer.V2RegisterClusterCreated
 			clusterCIDR := "10.128.0.0/14"
@@ -239,25 +261,25 @@ var _ = Describe("Operators endpoint tests", func() {
 
 			if vipDhcpAllocation == nil {
 				vipDhcpAllocation = swag.Bool(true)
-				if highAvailabilityMode == models.ClusterHighAvailabilityModeNone {
+				if ctrlPlaneCount == int64(1) {
 					vipDhcpAllocation = swag.Bool(false)
 				}
 			}
 
 			cluster, err = utils_test.TestContext.User2BMClient.Installer.V2RegisterCluster(ctx, &installer.V2RegisterClusterParams{
 				NewClusterParams: &models.ClusterCreateParams{
-					Name:                 swag.String("test-cluster"),
-					OpenshiftVersion:     swag.String(openshiftVersion),
-					HighAvailabilityMode: swag.String(highAvailabilityMode),
-					PullSecret:           swag.String(fmt.Sprintf(psTemplate, utils_test.FakePS2)),
-					CPUArchitecture:      swag.StringValue(cpuArchitecture),
-					OlmOperators:         operators,
-					BaseDNSDomain:        "example.com",
-					ClusterNetworks:      []*models.ClusterNetwork{{Cidr: models.Subnet(clusterCIDR), HostPrefix: 23}},
-					ServiceNetworks:      []*models.ServiceNetwork{{Cidr: models.Subnet(serviceCIDR)}},
-					SSHPublicKey:         utils_test.SshPublicKey,
-					VipDhcpAllocation:    vipDhcpAllocation,
-					NetworkType:          swag.String(models.ClusterNetworkTypeOVNKubernetes),
+					Name:              swag.String("test-cluster"),
+					OpenshiftVersion:  swag.String(openshiftVersion),
+					ControlPlaneCount: swag.Int64(ctrlPlaneCount),
+					PullSecret:        swag.String(fmt.Sprintf(psTemplate, utils_test.FakePS2)),
+					CPUArchitecture:   swag.StringValue(cpuArchitecture),
+					OlmOperators:      operators,
+					BaseDNSDomain:     "example.com",
+					ClusterNetworks:   []*models.ClusterNetwork{{Cidr: models.Subnet(clusterCIDR), HostPrefix: 23}},
+					ServiceNetworks:   []*models.ServiceNetwork{{Cidr: models.Subnet(serviceCIDR)}},
+					SSHPublicKey:      utils_test.SshPublicKey,
+					VipDhcpAllocation: vipDhcpAllocation,
+					NetworkType:       swag.String(models.ClusterNetworkTypeOVNKubernetes),
 				},
 			})
 
@@ -272,7 +294,7 @@ var _ = Describe("Operators endpoint tests", func() {
 			// Register cluster with ppc64le CPU architecture
 			cluster := registerNewCluster(
 				"4.13.0",
-				models.ClusterHighAvailabilityModeFull,
+				int64(common.MinMasterHostsNeededForInstallationInHaMode),
 				nil,
 				swag.String(models.ClusterCPUArchitectureS390x),
 				swag.Bool(false),
@@ -343,7 +365,7 @@ var _ = Describe("Operators endpoint tests", func() {
 		It("LSO as ODF dependency on ARM arch", func() {
 			cluster := registerNewCluster(
 				"4.13-multi",
-				models.ClusterHighAvailabilityModeFull,
+				int64(common.MinMasterHostsNeededForInstallationInHaMode),
 				nil,
 				swag.String(models.ClusterCPUArchitectureArm64),
 				nil,
@@ -384,8 +406,8 @@ var _ = Describe("Operators endpoint tests", func() {
 
 		It("should lvm installed as cnv dependency", func() {
 			cluster := registerNewCluster(
-				"4.12.0",
-				models.ClusterHighAvailabilityModeNone,
+				"4.13.0",
+				int64(1),
 				[]*models.OperatorCreateParams{{Name: cnv.Operator.Name}},
 				nil,
 				nil,
@@ -412,10 +434,10 @@ var _ = Describe("Operators endpoint tests", func() {
 			))
 		})
 
-		It("should lvm have right subscription name on 4.12", func() {
+		It("should lvm have right subscription name on 4.13", func() {
 			cluster := registerNewCluster(
-				"4.12.0",
-				models.ClusterHighAvailabilityModeNone,
+				"4.13.0",
+				int64(1),
 				[]*models.OperatorCreateParams{{Name: cnv.Operator.Name}},
 				nil,
 				nil,
@@ -438,7 +460,7 @@ var _ = Describe("Operators endpoint tests", func() {
 		It("should lvm have right subscription name on 4.11", func() {
 			cluster := registerNewCluster(
 				"4.11",
-				models.ClusterHighAvailabilityModeNone,
+				int64(1),
 				[]*models.OperatorCreateParams{{Name: lvm.Operator.Name}},
 				nil,
 				nil,
@@ -516,7 +538,7 @@ var _ = Describe("Operators endpoint tests", func() {
 		})
 
 		It("should be updated", func() {
-			utils_test.TestContext.V2ReportMonitoredOperatorStatus(ctx, *cluster.Payload.ID, odf.Operator.Name, models.OperatorStatusFailed, "4.12")
+			utils_test.TestContext.V2ReportMonitoredOperatorStatus(ctx, *cluster.Payload.ID, odf.Operator.Name, models.OperatorStatusFailed, "4.13")
 
 			ops, err := utils_test.TestContext.AgentBMClient.Operators.V2ListOfClusterOperators(ctx, opclient.NewV2ListOfClusterOperatorsParams().
 				WithClusterID(*cluster.Payload.ID).
@@ -527,7 +549,7 @@ var _ = Describe("Operators endpoint tests", func() {
 			Expect(operators).To(HaveLen(1))
 			Expect(operators[0].StatusInfo).To(BeEquivalentTo(string(models.OperatorStatusFailed)))
 			Expect(operators[0].Status).To(BeEquivalentTo(models.OperatorStatusFailed))
-			Expect(operators[0].Version).To(BeEquivalentTo("4.12"))
+			Expect(operators[0].Version).To(BeEquivalentTo("4.13"))
 		})
 	})
 

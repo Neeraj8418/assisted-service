@@ -2,7 +2,7 @@ apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   annotations:
-    controller-gen.kubebuilder.io/version: v0.14.0
+    controller-gen.kubebuilder.io/version: v0.17.0
   name: agentclassifications.agent-install.openshift.io
 spec:
   conversion:
@@ -118,7 +118,7 @@ apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   annotations:
-    controller-gen.kubebuilder.io/version: v0.14.0
+    controller-gen.kubebuilder.io/version: v0.17.0
   name: agentclusterinstalls.extensions.hive.openshift.io
 spec:
   group: extensions.hive.openshift.io
@@ -181,6 +181,31 @@ spec:
                   type: string
                 maxItems: 2
                 type: array
+              arbiter:
+                description: |-
+                  Arbiter is the configuration for the machines that have the
+                  arbiter role.
+                properties:
+                  hyperthreading:
+                    default: Enabled
+                    description: |-
+                      Hyperthreading determines the mode of hyperthreading that machines in the
+                      pool will utilize.
+                      Default is for hyperthreading to be enabled.
+                    enum:
+                    - ""
+                    - Enabled
+                    - Disabled
+                    type: string
+                  name:
+                    description: |-
+                      Name is the name of the machine pool.
+                      For the control plane machine pool, the name will always be "master".
+                      For the compute machine pools, the only valid name is "worker".
+                    type: string
+                required:
+                - name
+                type: object
               clusterDeploymentRef:
                 description: ClusterDeploymentRef is a reference to the ClusterDeployment
                   associated with this AgentClusterInstall.
@@ -189,7 +214,6 @@ spec:
                     description: |-
                       Name of the referent.
                       More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
-                      TODO: Add other useful fields. apiVersion, kind, uid?
                     type: string
                 type: object
                 x-kubernetes-map-type: atomic
@@ -208,7 +232,6 @@ spec:
                         description: |-
                           Name of the referent.
                           More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
-                          TODO: Add other useful fields. apiVersion, kind, uid?
                         type: string
                     type: object
                     x-kubernetes-map-type: atomic
@@ -221,7 +244,6 @@ spec:
                         description: |-
                           Name of the referent.
                           More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
-                          TODO: Add other useful fields. apiVersion, kind, uid?
                         type: string
                     type: object
                     x-kubernetes-map-type: atomic
@@ -335,7 +357,12 @@ spec:
                     - none
                     - all
                     - masters
+                    - arbiters
                     - workers
+                    - masters,arbiters
+                    - masters,workers
+                    - arbiters,workers
+                    - masters,arbiters,workers
                     type: string
                   mode:
                     description: The disk encryption mode to use.
@@ -460,7 +487,6 @@ spec:
                     description: |-
                       Name of the referent.
                       More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
-                      TODO: Add other useful fields. apiVersion, kind, uid?
                     type: string
                 type: object
                 x-kubernetes-map-type: atomic
@@ -580,6 +606,12 @@ spec:
                 description: ProvisionRequirements defines configuration for when
                   the installation is ready to be launched automatically.
                 properties:
+                  arbiterAgents:
+                    description: |-
+                      ArbiterAgents is the minimum number of matching approved and ready Agents with the arbiter role
+                      required to launch the install.
+                    minimum: 0
+                    type: integer
                   controlPlaneAgents:
                     description: |-
                       ControlPlaneAgents is the number of matching approved and ready Agents with the control plane role
@@ -790,7 +822,7 @@ apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   annotations:
-    controller-gen.kubebuilder.io/version: v0.14.0
+    controller-gen.kubebuilder.io/version: v0.17.0
   name: agents.agent-install.openshift.io
 spec:
   conversion:
@@ -879,6 +911,10 @@ spec:
                       name must be unique.
                     type: string
                 type: object
+              fencingCredentialsSecretRef:
+                description: FencingCredentialsSecretRef is a name of a secret in
+                  the Agent's namespace that contains fencing credentials
+                type: string
               hostname:
                 type: string
               ignitionConfigOverrides:
@@ -911,6 +947,10 @@ spec:
                 description: InstallationDiskID defines the installation destination
                   disk (must be equal to the inventory disk id).
                 type: string
+              installation_disk_path:
+                description: InstallationDiskPath defines the installation destination
+                  disk using either its by-id or by-path value.
+                type: string
               installerArgs:
                 description: Json formatted string containing the user overrides for
                   the host's coreos installer args
@@ -926,7 +966,6 @@ spec:
               role:
                 description: |-
                   HostRole host role
-
 
                   swagger:model host-role
                 type: string
@@ -966,6 +1005,35 @@ spec:
                   - type
                   type: object
                 type: array
+              csrStatus:
+                description: CSRStatus tracks the status of CSR approvals for the
+                  agent
+                properties:
+                  approvedCSRs:
+                    description: CSRs that have been approved for the agent by the
+                      assisted-service
+                    items:
+                      description: CSRInfo tracks information about an approved CSR
+                      properties:
+                        approvedAt:
+                          format: date-time
+                          type: string
+                        name:
+                          type: string
+                        type:
+                          description: CSRType represents the type of CSR
+                          type: string
+                      required:
+                      - approvedAt
+                      - name
+                      - type
+                      type: object
+                    type: array
+                  lastApprovalAttempt:
+                    description: Last time we attempted a CSR approval
+                    format: date-time
+                    type: string
+                type: object
               debugInfo:
                 description: DebugInfo includes information for debugging the installation
                   process.
@@ -1090,6 +1158,28 @@ spec:
                       - id
                       type: object
                     type: array
+                  gpus:
+                    items:
+                      properties:
+                        address:
+                          description: Device address (for example "0000:00:02.0")
+                          type: string
+                        deviceID:
+                          description: ID of the device (for example "3ea0")
+                          type: string
+                        name:
+                          description: Product name of the device (for example "UHD
+                            Graphics 620 (Whiskey Lake)")
+                          type: string
+                        vendor:
+                          description: The name of the device vendor (for example
+                            "Intel Corporation")
+                          type: string
+                        vendorID:
+                          description: ID of the vendor (for example "8086")
+                          type: string
+                      type: object
+                    type: array
                   hostname:
                     type: string
                   interfaces:
@@ -1158,6 +1248,12 @@ spec:
                         type: boolean
                     type: object
                 type: object
+              kind:
+                description: |-
+                  Kind corresponds to the same field in the model Host. It indicates the type of cluster the host is
+                  being installed to; either an existing cluster (day-2) or a new cluster (day-1).
+                  Value is one of: "AddToExistingClusterHost" (day-2) or "Host" (day-1)
+                type: string
               ntpSources:
                 items:
                   properties:
@@ -1166,7 +1262,6 @@ spec:
                     sourceState:
                       description: |-
                         SourceState source state
-
 
                         swagger:model source_state
                       type: string
@@ -1192,7 +1287,6 @@ spec:
                       description: |-
                         HostStage host stage
 
-
                         swagger:model host-stage
                       type: string
                     type: array
@@ -1208,7 +1302,6 @@ spec:
               role:
                 description: |-
                   HostRole host role
-
 
                   swagger:model host-role
                 type: string
@@ -1243,7 +1336,7 @@ apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   annotations:
-    controller-gen.kubebuilder.io/version: v0.14.0
+    controller-gen.kubebuilder.io/version: v0.17.0
   name: agentserviceconfigs.agent-install.openshift.io
 spec:
   group: agent-install.openshift.io
@@ -1291,7 +1384,6 @@ spec:
                     description: |-
                       Name of the referent.
                       More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
-                      TODO: Add other useful fields. apiVersion, kind, uid?
                     type: string
                 type: object
                 x-kubernetes-map-type: atomic
@@ -1305,7 +1397,6 @@ spec:
                     description: |-
                       Name of the referent.
                       More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
-                      TODO: Add other useful fields. apiVersion, kind, uid?
                     type: string
                 type: object
                 x-kubernetes-map-type: atomic
@@ -1950,7 +2041,6 @@ spec:
                     description: |-
                       Name of the referent.
                       More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
-                      TODO: Add other useful fields. apiVersion, kind, uid?
                     type: string
                 type: object
                 x-kubernetes-map-type: atomic
@@ -2059,6 +2149,10 @@ spec:
                   - type
                   type: object
                 type: array
+              immutableAnnotations:
+                additionalProperties:
+                  type: string
+                type: object
             type: object
         type: object
     served: true
@@ -2070,7 +2164,7 @@ apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   annotations:
-    controller-gen.kubebuilder.io/version: v0.14.0
+    controller-gen.kubebuilder.io/version: v0.17.0
   name: hypershiftagentserviceconfigs.agent-install.openshift.io
 spec:
   group: agent-install.openshift.io
@@ -2121,7 +2215,6 @@ spec:
                     description: |-
                       Name of the referent.
                       More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
-                      TODO: Add other useful fields. apiVersion, kind, uid?
                     type: string
                 type: object
                 x-kubernetes-map-type: atomic
@@ -2135,7 +2228,6 @@ spec:
                     description: |-
                       Name of the referent.
                       More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
-                      TODO: Add other useful fields. apiVersion, kind, uid?
                     type: string
                 type: object
                 x-kubernetes-map-type: atomic
@@ -2777,7 +2869,6 @@ spec:
                     description: |-
                       Name of the referent.
                       More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
-                      TODO: Add other useful fields. apiVersion, kind, uid?
                     type: string
                 type: object
                 x-kubernetes-map-type: atomic
@@ -2792,7 +2883,6 @@ spec:
                     description: |-
                       Name of the referent.
                       More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
-                      TODO: Add other useful fields. apiVersion, kind, uid?
                     type: string
                 type: object
                 x-kubernetes-map-type: atomic
@@ -2912,7 +3002,7 @@ apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   annotations:
-    controller-gen.kubebuilder.io/version: v0.14.0
+    controller-gen.kubebuilder.io/version: v0.17.0
   name: infraenvs.agent-install.openshift.io
 spec:
   conversion:
@@ -2980,6 +3070,20 @@ spec:
                   from the hosts discovered by this infra-env will also trust the
                   certificates in this bundle.
                 type: string
+              agentApproval:
+                description: |-
+                  AgentApproval defines configuration for automatic approval of Agents
+                  discovered by this InfraEnv.
+                properties:
+                  autoApprove:
+                    default: false
+                    description: |-
+                      AutoApprove indicates whether Agents discovered using this InfraEnv
+                      should be automatically approved by the system.
+                      If true, any Agent referencing this InfraEnv may be approved without manual intervention.
+                      Use only in trusted environments.
+                    type: boolean
+                type: object
               agentLabels:
                 additionalProperties:
                   type: string
@@ -3123,7 +3227,7 @@ spec:
                   OSImageVersion is the version of OS image to use when generating the InfraEnv.
                   The version should refer to an OSImage specified in the AgentServiceConfig
                   (i.e. OSImageVersion should equal to an OpenshiftVersion in OSImages list).
-                  Note: OSImageVersion can't be specified along with ClusterRef.
+                  Note: OSImageVersion can't be specified along with ClusterRef while creating an InfraEnv.
                 type: string
               proxy:
                 description: |-
@@ -3150,7 +3254,6 @@ spec:
                     description: |-
                       Name of the referent.
                       More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
-                      TODO: Add other useful fields. apiVersion, kind, uid?
                     type: string
                 type: object
                 x-kubernetes-map-type: atomic
@@ -3293,7 +3396,7 @@ apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   annotations:
-    controller-gen.kubebuilder.io/version: v0.14.0
+    controller-gen.kubebuilder.io/version: v0.17.0
   name: nmstateconfigs.agent-install.openshift.io
 spec:
   group: agent-install.openshift.io

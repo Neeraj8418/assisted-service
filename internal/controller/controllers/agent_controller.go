@@ -39,6 +39,7 @@ import (
 	"github.com/openshift/assisted-service/internal/common"
 	"github.com/openshift/assisted-service/internal/gencrypto"
 	"github.com/openshift/assisted-service/internal/host"
+	"github.com/openshift/assisted-service/internal/host/hostutil"
 	"github.com/openshift/assisted-service/internal/spoke_k8s_client"
 	"github.com/openshift/assisted-service/models"
 	"github.com/openshift/assisted-service/pkg/auth"
@@ -101,12 +102,14 @@ type AgentReconciler struct {
 	AgentContainerImage        string
 	HostFSMountDir             string
 	reclaimer                  *agentReclaimer
+	ImageServiceEnabled        bool
 }
 
 // +kubebuilder:rbac:groups=agent-install.openshift.io,resources=agents,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=agent-install.openshift.io,resources=agents/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=agent-install.openshift.io,resources=agents/ai-deprovision,verbs=update
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
+// +kubebuilder:rbac:groups=agent-install.openshift.io,resources=infraenvs,verbs=get
 
 func (r *AgentReconciler) Reconcile(origCtx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	ctx := addRequestIdIfNeeded(origCtx)
@@ -117,10 +120,10 @@ func (r *AgentReconciler) Reconcile(origCtx context.Context, req ctrl.Request) (
 		})
 
 	defer func() {
-		log.Info("Agent Reconcile ended")
+		log.Debug("Agent Reconcile ended")
 	}()
 
-	log.Info("Agent Reconcile started")
+	log.Debug("Agent Reconcile started")
 
 	agent := &aiv1beta1.Agent{}
 
@@ -155,13 +158,15 @@ func (r *AgentReconciler) Reconcile(origCtx context.Context, req ctrl.Request) (
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			// Restoring the Host according to values from Agent
-			if err = r.restoreHostByAgent(ctx, agent); err != nil {
+			var result ctrl.Result
+			result, err = r.restoreHostByAgent(ctx, log, agent, origAgent)
+			if err != nil {
 				log.WithError(err).Errorf("failed to restore Host %s according to the Agent", agent.Name)
-				return ctrl.Result{RequeueAfter: defaultRequeueAfterOnError}, err
+				return result, err
 			}
 			// Requeuing as the associated Host should exist now
 			log.Infof("Restored a Host for agent %s", agent.Name)
-			return ctrl.Result{Requeue: true, RequeueAfter: defaultRequeue}, nil
+			return result, nil
 		} else {
 			log.WithError(err).Errorf("failed to retrieve Host %s from backend", agent.Name)
 			return ctrl.Result{RequeueAfter: defaultRequeueAfterOnError}, err
@@ -176,8 +181,8 @@ func (r *AgentReconciler) Reconcile(origCtx context.Context, req ctrl.Request) (
 		}
 	}
 
-	if err = r.setInfraEnvNameLabel(ctx, log, h, agent); err != nil {
-		log.WithError(err).Warnf("failed to set infraEnv name label on agent %s/%s", agent.Namespace, agent.Name)
+	if err = r.setOwnerAndLabel(ctx, log, h, agent); err != nil {
+		log.WithError(err).Warnf("failed to set infraEnv as the owner and the name label on agent %s/%s", agent.Namespace, agent.Name)
 	}
 
 	// Add/Update Agent annotations
@@ -188,7 +193,15 @@ func (r *AgentReconciler) Reconcile(origCtx context.Context, req ctrl.Request) (
 	}
 
 	if agent.Spec.ClusterDeploymentName == nil && h.ClusterID != nil {
-		log.Debugf("ClusterDeploymentName is unset in Agent %s. unbind", agent.Name)
+		log.Debugf("ClusterDeploymentName is unset in Agent %s.", agent.Name)
+		if funk.ContainsString(host.HostInstallingStatuses, *h.Status) && swag.StringValue(h.Kind) != models.HostKindAddToExistingClusterHost {
+			// Only day-2 hosts are allowed to be cancelled during installation
+			errMsg := fmt.Errorf("cancelling non-day-2 host [%s] in the middle of installation is not allowed", *h.ID)
+			log.Error(errMsg)
+			return r.updateStatus(ctx, log, agent, origAgent, &h.Host, h.ClusterID, errMsg, false)
+		}
+
+		log.Infof("Unbinding host %s from cluster %s", *h.ID, *h.ClusterID)
 		return r.unbindHost(ctx, log, agent, origAgent, h)
 	}
 
@@ -206,7 +219,7 @@ func (r *AgentReconciler) Reconcile(origCtx context.Context, req ctrl.Request) (
 			log.WithError(err).Error(errMsg)
 			// Update that we failed to retrieve the clusterDeployment
 			//TODO MGMT-7844 add mapping CD-ACI to rnot requeue always
-			return r.updateStatus(ctx, log, agent, origAgent, &h.Host, nil, errors.Wrapf(err, errMsg), true)
+			return r.updateStatus(ctx, log, agent, origAgent, &h.Host, nil, errors.Wrap(err, errMsg), true)
 		}
 
 		// Retrieve cluster by ClusterDeploymentName from the database
@@ -238,6 +251,21 @@ func (r *AgentReconciler) Reconcile(origCtx context.Context, req ctrl.Request) (
 		}
 	}
 
+	// check and apply auto-approval if configured
+	autoApproved, err := r.applyAutoApprovalIfNeeded(ctx, log, agent, h)
+	if err != nil {
+		log.WithError(err).Warn("Failed to apply auto-approval")
+		return r.updateStatus(ctx, log, agent, origAgent, &h.Host, h.ClusterID, err, true)
+	}
+
+	if autoApproved {
+		if updateErr := r.Update(ctx, agent); updateErr != nil {
+			log.WithError(updateErr).Error("Failed to persist auto-approval to Agent")
+			return ctrl.Result{RequeueAfter: defaultRequeueAfterOnError}, updateErr
+		}
+		log.Infof("Persisted auto-approval to Agent %s/%s", agent.Namespace, agent.Name)
+	}
+
 	// check for updates from user, compare spec and update if needed
 	h, err = r.updateIfNeeded(ctx, log, agent, h)
 	if err != nil {
@@ -264,7 +292,7 @@ func updateAnnotations(log logrus.FieldLogger, agent *v1beta1.Agent, h *models.H
 	updated = setAgentAnnotation(log, agent, AgentInventoryAnnotation, h.Inventory) || updated
 	updated = setAgentAnnotation(log, agent, AgentValidationsInfoAnnotation, h.ValidationsInfo) || updated
 	if h.Progress != nil {
-		updated = setAgentAnnotation(log, agent, AgentCurrentStageAnnotation, string(h.Progress.CurrentStage))
+		updated = setAgentAnnotation(log, agent, AgentCurrentStageAnnotation, string(h.Progress.CurrentStage)) || updated
 	}
 	return updated
 }
@@ -480,7 +508,13 @@ func (r *AgentReconciler) handleAgentFinalizer(ctx context.Context, log logrus.F
 		}
 	} else { // agent is being deleted
 		if funk.ContainsString(agent.GetFinalizers(), AgentFinalizerName) {
-			if _, skipCleanup := agent.GetAnnotations()[AgentSkipSpokeCleanupAnnotation]; !skipCleanup && agent.Spec.ClusterDeploymentName != nil {
+			spokeResourcesExist, err := r.spokeResourcesExist(ctx, agent)
+			if err != nil {
+				log.WithError(err).Errorf("failed to check spoke resources presence")
+				return &ctrl.Result{}, err
+			}
+			// Only remove the spoke resources if the spoke resources exist and the skip cleanup annotation is not set and it's bound to a cluster
+			if _, skipCleanup := agent.GetAnnotations()[AgentSkipSpokeCleanupAnnotation]; !skipCleanup && agent.Spec.ClusterDeploymentName != nil && spokeResourcesExist {
 				// only remove the spoke resources if the entire cluster isn't being deleted
 				clusterRef := types.NamespacedName{
 					Name:      agent.Spec.ClusterDeploymentName.Name,
@@ -491,7 +525,13 @@ func (r *AgentReconciler) handleAgentFinalizer(ctx context.Context, log logrus.F
 					log.WithError(err).Errorf("failed to check cluster deployment presence")
 					return &ctrl.Result{}, err
 				}
-				if clusterExists {
+				infraEnvExists, err := r.infraEnvExists(ctx, agent)
+				if err != nil {
+					log.WithError(err).Errorf("failed to check infraenv presence")
+					return &ctrl.Result{}, err
+				}
+				// If the cluster exists and the infraenv exists, remove the spoke resources
+				if clusterExists && infraEnvExists {
 					spokeClient, err := r.spokeKubeClient(ctx, agent.Spec.ClusterDeploymentName)
 					if err != nil {
 						log.WithError(err).Error("failed to create spoke client")
@@ -536,29 +576,67 @@ func (r *AgentReconciler) shouldApproveCSR(csr *certificatesv1.CertificateSignin
 	return validateNodeCsr(agent, csr, x509CSR)
 }
 
-func (r *AgentReconciler) approveAIHostsCSRs(ctx context.Context, clients spoke_k8s_client.SpokeK8sClient, agent *aiv1beta1.Agent, validateNodeCsr nodeCsrValidator) {
+func (r *AgentReconciler) approveAIHostsCSRs(ctx context.Context, clients spoke_k8s_client.SpokeK8sClient, agent *aiv1beta1.Agent, validateNodeCsr nodeCsrValidator, csrType aiv1beta1.CSRType) {
 	csrList, err := clients.ListCsrs(ctx)
 	if err != nil {
 		r.Log.WithError(err).Errorf("Failed to get CSRs for agent %s/%s", agent.Namespace, agent.Name)
 		return
 	}
+
+	// Initialize CSR status if needed
+	if agent.Status.CSRStatus.ApprovedCSRs == nil {
+		agent.Status.CSRStatus.ApprovedCSRs = []aiv1beta1.CSRInfo{}
+	}
+
 	for i := range csrList.Items {
 		csr := &csrList.Items[i]
-		if !isCsrApproved(csr) {
-			shouldApprove, err := r.shouldApproveCSR(csr, agent, validateNodeCsr)
-			if err != nil || !shouldApprove {
-				if err != nil {
-					r.Log.WithError(err).Errorf("Failed checking if CSR %s should be approved for agent %s/%s",
-						csr.Name, agent.Namespace, agent.Name)
-				}
-				continue
-			}
+		isApproved := isCsrApproved(csr)
+
+		if isApproved && isCSRTracked(agent, csr.Name) {
+			continue
+		}
+
+		shouldProcess, err := r.shouldApproveCSR(csr, agent, validateNodeCsr)
+		if err != nil {
+			r.Log.WithError(err).Debugf("Failed validating CSR %s for agent %s", csr.Name, agent.Name)
+			continue
+		}
+		if !shouldProcess {
+			continue
+		}
+
+		approvedAt := metav1.Now()
+		if !isApproved {
 			if err = clients.ApproveCsr(ctx, csr); err != nil {
 				r.Log.WithError(err).Errorf("Failed to approve CSR %s for agent %s/%s", csr.Name, agent.Namespace, agent.Name)
 				continue
 			}
+		} else {
+			approvedAt = getCSRApprovalTime(csr)
+		}
+
+		r.trackCSR(agent, csr.Name, csrType, approvedAt)
+	}
+
+	agent.Status.CSRStatus.LastApprovalAttempt = metav1.Now()
+}
+
+func getCSRApprovalTime(csr *certificatesv1.CertificateSigningRequest) metav1.Time {
+	for _, c := range csr.Status.Conditions {
+		if c.Type == certificatesv1.CertificateApproved {
+			return c.LastUpdateTime
 		}
 	}
+	return metav1.Time{}
+}
+
+func (r *AgentReconciler) trackCSR(agent *aiv1beta1.Agent, csrName string, csrType aiv1beta1.CSRType, approvedAt metav1.Time) {
+	csrInfo := aiv1beta1.CSRInfo{
+		Name:       csrName,
+		Type:       csrType,
+		ApprovedAt: approvedAt,
+	}
+	agent.Status.CSRStatus.ApprovedCSRs = append(agent.Status.CSRStatus.ApprovedCSRs, csrInfo)
 }
 
 func (r *AgentReconciler) spokeKubeClient(ctx context.Context, clusterRef *aiv1beta1.ClusterReference) (spoke_k8s_client.SpokeK8sClient, error) {
@@ -593,33 +671,38 @@ func (r *AgentReconciler) spokeKubeClient(ctx context.Context, clusterRef *aiv1b
 // requeue means that approval will be attempted again
 func (r *AgentReconciler) tryApproveDay2CSRs(ctx context.Context, agent *aiv1beta1.Agent, node *corev1.Node, client spoke_k8s_client.SpokeK8sClient) {
 	r.Log.Infof("Approving CSRs for agent %s/%s", agent.Namespace, agent.Name)
-	var validateNodeCsr nodeCsrValidator
 
-	if node == nil {
-		validateNodeCsr = validateNodeClientCSR
-	} else {
-		validateNodeCsr = createNodeServerCsrValidator(node)
+	// Try to approve client CSRs
+	r.approveAIHostsCSRs(ctx, client, agent, validateNodeClientCSR, aiv1beta1.CSRTypeClient)
+
+	// Also try serving CSRs if node exists
+	if node != nil {
+		r.approveAIHostsCSRs(ctx, client, agent, createNodeServerCsrValidator(node), aiv1beta1.CSRTypeServing)
 	}
-
-	// Even if node is already ready, we try approving last time
-	r.approveAIHostsCSRs(ctx, client, agent, validateNodeCsr)
 }
 
-func (r *AgentReconciler) bmhExists(ctx context.Context, agent *aiv1beta1.Agent) (bool, error) {
+func (r *AgentReconciler) getBMH(ctx context.Context, agent *aiv1beta1.Agent) (*bmh_v1alpha1.BareMetalHost, error) {
 	bmhName, ok := agent.ObjectMeta.Labels[AGENT_BMH_LABEL]
 	if !ok {
-		return false, nil
+		return nil, nil
 	}
-
 	bmhKey := types.NamespacedName{
 		Name:      bmhName,
 		Namespace: agent.Namespace,
 	}
-	if err := r.Client.Get(ctx, bmhKey, &bmh_v1alpha1.BareMetalHost{}); err != nil {
-		return false, client.IgnoreNotFound(err)
+	bmh := &bmh_v1alpha1.BareMetalHost{}
+	if err := r.Client.Get(ctx, bmhKey, bmh); err != nil {
+		return nil, client.IgnoreNotFound(err)
 	}
+	return bmh, nil
+}
 
-	return true, nil
+func (r *AgentReconciler) bmhExists(ctx context.Context, agent *aiv1beta1.Agent) (bool, error) {
+	bmh, err := r.getBMH(ctx, agent)
+	if err != nil {
+		return false, err
+	}
+	return bmh != nil, nil
 }
 
 func (r *AgentReconciler) clusterExists(ctx context.Context, clusterRef types.NamespacedName) (bool, error) {
@@ -643,7 +726,27 @@ func (r *AgentReconciler) clusterExists(ctx context.Context, clusterRef types.Na
 	return aci.DeletionTimestamp.IsZero(), nil
 }
 
+// Check if the infraenv exists for the agent
+// Returns true if the infraenv exists, false if it does not exist or is being deleted
+func (r *AgentReconciler) infraEnvExists(ctx context.Context, agent *aiv1beta1.Agent) (bool, error) {
+	infraEnvName, ok := agent.Labels[aiv1beta1.InfraEnvNameLabel]
+	if !ok {
+		return false, fmt.Errorf("failed to find infraenv name for agent %s in namespace %s", agent.Name, agent.Namespace)
+	}
+	key := types.NamespacedName{Namespace: agent.Namespace, Name: infraEnvName}
+	infraEnv := &aiv1beta1.InfraEnv{}
+	if err := r.Client.Get(ctx, key, infraEnv); err != nil {
+		return false, client.IgnoreNotFound(err)
+	}
+
+	return infraEnv.DeletionTimestamp.IsZero(), nil
+}
+
 func (r *AgentReconciler) shouldReclaimOnUnbind(ctx context.Context, agent *aiv1beta1.Agent) bool {
+	// if image service is disabled, reclaim will never work because boot artifacts cannot be downloaded
+	if !r.ImageServiceEnabled {
+		return false
+	}
 	// default to not attempting to reclaim as that's the safer route
 	if foundBMH, err := r.bmhExists(ctx, agent); err != nil || foundBMH {
 		if err != nil {
@@ -721,6 +824,9 @@ func (r *AgentReconciler) unbindHost(ctx context.Context, log logrus.FieldLogger
 	if err != nil {
 		return r.updateStatus(ctx, log, agent, origAgent, &h.Host, nil, err, !IsUserError(err))
 	}
+
+	// Reset CSR status since the agent is unbound
+	resetCSRStatus(agent)
 
 	return r.updateStatus(ctx, log, agent, origAgent, &host.Host, h.ClusterID, nil, true)
 }
@@ -839,6 +945,28 @@ func (r *AgentReconciler) applyDay2NodeLabels(ctx context.Context, log logrus.Fi
 	return nil
 }
 
+// Spoke resources exist if the agent is installed or resources have been created for the host on the spoke cluster
+func (r *AgentReconciler) spokeResourcesExist(ctx context.Context, agent *aiv1beta1.Agent) (bool, error) {
+	agentStage := agent.Status.Progress.CurrentStage
+	if agentStage == models.HostStageDone {
+		return true, nil
+	}
+
+	bmh, err := r.getBMH(ctx, agent)
+	if err != nil {
+		return false, err
+	}
+	if bmh != nil && metav1.HasAnnotation(bmh.ObjectMeta, BMH_SPOKE_CREATED_ANNOTATION) {
+		return true, nil
+	}
+
+	// If there are approved CSRs, then spoke resources exist
+	if len(agent.Status.CSRStatus.ApprovedCSRs) > 0 {
+		return true, nil
+	}
+	return false, nil
+}
+
 // updateStatus is updating all the Agent Conditions.
 // In case that an error has ocurred when trying to sync the Spec, the error (syncErr) is presented in SpecSyncedCondition.
 // Internal bool differentiate between backend server error (internal HTTP 5XX) and user input error (HTTP 4XXX)
@@ -849,8 +977,16 @@ func (r *AgentReconciler) updateStatus(ctx context.Context, log logrus.FieldLogg
 		shouldAutoApproveCSRs bool
 		spokeClient           spoke_k8s_client.SpokeK8sClient
 		node                  *corev1.Node
+		ret                   ctrl.Result = ctrl.Result{}
 	)
-	ret := ctrl.Result{}
+	patch := client.MergeFrom(origAgent.DeepCopy())
+	defer func() {
+		if patchErr := r.Status().Patch(ctx, agent, patch); patchErr != nil {
+			log.WithError(patchErr).Error("failed to patch agent Status")
+			err = patchErr
+			return
+		}
+	}()
 	specSynced(agent, syncErr, internal)
 
 	if h != nil && h.Status != nil {
@@ -862,6 +998,7 @@ func (r *AgentReconciler) updateStatus(ctx context.Context, log logrus.FieldLogg
 		agent.Status.DebugInfo.State = swag.StringValue(h.Status)
 		agent.Status.DebugInfo.StateInfo = swag.StringValue(h.StatusInfo)
 		agent.Status.InstallationDiskID = h.InstallationDiskID
+		agent.Status.Kind = swag.StringValue(h.Kind)
 
 		if h.ValidationsInfo != "" {
 			newValidationsInfo := ValidationsStatus{}
@@ -885,7 +1022,8 @@ func (r *AgentReconciler) updateStatus(ctx context.Context, log logrus.FieldLogg
 				}
 				if shouldAutoApproveCSRs, err = r.shouldApproveCSRsForAgent(ctx, agent, h); err != nil {
 					log.WithError(err).Errorf("Failed to determine if agent %s/%s is rebooting and belongs to none platform cluster or has an associated BMH", agent.Namespace, agent.Name)
-					return ctrl.Result{RequeueAfter: defaultRequeueAfterOnError}, nil
+					ret = ctrl.Result{RequeueAfter: defaultRequeueAfterOnError}
+					return ret, nil
 				}
 
 				// TODO: Node name might be FQDN and not just host name if cluster is IPv6
@@ -893,7 +1031,8 @@ func (r *AgentReconciler) updateStatus(ctx context.Context, log logrus.FieldLogg
 				if err != nil {
 					if !k8serrors.IsNotFound(err) {
 						r.Log.WithError(err).Errorf("agent %s/%s: failed to get node", agent.Namespace, agent.Name)
-						return ctrl.Result{RequeueAfter: defaultRequeueAfterOnError}, err
+						ret = ctrl.Result{RequeueAfter: defaultRequeueAfterOnError}
+						return ret, err
 					}
 					node = nil
 				}
@@ -902,10 +1041,12 @@ func (r *AgentReconciler) updateStatus(ctx context.Context, log logrus.FieldLogg
 				}
 				if err = r.applyDay2NodeLabels(ctx, log, agent, node, spokeClient); err != nil {
 					log.WithError(err).Errorf("Failed to apply labels for day2 node %s/%s", agent.Namespace, agent.Name)
-					return ctrl.Result{RequeueAfter: defaultRequeueAfterOnError}, err
+					ret = ctrl.Result{RequeueAfter: defaultRequeueAfterOnError}
+					return ret, err
 				}
-				if err = r.UpdateDay2InstallPogress(ctx, h, agent, node); err != nil {
-					return ctrl.Result{RequeueAfter: defaultRequeueAfterOnError}, err
+				if err = r.UpdateDay2InstallPogress(ctx, h, agent, node, shouldAutoApproveCSRs); err != nil {
+					ret = ctrl.Result{RequeueAfter: defaultRequeueAfterOnError}
+					return ret, err
 				}
 				if agent.Status.Progress.CurrentStage != models.HostStageDone {
 					ret = ctrl.Result{RequeueAfter: r.ApproveCsrsRequeueDuration}
@@ -928,7 +1069,9 @@ func (r *AgentReconciler) updateStatus(ctx context.Context, log logrus.FieldLogg
 		if clusterId != nil {
 			err = r.populateEventsURL(log, agent, h.InfraEnvID.String())
 			if err != nil {
-				return ctrl.Result{Requeue: true}, nil
+				ret = ctrl.Result{Requeue: true}
+				err = nil
+				return ret, nil
 			}
 			if agent.Status.DebugInfo.LogsURL == "" && !time.Time(h.LogsCollectedAt).Equal(time.Time{}) { // logs collection time is updated means logs are available
 				var logsURL string
@@ -949,21 +1092,13 @@ func (r *AgentReconciler) updateStatus(ctx context.Context, log logrus.FieldLogg
 		setConditionsUnknown(agent)
 	}
 
-	if !reflect.DeepEqual(agent, origAgent) {
-		if updateErr := r.Status().Update(ctx, agent); updateErr != nil {
-			log.WithError(updateErr).Error("failed to update agent Status")
-			return ctrl.Result{Requeue: true}, nil
-		}
-	} else {
-		log.Debugf("Agent %s/%s: update skipped", agent.Namespace, agent.Name)
-	}
 	if syncErr != nil && internal {
-		return ctrl.Result{RequeueAfter: defaultRequeueAfterOnError}, nil
+		ret = ctrl.Result{RequeueAfter: defaultRequeueAfterOnError}
 	}
-	return ret, nil
+	return ret, err
 }
 
-func (r *AgentReconciler) UpdateDay2InstallPogress(ctx context.Context, h *models.Host, agent *aiv1beta1.Agent, node *corev1.Node) error {
+func (r *AgentReconciler) UpdateDay2InstallPogress(ctx context.Context, h *models.Host, agent *aiv1beta1.Agent, node *corev1.Node, shouldAutoApproveCSRs bool) error {
 	if node == nil {
 		// In case the node not found we get the stage from the host
 		agent.Status.Progress.CurrentStage = h.Progress.CurrentStage
@@ -971,7 +1106,8 @@ func (r *AgentReconciler) UpdateDay2InstallPogress(ctx context.Context, h *model
 		return nil
 	}
 	var err error
-	if isNodeReady(node) {
+	allCSRsHandled := areCSRsHandled(shouldAutoApproveCSRs, agent)
+	if isNodeReady(node) && allCSRsHandled {
 		err = r.updateHostInstallProgress(ctx, h, models.HostStageDone)
 		agent.Status.Progress.CurrentStage = models.HostStageDone
 		// now that the node is done there is no need to requeue
@@ -984,6 +1120,24 @@ func (r *AgentReconciler) UpdateDay2InstallPogress(ctx context.Context, h *model
 		return err
 	}
 	return nil
+}
+
+// areCSRsHandled returns true if CSRs do not need to be auto-approved or if both client and serving CSRs are approved
+func areCSRsHandled(shouldAutoApproveCSRs bool, agent *aiv1beta1.Agent) bool {
+	if !shouldAutoApproveCSRs {
+		return true
+	}
+	clientCSRApproved := false
+	servingCSRApproved := false
+	for _, csr := range agent.Status.CSRStatus.ApprovedCSRs {
+		if csr.Type == aiv1beta1.CSRTypeClient {
+			clientCSRApproved = true
+		}
+		if csr.Type == aiv1beta1.CSRTypeServing {
+			servingCSRApproved = true
+		}
+	}
+	return clientCSRApproved && servingCSRApproved
 }
 
 func (r *AgentReconciler) populateEventsURL(log logrus.FieldLogger, agent *aiv1beta1.Agent, infraEnvId string) error {
@@ -1105,8 +1259,8 @@ func (r *AgentReconciler) updateInstallerArgs(ctx context.Context, log logrus.Fi
 		err := json.Unmarshal([]byte(agent.Spec.InstallerArgs), &agentSpecInstallerArgs.Args)
 		if err != nil {
 			msg := fmt.Sprintf("Fail to unmarshal installer args for host %s in infraEnv %s", agent.Name, host.InfraEnvID)
-			log.WithError(err).Errorf(msg)
-			return common.NewApiError(http.StatusBadRequest, errors.Wrapf(err, msg))
+			log.WithError(err).Error(msg)
+			return common.NewApiError(http.StatusBadRequest, errors.Wrap(err, msg))
 		}
 	}
 
@@ -1464,6 +1618,17 @@ func (r *AgentReconciler) updateInventoryAndLabels(log logrus.FieldLogger, ctx c
 			}
 		}
 	}
+	if inventory.Gpus != nil {
+		gpus := make([]aiv1beta1.HostGpu, len(inventory.Gpus))
+		agent.Status.Inventory.Gpus = gpus
+		for i, g := range inventory.Gpus {
+			gpus[i].Address = g.Address
+			gpus[i].DeviceID = g.DeviceID
+			gpus[i].Name = g.Name
+			gpus[i].Vendor = g.Vendor
+			gpus[i].VendorID = g.VendorID
+		}
+	}
 
 	return r.updateLabels(log, ctx, agent)
 }
@@ -1604,6 +1769,60 @@ func (r *AgentReconciler) updateNodeLabels(log logrus.FieldLogger, host *common.
 	return false, nil
 }
 
+func (r *AgentReconciler) updateHostFencingCredentials(ctx context.Context, log logrus.FieldLogger, host *common.Host, agent *aiv1beta1.Agent, params *installer.V2UpdateHostParams) (bool, error) {
+	if agent.Spec.FencingCredentialsSecretRef == "" {
+		return false, nil
+	}
+
+	secretRef := types.NamespacedName{Namespace: agent.Namespace, Name: agent.Spec.FencingCredentialsSecretRef}
+	secret, err := getSecret(ctx, r.Client, r.APIReader, secretRef)
+	if err != nil {
+		log.WithError(err).Errorf("failed to get fencing credentials secret for host %s infra-env %s", host.ID.String(), host.InfraEnvID.String())
+		return false, err
+	}
+
+	agentFencingCredentials := &models.FencingCredentialsParams{
+		Address:  swag.String(string(secret.Data["address"])),
+		Password: swag.String(string(secret.Data["password"])),
+		Username: swag.String(string(secret.Data["username"])),
+	}
+	certificateVerification, ok := secret.Data["certificateVerification"]
+	if ok {
+		agentFencingCredentials.CertificateVerification = swag.String(string(certificateVerification))
+	}
+
+	fencingCredentials, err := json.Marshal(agentFencingCredentials)
+	if err != nil {
+		log.WithError(err).Errorf("failed to marshal fencing credentials for host %s infra-env %s", host.ID.String(), host.InfraEnvID.String())
+		return false, err
+	}
+
+	if host.FencingCredentials != string(fencingCredentials) {
+		params.HostUpdateParams.FencingCredentials = agentFencingCredentials
+		return true, nil
+	}
+	return false, nil
+}
+
+func (r *AgentReconciler) updateHostIgnitionEndpointToken(ctx context.Context, log logrus.FieldLogger, host *common.Host, agent *aiv1beta1.Agent, params *installer.V2UpdateHostParams) (bool, error) {
+	if agent.Spec.IgnitionEndpointTokenReference != nil {
+		token, err := r.getIgnitionToken(ctx, agent.Spec.IgnitionEndpointTokenReference)
+		if err != nil {
+			log.WithError(err).Errorf("Failed to get ignition token")
+			return false, err
+		}
+
+		if token != host.IgnitionEndpointToken {
+			params.HostUpdateParams.IgnitionEndpointToken = &token
+			return true, nil
+		}
+	} else if host.IgnitionEndpointToken != "" {
+		params.HostUpdateParams.IgnitionEndpointToken = swag.String("")
+		return true, nil
+	}
+	return false, nil
+}
+
 func (r *AgentReconciler) updateIfNeeded(ctx context.Context, log logrus.FieldLogger, agent *aiv1beta1.Agent, internalHost *common.Host) (*common.Host, error) {
 	spec := agent.Spec
 	var err error
@@ -1639,7 +1858,12 @@ func (r *AgentReconciler) updateIfNeeded(ctx context.Context, log logrus.FieldLo
 		return internalHost, err
 	}
 
-	hostUpdate = hostUpdate || nodesUpdated
+	fencingCredentialsUpdated, err := r.updateHostFencingCredentials(ctx, log, internalHost, agent, params)
+	if err != nil {
+		return internalHost, err
+	}
+
+	hostUpdate = hostUpdate || nodesUpdated || fencingCredentialsUpdated
 
 	if spec.Hostname != "" && spec.Hostname != internalHost.RequestedHostname {
 		hostUpdate = true
@@ -1657,31 +1881,24 @@ func (r *AgentReconciler) updateIfNeeded(ctx context.Context, log logrus.FieldLo
 		params.HostUpdateParams.HostRole = &role
 	}
 
-	if spec.InstallationDiskID != "" && spec.InstallationDiskID != internalHost.InstallationDiskID {
+	diskUpdateNeeded, newDiskID, err := updateInstallDisk(&internalHost.Host, spec.InstallationDiskID, spec.InstallationDiskPath)
+	if err != nil {
+		log.WithError(err).Errorf("Failed to update installation disk for host %s", internalHost.ID)
+		return internalHost, err
+	}
+
+	if diskUpdateNeeded {
 		hostUpdate = true
 		params.HostUpdateParams.DisksSelectedConfig = []*models.DiskConfigParams{
-			{ID: &spec.InstallationDiskID, Role: models.DiskRoleInstall},
+			{ID: &newDiskID, Role: models.DiskRoleInstall},
 		}
 	}
 
-	if spec.IgnitionEndpointTokenReference != nil {
-		var token string
-		token, err = r.getIgnitionToken(ctx, agent.Spec.IgnitionEndpointTokenReference)
-		if err != nil {
-			log.WithError(err).Errorf("Failed to get ignition token")
-			return internalHost, err
-		}
-
-		if token != internalHost.IgnitionEndpointToken {
-			hostUpdate = true
-			params.HostUpdateParams.IgnitionEndpointToken = &token
-		}
-	} else {
-		if internalHost.IgnitionEndpointToken != "" {
-			hostUpdate = true
-			params.HostUpdateParams.IgnitionEndpointToken = swag.String("")
-		}
+	IgnitionEndpointTokenUpdated, err := r.updateHostIgnitionEndpointToken(ctx, log, internalHost, agent, params)
+	if err != nil {
+		return internalHost, err
 	}
+	hostUpdate = hostUpdate || IgnitionEndpointTokenUpdated
 
 	if agent.Spec.IgnitionEndpointHTTPHeaders != nil {
 		hostIgnitionEndpointHTTPHeaders := make(map[string]string)
@@ -1744,6 +1961,43 @@ func (r *AgentReconciler) updateIfNeeded(ctx context.Context, log logrus.FieldLo
 	return returnedHost, nil
 }
 
+// Check if the installation disk needs to be updated based on the disk ID or path provided
+// Returns true if the installation disk specified doesn't match the host's current installation disk
+// Also returns the disk ID or path that should be used for the update
+func updateInstallDisk(host *models.Host, desiredDiskID, desiredDiskByPath string) (bool, string, error) {
+	if desiredDiskByPath == "" && desiredDiskID == "" {
+		// If both fields are empty, there is no desired disk and no update needed
+		return false, "", nil
+	}
+
+	// Currently the Agent API has two fields to specify installation disk
+	// so we need to check which one is set
+	diskID := desiredDiskID
+	if desiredDiskByPath != "" {
+		diskID = desiredDiskByPath
+	}
+
+	if hostutil.GetHostInstallationPath(host) == "" {
+		// Indicates no disk was set as the installation disk previously
+		return true, diskID, nil
+	}
+
+	// Get the actual current installation disk object from the host's inventory
+	installationDisk, err := hostutil.GetHostInstallationDisk(host)
+	if err != nil {
+		return false, "", err
+	}
+	if installationDisk == nil {
+		return true, diskID, nil
+	}
+
+	matchesInstallDisk := diskID == installationDisk.ID ||
+		diskID == installationDisk.ByPath ||
+		diskID == common.GetDeviceFullName(installationDisk)
+
+	return !matchesInstallDisk, diskID, nil
+}
+
 func (r *AgentReconciler) getIgnitionToken(ctx context.Context, ignitionEndpointTokenReference *aiv1beta1.IgnitionEndpointTokenReference) (string, error) {
 	secretRef := types.NamespacedName{Namespace: ignitionEndpointTokenReference.Namespace, Name: ignitionEndpointTokenReference.Name}
 	secret, err := getSecret(ctx, r.Client, r.APIReader, secretRef)
@@ -1761,7 +2015,7 @@ func (r *AgentReconciler) getIgnitionToken(ctx context.Context, ignitionEndpoint
 	return string(token), nil
 }
 
-func (r *AgentReconciler) setInfraEnvNameLabel(ctx context.Context, log logrus.FieldLogger, h *common.Host, agent *aiv1beta1.Agent) error {
+func (r *AgentReconciler) setOwnerAndLabel(ctx context.Context, log logrus.FieldLogger, h *common.Host, agent *aiv1beta1.Agent) error {
 	infraEnv, err := r.Installer.GetInfraEnvInternal(ctx, installer.GetInfraEnvParams{InfraEnvID: h.InfraEnvID})
 	if err != nil {
 		return err
@@ -1769,10 +2023,63 @@ func (r *AgentReconciler) setInfraEnvNameLabel(ctx context.Context, log logrus.F
 	if infraEnv.Name == nil {
 		return errors.Errorf("infraEnv %s name is nil", h.InfraEnvID)
 	}
+	err = r.addInfraEnvAsOwner(ctx, agent, *infraEnv.Name)
+	if err != nil {
+		log.WithError(err).Errorf("failed to add infraenv %s owner reference to agent %s/%s", *infraEnv.Name, agent.Namespace, agent.Name)
+		return err
+	}
 	if setAgentLabel(log, agent, aiv1beta1.InfraEnvNameLabel, *infraEnv.Name) {
 		return r.updateAndReplaceAgent(ctx, agent)
 	}
 	return nil
+}
+
+func (r *AgentReconciler) addInfraEnvAsOwner(ctx context.Context, agent *aiv1beta1.Agent, infraEnvName string) error {
+	infraEnv := &aiv1beta1.InfraEnv{}
+	if err := r.Get(ctx, types.NamespacedName{Name: infraEnvName, Namespace: agent.Namespace}, infraEnv); err != nil {
+		return err
+	}
+	if !isAgentOwnedByInfraEnv(agent, infraEnv) {
+		if err := controllerutil.SetOwnerReference(infraEnv, agent, r.Scheme); err != nil {
+			return err
+		}
+		return r.updateAndReplaceAgent(ctx, agent)
+	}
+	return nil
+}
+
+func (r *AgentReconciler) applyAutoApprovalIfNeeded(ctx context.Context, log logrus.FieldLogger, agent *aiv1beta1.Agent, h *common.Host) (bool, error) {
+	if agent.Spec.Approved {
+		return false, nil
+	}
+
+	infraEnvName, exist := agent.Labels[aiv1beta1.InfraEnvNameLabel]
+	if !exist {
+		log.Debugf("Agent %s/%s has no InfraEnv label, skipping auto-approval check", agent.Namespace, agent.Name)
+		return false, nil
+	}
+
+	infraEnvKey := types.NamespacedName{
+		Name:      infraEnvName,
+		Namespace: agent.Namespace,
+	}
+
+	infraEnv := &aiv1beta1.InfraEnv{}
+	if err := r.Get(ctx, infraEnvKey, infraEnv); err != nil {
+		if k8serrors.IsNotFound(err) {
+			log.Debugf("InfraEnv %s/%s not found, skipping auto-approval check", infraEnvKey.Namespace, infraEnvKey.Name)
+			return false, nil
+		}
+		return false, errors.Wrapf(err, "failed to get InfraEnv %s/%s", infraEnvKey.Namespace, infraEnvKey.Name)
+	}
+
+	if infraEnv.Spec.AgentApproval != nil && infraEnv.Spec.AgentApproval.AutoApprove {
+		log.Infof("Auto-approving agent %s/%s based on InfraEnv %s configuration", agent.Namespace, agent.Name, infraEnvKey.Name)
+		agent.Spec.Approved = true
+		return true, nil
+	}
+
+	return false, nil
 }
 
 func (r *AgentReconciler) SetupWithManager(mgr ctrl.Manager) error {
@@ -1825,12 +2132,12 @@ func (r *AgentReconciler) updateHostInstallProgress(ctx context.Context, host *m
 	return err
 }
 
-func (r *AgentReconciler) restoreHostByAgent(ctx context.Context, agent *aiv1beta1.Agent) error {
+func (r *AgentReconciler) restoreHostByAgent(ctx context.Context, log logrus.FieldLogger, agent, origAgent *aiv1beta1.Agent) (ctrl.Result, error) {
 	// Get InfraEnv
 	infraEnvName, exist := agent.Labels[aiv1beta1.InfraEnvNameLabel]
 	if !exist {
 		r.Log.Errorf("Failed to find infraEnv name for agent %s in namespace %s", agent.Name, agent.Namespace)
-		return errors.New("Missing InfraEnv name label")
+		return ctrl.Result{RequeueAfter: defaultRequeueAfterOnError}, errors.New("Missing InfraEnv name label")
 	}
 	key := types.NamespacedName{
 		Name:      infraEnvName,
@@ -1840,10 +2147,10 @@ func (r *AgentReconciler) restoreHostByAgent(ctx context.Context, agent *aiv1bet
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			r.Log.WithError(err).Errorf("InfraEnv with name '%s' is missing", infraEnvName)
-			return err
+			return ctrl.Result{RequeueAfter: defaultRequeueAfterOnError}, err
 		}
 		r.Log.WithError(err).Errorf("Failed to get InfraEnv with name '%s'", infraEnvName)
-		return err
+		return ctrl.Result{RequeueAfter: defaultRequeueAfterOnError}, err
 	}
 
 	// Get associated cluster if available
@@ -1858,18 +2165,36 @@ func (r *AgentReconciler) restoreHostByAgent(ctx context.Context, agent *aiv1bet
 		if err != nil {
 			r.Log.WithError(err).Errorf("Failed to get cluster (name: %s namespace: %s)",
 				agent.Spec.ClusterDeploymentName.Name, agent.Spec.ClusterDeploymentName.Namespace)
-			return err
+			return ctrl.Result{RequeueAfter: defaultRequeueAfterOnError}, err
 		}
 		clusterID = cluster.ID
+	}
+
+	// Check if a host with the same ID already exists (regardless of namespace)
+	// This prevents duplicate hosts and reports conflicts
+	existingHost, err := r.Installer.GetHostByIdInternal(ctx, agent.Name)
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		r.Log.WithError(err).Errorf("Failed to check for existing host with ID %s", agent.Name)
+		return r.updateStatus(ctx, log, agent, origAgent, nil, nil, err, true)
+	} else if err == nil && existingHost != nil {
+		errMsg := fmt.Sprintf("Host with ID %s already exists in namespace %s. Agent creation conflicts with existing host.",
+			agent.Name, existingHost.KubeKeyNamespace)
+		r.Log.Error(errMsg)
+		return r.updateStatus(ctx, log, agent, origAgent, nil, nil, errors.New(errMsg), false)
 	}
 
 	host, err := createNewHost(agent, clusterID, *infraEnv.ID)
 	if err != nil {
 		r.Log.WithError(err).Errorf("Failed to create Host with name '%s'", agent.Name)
-		return err
+		return ctrl.Result{RequeueAfter: defaultRequeueAfterOnError}, err
 	}
 
-	return r.Installer.CreateHostInKubeKeyNamespace(ctx, key, host)
+	err = r.Installer.CreateHostInKubeKeyNamespace(ctx, key, host)
+	if err != nil {
+		return ctrl.Result{RequeueAfter: defaultRequeueAfterOnError}, err
+	}
+
+	return ctrl.Result{Requeue: true, RequeueAfter: defaultRequeue}, nil
 }
 
 func createNewHost(agent *v1beta1.Agent, clusterID *strfmt.UUID, infraEnvID strfmt.UUID) (*models.Host, error) {
@@ -1916,4 +2241,34 @@ func createNewHost(agent *v1beta1.Agent, clusterID *strfmt.UUID, infraEnvID strf
 	}
 
 	return host, nil
+}
+
+// resetCSRStatus resets all CSR tracking information in the agent status
+func resetCSRStatus(agent *aiv1beta1.Agent) {
+	agent.Status.CSRStatus = aiv1beta1.CSRStatus{
+		ApprovedCSRs:        []aiv1beta1.CSRInfo{},
+		LastApprovalAttempt: metav1.Time{},
+	}
+}
+
+// isCSRTracked checks if a CSR is already tracked in the agent's approved CSRs list
+func isCSRTracked(agent *aiv1beta1.Agent, csrName string) bool {
+	for _, csr := range agent.Status.CSRStatus.ApprovedCSRs {
+		if csr.Name == csrName {
+			return true
+		}
+	}
+	return false
+}
+
+func isAgentOwnedByInfraEnv(agent *aiv1beta1.Agent, infraEnv *aiv1beta1.InfraEnv) bool {
+	if agent.OwnerReferences == nil {
+		return false
+	}
+	for _, ownerRef := range agent.OwnerReferences {
+		if ownerRef.Kind == infraEnv.Kind && ownerRef.Name == infraEnv.Name && ownerRef.UID == infraEnv.UID {
+			return true
+		}
+	}
+	return false
 }

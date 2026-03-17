@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-openapi/strfmt"
@@ -328,7 +329,6 @@ var _ = Describe("update_role", func() {
 		}
 
 		for _, t := range tests {
-			t := t
 			It(t.name, func() {
 				// Setup
 				if t.day2 {
@@ -660,7 +660,7 @@ var _ = Describe("update progress special cases", func() {
 		)
 		It("Single node special stage order - happy flow", func() {
 			cluster := hostutil.GenerateTestCluster(clusterId)
-			cluster.HighAvailabilityMode = swag.String(models.ClusterHighAvailabilityModeNone)
+			cluster.ControlPlaneCount = 1
 			Expect(db.Create(&cluster).Error).ShouldNot(HaveOccurred())
 
 			progress.CurrentStage = models.HostStageWaitingForBootkube
@@ -683,7 +683,7 @@ var _ = Describe("update progress special cases", func() {
 		})
 		It("Single node special stage order - not allowed", func() {
 			cluster := hostutil.GenerateTestCluster(clusterId)
-			cluster.HighAvailabilityMode = swag.String(models.ClusterHighAvailabilityModeNone)
+			cluster.ControlPlaneCount = 1
 			Expect(db.Create(&cluster).Error).ShouldNot(HaveOccurred())
 
 			progress.CurrentStage = models.HostStageWaitingForBootkube
@@ -703,7 +703,7 @@ var _ = Describe("update progress special cases", func() {
 		})
 		It("multi node update should fail", func() {
 			cluster := hostutil.GenerateTestCluster(clusterId)
-			cluster.HighAvailabilityMode = swag.String(models.ClusterHighAvailabilityModeFull)
+			cluster.ControlPlaneCount = common.MinMasterHostsNeededForInstallationInHaMode
 			Expect(db.Create(&cluster).Error).ShouldNot(HaveOccurred())
 
 			progress.CurrentStage = models.HostStageWaitingForBootkube
@@ -1173,7 +1173,6 @@ var _ = Describe("UpdateInventory", func() {
 				expectedId: path,
 			},
 		} {
-			test := test
 			It(test.testName, func() {
 				host = hostutil.GenerateTestHost(hostId, infraEnvId, clusterId, models.HostStatusDiscovering)
 				Expect(db.Create(&host).Error).ShouldNot(HaveOccurred())
@@ -1237,7 +1236,6 @@ var _ = Describe("UpdateInventory", func() {
 				serviceReasons:   []string{},
 				expectedDecision: false, expectedReasons: []string{"Agent reason"}},
 		} {
-			test := test
 			It(test.testName, func() {
 				mockValidator.EXPECT().DiskIsEligible(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(append(test.agentReasons, test.serviceReasons...), nil)
 
@@ -1287,7 +1285,6 @@ var _ = Describe("UpdateInventory", func() {
 				hostMAC:     "",
 			},
 		} {
-			test := test
 			It(test.testName, func() {
 
 				hapi.(*Manager).Config.BootstrapHostMAC = test.hostMAC
@@ -1935,14 +1932,14 @@ var _ = Describe("Unbind host", func() {
 			{
 				name:        models.HostStatusInstalling,
 				srcState:    models.HostStatusInstalling,
-				validation:  failure,
-				expectEvent: false,
+				validation:  success,
+				expectEvent: true,
 			},
 			{
 				name:        models.HostStatusInstallingInProgress,
 				srcState:    models.HostStatusInstallingInProgress,
-				validation:  failure,
-				expectEvent: false,
+				validation:  success,
+				expectEvent: true,
 			},
 			{
 				name:        models.HostStatusResettingPendingUserAction,
@@ -2290,6 +2287,100 @@ var _ = Describe("UpdateNTP", func() {
 			Expect(h.NtpSources).Should(Equal(string(marshalled)))
 		})
 	}
+})
+
+var _ = Describe("UpdateFencing", func() {
+	var (
+		ctx                           = context.Background()
+		hapi                          API
+		db                            *gorm.DB
+		ctrl                          *gomock.Controller
+		mockEvents                    *eventsapi.MockHandler
+		hostId, clusterId, infraEnvId strfmt.UUID
+		dbName                        string
+	)
+
+	BeforeEach(func() {
+		db, dbName = common.PrepareTestDB()
+		ctrl = gomock.NewController(GinkgoT())
+		mockEvents = eventsapi.NewMockHandler(ctrl)
+		dummy := &leader.DummyElector{}
+		hapi = NewManager(common.GetTestLog(), db, testing.GetDummyNotificationStream(ctrl), mockEvents, nil, nil, createValidatorCfg(), nil, defaultConfig, dummy, nil, nil, false, nil, nil, false)
+		hostId = strfmt.UUID(uuid.New().String())
+		clusterId = strfmt.UUID(uuid.New().String())
+		infraEnvId = strfmt.UUID(uuid.New().String())
+	})
+
+	AfterEach(func() {
+		ctrl.Finish()
+		common.DeleteTestDB(db, dbName)
+	})
+
+	It("credentials with empty certificate verification", func() {
+		host := hostutil.GenerateTestHost(hostId, infraEnvId, clusterId, models.HostStatusKnown)
+		Expect(db.Create(&host).Error).ShouldNot(HaveOccurred())
+		fencingCredentialsParams := &models.FencingCredentialsParams{
+			Address:  swag.String("https://bmc.example.com"),
+			Username: swag.String("admin"),
+			Password: swag.String("password123"),
+		}
+		fencingCredentials, err := json.Marshal(fencingCredentialsParams)
+		Expect(err).ShouldNot(HaveOccurred())
+
+		err = hapi.UpdateFencing(ctx, &host, string(fencingCredentials), db)
+		Expect(err).ShouldNot(HaveOccurred())
+		h := hostutil.GetHostFromDB(*host.ID, host.InfraEnvID, db)
+		var actualFencingCredentials models.FencingCredentialsParams
+		err = json.Unmarshal([]byte(h.FencingCredentials), &actualFencingCredentials)
+		Expect(err).ShouldNot(HaveOccurred())
+		Expect(actualFencingCredentials.Address).Should(Equal(fencingCredentialsParams.Address))
+		Expect(actualFencingCredentials.Username).Should(Equal(fencingCredentialsParams.Username))
+		Expect(actualFencingCredentials.Password).Should(Equal(fencingCredentialsParams.Password))
+		Expect(actualFencingCredentials.CertificateVerification).Should(Equal(fencingCredentialsParams.CertificateVerification))
+	})
+
+	It("credentials with certificate verification disabled", func() {
+		host := hostutil.GenerateTestHost(hostId, infraEnvId, clusterId, models.HostStatusKnown)
+		Expect(db.Create(&host).Error).ShouldNot(HaveOccurred())
+		fencingCredentialsParams := &models.FencingCredentialsParams{
+			Address:                 swag.String("https://bmc.example.com"),
+			Username:                swag.String("admin"),
+			Password:                swag.String("password123"),
+			CertificateVerification: swag.String("Disabled"),
+		}
+		fencingCredentials, err := json.Marshal(fencingCredentialsParams)
+		Expect(err).ShouldNot(HaveOccurred())
+
+		err = hapi.UpdateFencing(ctx, &host, string(fencingCredentials), db)
+		Expect(err).ShouldNot(HaveOccurred())
+		h := hostutil.GetHostFromDB(*host.ID, host.InfraEnvID, db)
+		var actualFencingCredentials models.FencingCredentialsParams
+		err = json.Unmarshal([]byte(h.FencingCredentials), &actualFencingCredentials)
+		Expect(err).ShouldNot(HaveOccurred())
+		Expect(actualFencingCredentials.Address).Should(Equal(fencingCredentialsParams.Address))
+		Expect(actualFencingCredentials.Username).Should(Equal(fencingCredentialsParams.Username))
+		Expect(actualFencingCredentials.Password).Should(Equal(fencingCredentialsParams.Password))
+		Expect(actualFencingCredentials.CertificateVerification).Should(Equal(fencingCredentialsParams.CertificateVerification))
+	})
+
+	It("invalid host status", func() {
+		host := hostutil.GenerateTestHost(hostId, infraEnvId, clusterId, models.HostStatusInstalling)
+		Expect(db.Create(&host).Error).ShouldNot(HaveOccurred())
+		fencingCredentialsParams := &models.FencingCredentialsParams{
+			Address:  swag.String("https://bmc.example.com"),
+			Username: swag.String("admin"),
+			Password: swag.String("password123"),
+		}
+		fencingCredentials, err := json.Marshal(fencingCredentialsParams)
+		Expect(err).ShouldNot(HaveOccurred())
+
+		err = hapi.UpdateFencing(ctx, &host, string(fencingCredentials), db)
+		Expect(err).Should(HaveOccurred())
+		Expect(err.Error()).To(Equal(fmt.Sprintf("Host is in %s state, fencing credentials can be set only in one of %s states",
+			models.HostStatusInstalling, hostStatusesBeforeInstallation[:])))
+		h := hostutil.GetHostFromDB(*host.ID, host.InfraEnvID, db)
+		Expect(h.FencingCredentials).To(Equal(""))
+	})
 })
 
 var _ = Describe("UpdateMachineConfigPoolName", func() {
@@ -2819,6 +2910,7 @@ var _ = Describe("AutoAssignRole", func() {
 	var (
 		ctx             = context.Background()
 		clusterId       strfmt.UUID
+		cluster         *common.Cluster
 		infraEnvId      strfmt.UUID
 		hapi            API
 		db              *gorm.DB
@@ -2827,6 +2919,44 @@ var _ = Describe("AutoAssignRole", func() {
 		mockEvents      *eventsapi.MockHandler
 		dbName          string
 	)
+
+	generateAutoAssignHost := func(hostID strfmt.UUID, cpus, ram int64, hasGPU bool, hostname string) *models.Host {
+		h := hostutil.GenerateTestHost(hostID, infraEnvId, clusterId, models.HostStatusKnown)
+		h.Role = models.HostRoleAutoAssign
+		h.SuggestedRole = ""
+		h.RequestedHostname = hostname
+
+		var gpus []*models.Gpu
+		if hasGPU {
+			gpus = []*models.Gpu{
+				{DeviceID: "2222", VendorID: "0000"},
+			}
+		}
+
+		inventory := &models.Inventory{
+			CPU: &models.CPU{
+				Count: cpus,
+			},
+			Memory: &models.Memory{
+				UsableBytes:   conversions.GibToBytes(ram),
+				PhysicalBytes: conversions.GibToBytes(ram), // Add PhysicalBytes for validation
+			},
+			Disks: []*models.Disk{
+				{
+					SizeBytes:               100 * conversions.GB,
+					DriveType:               models.DriveTypeSSD,
+					ID:                      "/dev/disk/by-id/test-disk",
+					InstallationEligibility: models.DiskInstallationEligibility{Eligible: true},
+				},
+			},
+			Gpus: gpus,
+		}
+		b, _ := json.Marshal(inventory)
+		h.Inventory = string(b)
+
+		return &h
+	}
+
 	BeforeEach(func() {
 		ctrl = gomock.NewController(GinkgoT())
 		mockEvents = eventsapi.NewMockHandler(ctrl)
@@ -2862,11 +2992,12 @@ var _ = Describe("AutoAssignRole", func() {
 			mockVersions,
 			false,
 		)
-		Expect(db.Create(&common.Cluster{Cluster: models.Cluster{
+		cluster = &common.Cluster{Cluster: models.Cluster{
 			ID:                &clusterId,
 			Kind:              swag.String(models.ClusterKindCluster),
 			ControlPlaneCount: common.MinMasterHostsNeededForInstallationInHaMode,
-		}}).Error).ShouldNot(HaveOccurred())
+		}}
+		Expect(db.Create(cluster).Error).ShouldNot(HaveOccurred())
 		mockOperators.EXPECT().ValidateHost(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes().Return([]api.ValidationResult{
 			{Status: api.Success, ValidationId: string(models.HostValidationIDOdfRequirementsSatisfied)},
 			{Status: api.Success, ValidationId: string(models.HostValidationIDLsoRequirementsSatisfied)},
@@ -2874,6 +3005,7 @@ var _ = Describe("AutoAssignRole", func() {
 			{Status: api.Success, ValidationId: string(models.HostValidationIDLvmRequirementsSatisfied)},
 			{Status: api.Success, ValidationId: string(models.ClusterValidationIDMtvRequirementsSatisfied)},
 			{Status: api.Success, ValidationId: string(models.ClusterValidationIDOscRequirementsSatisfied)},
+			{Status: api.Success, ValidationId: string(models.HostValidationIDMetallbRequirementsSatisfied)},
 		}, nil)
 		masterRequirements := models.ClusterHostRequirementsDetails{
 			CPUCores:   4,
@@ -3016,9 +3148,96 @@ var _ = Describe("AutoAssignRole", func() {
 		verifyAutoAssignRole(&h, true, true)
 		Expect(hostutil.GetHostFromDB(*h.ID, infraEnvId, db).Role).Should(Equal(models.HostRoleWorker))
 	})
+
+	It("TNA cluster with 2 masters and 0 arbiters", func() {
+		cluster.ControlPlaneCount = common.MinMasterHostsNeededForInstallationInHaArbiterMode
+		db.Save(cluster)
+		for i := 0; i < common.MinMasterHostsNeededForInstallationInHaArbiterMode; i++ {
+			h := hostutil.GenerateTestHost(strfmt.UUID(uuid.New().String()), infraEnvId, clusterId, models.HostStatusKnown)
+			h.Inventory = hostutil.GenerateMasterInventory()
+			h.Role = models.HostRoleAutoAssign
+			h.SuggestedRole = ""
+			Expect(db.Create(&h).Error).ShouldNot(HaveOccurred())
+			verifyAutoAssignRole(&h, true, true)
+			Expect(hostutil.GetHostFromDB(*h.ID, infraEnvId, db).Role).Should(Equal(models.HostRoleMaster))
+		}
+
+		h := hostutil.GenerateTestHost(strfmt.UUID(uuid.New().String()), infraEnvId, clusterId, models.HostStatusKnown)
+		h.Inventory = hostutil.GenerateMasterInventory()
+		h.Role = models.HostRoleAutoAssign
+		h.SuggestedRole = ""
+		Expect(db.Create(&h).Error).ShouldNot(HaveOccurred())
+		verifyAutoAssignRole(&h, true, true)
+		Expect(hostutil.GetHostFromDB(*h.ID, infraEnvId, db).Role).Should(Equal(models.HostRoleArbiter))
+	})
+	It("should assign roles based on hardware with GPU weight affecting priority", func() {
+		cluster.ControlPlaneCount = common.MinMasterHostsNeededForInstallationInHaMode
+		hosts := []*models.Host{
+			// master candidates (higher CPU/RAM)
+			generateAutoAssignHost(strfmt.UUID(uuid.New().String()), 8, 32, false, "powerful-host-1"),
+			generateAutoAssignHost(strfmt.UUID(uuid.New().String()), 8, 32, false, "powerful-host-2"),
+			generateAutoAssignHost(strfmt.UUID(uuid.New().String()), 8, 32, false, "powerful-host-3"),
+			// worker candidates with GPU (should be preferred for worker role due to GPU weight)
+			generateAutoAssignHost(strfmt.UUID(uuid.New().String()), 4, 16, true, "gpu-worker-1"),
+			generateAutoAssignHost(strfmt.UUID(uuid.New().String()), 4, 16, true, "gpu-worker-2"),
+		}
+
+		cluster.Hosts = hosts
+
+		// Sort hosts first (like the real auto-assign logic does)
+		sortedHosts, _ := SortHosts(hosts)
+
+		var masterCount, workerCount int
+
+		for _, host := range sortedHosts {
+			Expect(db.Create(host).Error).ShouldNot(HaveOccurred())
+			verifyAutoAssignRole(host, true, true)
+			if strings.Contains(host.RequestedHostname, "gpu-worker") {
+				Expect(hostutil.GetHostFromDB(*host.ID, infraEnvId, db).Role).Should(Equal(models.HostRoleWorker))
+				workerCount++
+			} else {
+				Expect(hostutil.GetHostFromDB(*host.ID, infraEnvId, db).Role).Should(Equal(models.HostRoleMaster))
+				masterCount++
+			}
+		}
+
+		Expect(masterCount).To(Equal(3), "Should have exactly 3 masters")
+		Expect(workerCount).To(Equal(2), "Should have exactly 2 workers")
+
+	})
+	It("should handle edge case of all hosts having GPUs", func() {
+		// All 5 hosts have GPUs - auto-assign should still work correctly
+		hosts := []*models.Host{
+			generateAutoAssignHost(strfmt.UUID(uuid.New().String()), 8, 32, true, "gpu-host-1"),
+			generateAutoAssignHost(strfmt.UUID(uuid.New().String()), 8, 32, true, "gpu-host-2"),
+			generateAutoAssignHost(strfmt.UUID(uuid.New().String()), 8, 32, true, "gpu-host-3"),
+			generateAutoAssignHost(strfmt.UUID(uuid.New().String()), 4, 16, true, "gpu-host-4"),
+			generateAutoAssignHost(strfmt.UUID(uuid.New().String()), 4, 16, true, "gpu-host-5"),
+		}
+
+		cluster.Hosts = hosts
+
+		// Sort hosts first (like the real auto-assign logic does)
+		sortedHosts, _ := SortHosts(hosts)
+
+		var masterCount, workerCount int
+
+		for _, host := range sortedHosts {
+			Expect(db.Create(host).Error).ShouldNot(HaveOccurred())
+			verifyAutoAssignRole(host, true, true)
+			role := hostutil.GetHostFromDB(*host.ID, infraEnvId, db).Role
+			if role == models.HostRoleMaster {
+				masterCount++
+			} else if role == models.HostRoleWorker {
+				workerCount++
+			}
+		}
+		Expect(masterCount).To(Equal(3), "Should have exactly 3 masters")
+		Expect(workerCount).To(Equal(2), "Should have exactly 2 workers")
+	})
 })
 
-var _ = Describe("IsValidMasterCandidate", func() {
+var _ = Describe("IsValidCandidate", func() {
 	var (
 		clusterId  strfmt.UUID
 		infraEnvId strfmt.UUID
@@ -3071,6 +3290,7 @@ var _ = Describe("IsValidMasterCandidate", func() {
 			{Status: api.Success, ValidationId: string(models.HostValidationIDLvmRequirementsSatisfied)},
 			{Status: api.Success, ValidationId: string(models.ClusterValidationIDMtvRequirementsSatisfied)},
 			{Status: api.Success, ValidationId: string(models.ClusterValidationIDOscRequirementsSatisfied)},
+			{Status: api.Success, ValidationId: string(models.HostValidationIDMetallbRequirementsSatisfied)},
 		}, nil)
 	})
 
@@ -3135,7 +3355,7 @@ var _ = Describe("IsValidMasterCandidate", func() {
 				Expect(db.Create(&h).Error).ShouldNot(HaveOccurred())
 				var cluster common.Cluster
 				Expect(db.Preload("Hosts").Take(&cluster, "id = ?", clusterId.String()).Error).ToNot(HaveOccurred())
-				isValidReply, err := hapi.IsValidMasterCandidate(&h, &cluster, db, common.GetTestLog(), true)
+				isValidReply, err := hapi.IsValidCandidate(&h, &cluster, models.HostRoleMaster, db, common.GetTestLog(), true)
 				Expect(isValidReply).Should(Equal(t.isValid))
 				Expect(err).ShouldNot(HaveOccurred())
 			})
@@ -4034,6 +4254,7 @@ var _ = Describe("sortHost by hardware", func() {
 		Cpus        int64
 		Ram         int64
 		Disks       []*models.Disk
+		GPU         []*models.Gpu
 	}{
 		{
 			description: "minimal master with 3 disks (total of 120 GB)",
@@ -4129,6 +4350,19 @@ var _ = Describe("sortHost by hardware", func() {
 				{SizeBytes: 20 * conversions.GB, DriveType: models.DriveTypeSSD, ID: diskID3},
 			},
 		},
+		{
+			description: "host with minimal hardware to be either master/worker, with GPU",
+			Cpus:        4,
+			Ram:         16,
+			Disks: []*models.Disk{
+				{SizeBytes: 20 * conversions.GB, DriveType: models.DriveTypeHDD, ID: diskID1},
+				{SizeBytes: 20 * conversions.GB, DriveType: models.DriveTypeSSD, ID: diskID2},
+				{SizeBytes: 20 * conversions.GB, DriveType: models.DriveTypeSSD, ID: diskID3},
+			},
+			GPU: []*models.Gpu{
+				{DeviceID: "2222", VendorID: "0000"},
+			},
+		},
 	}
 
 	generateHosts := func() []*models.Host {
@@ -4147,6 +4381,7 @@ var _ = Describe("sortHost by hardware", func() {
 					}
 					return d
 				}).([]*models.Disk),
+				Gpus: spec.GPU,
 			}
 			b, _ := json.Marshal(inventory)
 			id := strfmt.UUID(uuid.New().String())
@@ -4172,6 +4407,7 @@ var _ = Describe("sortHost by hardware", func() {
 			"odf worker with 1 disk of 40 GB",
 			"odf worker with 3 disks (total of 80 GB)",
 			"odf worker with 3 disks (total of 120 GB)",
+			"host with minimal hardware to be either master/worker, with GPU",
 		}
 		for i, h := range sorted {
 			Expect(h.RequestedHostname).To(Equal(expected[i]))

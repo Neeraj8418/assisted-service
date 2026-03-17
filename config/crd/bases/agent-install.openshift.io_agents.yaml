@@ -3,7 +3,7 @@ apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   annotations:
-    controller-gen.kubebuilder.io/version: v0.14.0
+    controller-gen.kubebuilder.io/version: v0.17.0
   name: agents.agent-install.openshift.io
 spec:
   group: agent-install.openshift.io
@@ -82,6 +82,10 @@ spec:
                       name must be unique.
                     type: string
                 type: object
+              fencingCredentialsSecretRef:
+                description: FencingCredentialsSecretRef is a name of a secret in
+                  the Agent's namespace that contains fencing credentials
+                type: string
               hostname:
                 type: string
               ignitionConfigOverrides:
@@ -114,6 +118,10 @@ spec:
                 description: InstallationDiskID defines the installation destination
                   disk (must be equal to the inventory disk id).
                 type: string
+              installation_disk_path:
+                description: InstallationDiskPath defines the installation destination
+                  disk using either its by-id or by-path value.
+                type: string
               installerArgs:
                 description: Json formatted string containing the user overrides for
                   the host's coreos installer args
@@ -129,7 +137,6 @@ spec:
               role:
                 description: |-
                   HostRole host role
-
 
                   swagger:model host-role
                 type: string
@@ -169,6 +176,35 @@ spec:
                   - type
                   type: object
                 type: array
+              csrStatus:
+                description: CSRStatus tracks the status of CSR approvals for the
+                  agent
+                properties:
+                  approvedCSRs:
+                    description: CSRs that have been approved for the agent by the
+                      assisted-service
+                    items:
+                      description: CSRInfo tracks information about an approved CSR
+                      properties:
+                        approvedAt:
+                          format: date-time
+                          type: string
+                        name:
+                          type: string
+                        type:
+                          description: CSRType represents the type of CSR
+                          type: string
+                      required:
+                      - approvedAt
+                      - name
+                      - type
+                      type: object
+                    type: array
+                  lastApprovalAttempt:
+                    description: Last time we attempted a CSR approval
+                    format: date-time
+                    type: string
+                type: object
               debugInfo:
                 description: DebugInfo includes information for debugging the installation
                   process.
@@ -293,6 +329,28 @@ spec:
                       - id
                       type: object
                     type: array
+                  gpus:
+                    items:
+                      properties:
+                        address:
+                          description: Device address (for example "0000:00:02.0")
+                          type: string
+                        deviceID:
+                          description: ID of the device (for example "3ea0")
+                          type: string
+                        name:
+                          description: Product name of the device (for example "UHD
+                            Graphics 620 (Whiskey Lake)")
+                          type: string
+                        vendor:
+                          description: The name of the device vendor (for example
+                            "Intel Corporation")
+                          type: string
+                        vendorID:
+                          description: ID of the vendor (for example "8086")
+                          type: string
+                      type: object
+                    type: array
                   hostname:
                     type: string
                   interfaces:
@@ -361,6 +419,12 @@ spec:
                         type: boolean
                     type: object
                 type: object
+              kind:
+                description: |-
+                  Kind corresponds to the same field in the model Host. It indicates the type of cluster the host is
+                  being installed to; either an existing cluster (day-2) or a new cluster (day-1).
+                  Value is one of: "AddToExistingClusterHost" (day-2) or "Host" (day-1)
+                type: string
               ntpSources:
                 items:
                   properties:
@@ -369,7 +433,6 @@ spec:
                     sourceState:
                       description: |-
                         SourceState source state
-
 
                         swagger:model source_state
                       type: string
@@ -395,7 +458,6 @@ spec:
                       description: |-
                         HostStage host stage
 
-
                         swagger:model host-stage
                       type: string
                     type: array
@@ -411,7 +473,6 @@ spec:
               role:
                 description: |-
                   HostRole host role
-
 
                   swagger:model host-role
                 type: string

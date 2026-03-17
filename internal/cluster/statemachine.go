@@ -126,6 +126,7 @@ func NewClusterStateMachine(th TransitionHandler) stateswitch.StateMachine {
 		If(IsMtvRequirementsSatisfied),
 		If(IsOscRequirementsSatisfied),
 		If(isNetworkTypeValid),
+		If(IsCustomManifestsRequirementsSatisfied),
 		If(NetworksSameAddressFamilies),
 		If(IsNodeFeatureDiscoveryRequirementsSatisfied),
 		If(IsNvidiaGPURequirementsSatisfied),
@@ -137,6 +138,17 @@ func NewClusterStateMachine(th TransitionHandler) stateswitch.StateMachine {
 		If(IsNmstateRequirementsSatisfied),
 		If(IsAMDGPURequirementsSatisfied),
 		If(IsKMMRequirementsSatisfied),
+		If(AreNodeHealthcheckRequirementsSatisfied),
+		If(AreSelfNodeRemediationRequirementsSatisfied),
+		If(AreFenceAgentsRemediationRequirementsSatisfied),
+		If(AreNodeMaintenanceRequirementsSatisfied),
+		If(AreKubeDeschedulerRequirementsSatisfied),
+		If(AreClusterObservabilityRequirementsSatisfied),
+		If(AreNUMAResourcesRequirementsSatisfied),
+		If(AreOADPRequirementsSatisfied),
+		If(AreMetallbRequirementsSatisfied),
+		If(IsLokiRequirementsSatisfied),
+		If(IsOpenShiftLoggingRequirementsSatisfied),
 	)
 
 	// Refresh cluster status conditions - Non DHCP
@@ -568,6 +580,7 @@ func NewClusterStateMachine(th TransitionHandler) stateswitch.StateMachine {
 		stateswitch.State(models.ClusterStatusError),
 		stateswitch.State(models.ClusterStatusCancelled),
 		stateswitch.State(models.ClusterStatusAddingHosts),
+		stateswitch.State(models.ClusterStatusUnmonitored),
 	} {
 		sm.AddTransitionRule(stateswitch.TransitionRule{
 			TransitionType:   TransitionTypeRefreshStatus,
@@ -627,6 +640,10 @@ func documentStates(sm stateswitch.StateMachine) {
 	sm.DescribeState(stateswitch.State(models.ClusterStatusInstallingPendingUserAction), stateswitch.StateDoc{
 		Name:        "Installing, Pending User Action",
 		Description: "Installation is in progress, but is blocked and cannot continue until the user takes action",
+	})
+	sm.DescribeState(stateswitch.State(models.ClusterStatusUnmonitored), stateswitch.StateDoc{
+		Name:        "Unmonitored",
+		Description: "The cluster is a temporary configuration holder for disconnected ISO generation and should not be monitored or transitioned",
 	})
 }
 

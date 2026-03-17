@@ -39,7 +39,7 @@ DEBUG_SERVICE_PORT := $(or ${DEBUG_SERVICE_PORT},40000)
 SERVICE := $(or ${SERVICE},${ASSISTED_ORG}/assisted-service:${ASSISTED_TAG})
 IMAGE_SERVICE := $(or ${IMAGE_SERVICE},${ASSISTED_ORG}/assisted-image-service:${ASSISTED_TAG})
 ASSISTED_UI := $(or ${ASSISTED_UI},${ASSISTED_ORG}/assisted-installer-ui:${ASSISTED_TAG})
-PSQL_IMAGE := $(or ${PSQL_IMAGE},quay.io/sclorg/postgresql-12-c8s:latest)
+PSQL_IMAGE := $(or ${PSQL_IMAGE},quay.io/sclorg/postgresql-13-c9s:latest)
 BUNDLE_IMAGE := $(or ${BUNDLE_IMAGE},${ASSISTED_ORG}/assisted-service-operator-bundle:${ASSISTED_TAG})
 INDEX_IMAGE := $(or ${INDEX_IMAGE},${ASSISTED_ORG}/assisted-service-index:${ASSISTED_TAG})
 
@@ -97,6 +97,9 @@ USE_LOCAL_SERVICE := $(or ${USE_LOCAL_SERVICE}, false)
 LOCAL_ASSISTED_SERVICE_IMAGE=localhost/assisted-service:latest
 LOCAL_IMAGE_ARCHIVE=build/assisted_service_image.tar
 HUB_CLUSTER_NAME := $(or ${HUB_CLUSTER_NAME}, assisted-hub-cluster)
+NVIDIA_REQUIRE_GPU := $(or ${NVIDIA_REQUIRE_GPU}, true)
+AMD_REQUIRE_GPU := $(or ${AMD_REQUIRE_GPU}, true)
+TNA_CLUSTERS_SUPPORT := $(or ${TNA_CLUSTERS_SUPPORT}, true)
 
 
 ifeq ($(DISABLE_TLS),true)
@@ -121,7 +124,7 @@ endif
 
 
 # Operator Vars - these must be kept up to date
-BUNDLE_CHANNELS ?= alpha,ocm-2.14
+BUNDLE_CHANNELS ?= alpha,ocm-2.17
 BUNDLE_OUTPUT_DIR ?= deploy/olm-catalog
 BUNDLE_METADATA_OPTS ?= --channels=$(BUNDLE_CHANNELS) --default-channel=alpha
 
@@ -423,7 +426,7 @@ podman-pull-service-from-docker-daemon:
 deploy-onprem:
 	podman play kube --configmap ${PODMAN_CONFIGMAP} deploy/podman/pod.yml
 	./hack/retry.sh 90 2 "curl -f http://127.0.0.1:8090/ready"
-	./hack/retry.sh 60 10 "curl -f http://127.0.0.1:8888/health"
+	./hack/retry.sh 180 10 "curl -f http://127.0.0.1:8888/health"
 
 deploy-on-openshift-ci:
 	export PERSISTENT_STORAGE="False" && export TARGET='oc' && export GENERATE_CRD='false' && unset GOFLAGS && \

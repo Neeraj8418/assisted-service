@@ -36,7 +36,7 @@ var _ = Describe("MTV Operator", func() {
 		})
 
 		It("should return the right validations ids", func() {
-			Expect(operator.GetClusterValidationID()).To(Equal(string(models.ClusterValidationIDMtvRequirementsSatisfied)))
+			Expect(operator.GetClusterValidationIDs()).To(Equal([]string{string(models.ClusterValidationIDMtvRequirementsSatisfied)}))
 			Expect(operator.GetHostValidationID()).To(Equal(string(models.HostValidationIDMtvRequirementsSatisfied)))
 		})
 
@@ -53,9 +53,8 @@ var _ = Describe("MTV Operator", func() {
 		var cluster common.Cluster
 
 		BeforeEach(func() {
-			mode := models.ClusterHighAvailabilityModeFull
 			cluster = common.Cluster{
-				Cluster: models.Cluster{HighAvailabilityMode: &mode},
+				Cluster: models.Cluster{ControlPlaneCount: common.MinMasterHostsNeededForInstallationInHaMode},
 			}
 		})
 
@@ -87,9 +86,8 @@ var _ = Describe("MTV Operator", func() {
 		var cluster common.Cluster
 
 		BeforeEach(func() {
-			mode := models.ClusterHighAvailabilityModeFull
 			cluster = common.Cluster{
-				Cluster: models.Cluster{HighAvailabilityMode: &mode},
+				Cluster: models.Cluster{ControlPlaneCount: common.MinMasterHostsNeededForInstallationInHaMode},
 			}
 		})
 

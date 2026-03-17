@@ -6,7 +6,9 @@ import (
 	"strings"
 
 	"github.com/go-openapi/swag"
+	configv1 "github.com/openshift/api/config/v1"
 	"github.com/openshift/assisted-service/internal/common"
+	"github.com/openshift/assisted-service/internal/host/hostutil"
 	"github.com/openshift/assisted-service/internal/installcfg"
 	"github.com/openshift/assisted-service/internal/network"
 	"github.com/openshift/assisted-service/internal/provider/registry"
@@ -94,17 +96,18 @@ func (i *installConfigBuilder) getBasicInstallConfig(cluster *common.Cluster) (*
 			Replicas       int    `json:"replicas"`
 		}{
 			{
-				Hyperthreading: i.getHypethreadingConfiguration(cluster, "worker"),
+				Hyperthreading: i.getHypethreadingConfiguration(cluster, models.ClusterHyperthreadingWorkers),
 				Name:           string(models.HostRoleWorker),
 				Replicas:       i.countHostsByRole(cluster, models.HostRoleWorker),
 			},
 		},
 		ControlPlane: struct {
-			Hyperthreading string `json:"hyperthreading,omitempty"`
-			Name           string `json:"name"`
-			Replicas       int    `json:"replicas"`
+			Hyperthreading string              `json:"hyperthreading,omitempty"`
+			Name           string              `json:"name"`
+			Replicas       int                 `json:"replicas"`
+			Fencing        *installcfg.Fencing `json:"fencing,omitempty"`
 		}{
-			Hyperthreading: i.getHypethreadingConfiguration(cluster, "master"),
+			Hyperthreading: i.getHypethreadingConfiguration(cluster, models.ClusterHyperthreadingMasters),
 			Name:           string(models.HostRoleMaster),
 			Replicas:       i.countHostsByRole(cluster, models.HostRoleMaster),
 		},
@@ -112,7 +115,10 @@ func (i *installConfigBuilder) getBasicInstallConfig(cluster *common.Cluster) (*
 		SSHKey:     cluster.SSHPublicKey,
 	}
 
-	cfg.Networking.NetworkType = networkType
+	// For "None" network type, don't set networkType in install-config (user provides CNI manifests)
+	if networkType != models.ClusterNetworkTypeNone {
+		cfg.Networking.NetworkType = networkType
+	}
 
 	for _, network := range cluster.ClusterNetworks {
 		cfg.Networking.ClusterNetwork = append(cfg.Networking.ClusterNetwork,
@@ -135,6 +141,26 @@ func (i *installConfigBuilder) getBasicInstallConfig(cluster *common.Cluster) (*
 	}
 
 	if err := i.handleMirrorRegistry(cfg, cluster); err != nil {
+		return nil, err
+	}
+
+	if common.IsClusterTopologyHighlyAvailableArbiter(cluster) {
+		cfg.Arbiter = &struct {
+			Hyperthreading string `json:"hyperthreading,omitempty"`
+			Name           string `json:"name"`
+			Replicas       int    `json:"replicas"`
+		}{
+			Hyperthreading: i.getHypethreadingConfiguration(cluster, models.ClusterHyperthreadingArbiters),
+			Name:           string(models.HostRoleArbiter),
+			Replicas:       i.countHostsByRole(cluster, models.HostRoleArbiter),
+		}
+		// Arbiter is TechPreview in 4.19 and GA in greater versions
+		if is419, _ := common.BaseVersionEqual(common.MinimumVersionForArbiterClusters, cluster.OpenshiftVersion); is419 {
+			cfg.FeatureSet = configv1.TechPreviewNoUpgrade
+		}
+	}
+
+	if err := i.handleFencing(cfg, cluster); err != nil {
 		return nil, err
 	}
 
@@ -301,18 +327,14 @@ func (i *installConfigBuilder) ValidateInstallConfigPatch(cluster *common.Cluste
 	return config.Validate()
 }
 
-func (i *installConfigBuilder) getHypethreadingConfiguration(cluster *common.Cluster, machineType string) string {
-	switch cluster.Hyperthreading {
-	case models.ClusterHyperthreadingAll:
+func (i *installConfigBuilder) getHypethreadingConfiguration(cluster *common.Cluster, machineGroup string) string {
+	if cluster.Hyperthreading == models.ClusterHyperthreadingAll {
 		return "Enabled"
-	case models.ClusterHyperthreadingMasters:
-		if machineType == "master" {
-			return "Enabled"
-		}
-	case models.ClusterHyperthreadingWorkers:
-		if machineType == "worker" {
-			return "Enabled"
-		}
+	}
+
+	enabledGroups := strings.Split(cluster.Hyperthreading, ",")
+	if funk.ContainsString(enabledGroups, machineGroup) {
+		return "Enabled"
 	}
 	return "Disabled"
 }
@@ -360,4 +382,36 @@ func (i *installConfigBuilder) mergeAllCASources(cluster *common.Cluster,
 	}
 
 	return strings.TrimSpace(strings.Join(certs, "\n"))
+}
+
+func (i *installConfigBuilder) handleFencing(cfg *installcfg.InstallerConfigBaremetal, cluster *common.Cluster) error {
+	if !common.IsClusterTopologyTwoNodesWithFencing(cluster) {
+		return nil
+	}
+
+	fencingCredentials := make([]installcfg.FencingCredential, common.AllowedNumberOfMasterHostsInTwoNodesWithFencing)
+	for index, master := range common.GetHostsByRole(cluster, models.HostRoleMaster) {
+		hostFencingCredentials := models.FencingCredentialsParams{}
+		if err := json.Unmarshal([]byte(master.FencingCredentials), &hostFencingCredentials); err != nil {
+			i.log.WithError(err).Errorf("failed to unmarshal the fencing credentials of host %s", master.ID.String())
+			return err
+		}
+
+		fencingCredentials[index] = installcfg.FencingCredential{
+			Hostname: hostutil.GetHostnameForMsg(&master),
+			Address:  *hostFencingCredentials.Address,
+			Username: *hostFencingCredentials.Username,
+			Password: *hostFencingCredentials.Password,
+		}
+
+		if hostFencingCredentials.CertificateVerification != nil && *hostFencingCredentials.CertificateVerification != "" {
+			certificateVerification := installcfg.CertificateVerification(*hostFencingCredentials.CertificateVerification)
+			fencingCredentials[index].CertificateVerification = &certificateVerification
+		}
+	}
+
+	cfg.ControlPlane.Fencing = &installcfg.Fencing{Credentials: fencingCredentials}
+	cfg.FeatureSet = configv1.DevPreviewNoUpgrade
+
+	return nil
 }

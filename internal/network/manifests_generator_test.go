@@ -16,6 +16,8 @@ import (
 	. "github.com/onsi/gomega"
 	"github.com/openshift/assisted-service/internal/common"
 	manifestsapi "github.com/openshift/assisted-service/internal/manifests/api"
+	"github.com/openshift/assisted-service/internal/operators/openshiftai"
+	"github.com/openshift/assisted-service/internal/system"
 	"github.com/openshift/assisted-service/models"
 	mcfgv1 "github.com/openshift/machine-config-operator/pkg/apis/machineconfiguration.openshift.io/v1"
 	"github.com/pkg/errors"
@@ -319,6 +321,29 @@ var _ = Describe("chrony manifest", func() {
 
 		})
 
+		It("CreateClusterManifest success - TNA cluster", func() {
+			arbiterHost := createHost([]*models.NtpSource{
+				common.TestNTPSourceSynced,
+				common.TestNTPSourceUnsynced,
+			})
+			arbiterHost.Role = models.HostRoleArbiter
+			cluster.Hosts = append(cluster.Hosts, arbiterHost)
+			manifestsApi.EXPECT().CreateClusterManifestInternal(gomock.Any(), gomock.Any(), false).Return(&models.Manifest{
+				FileName: "50-masters-chrony-configuration.yaml",
+				Folder:   models.ManifestFolderOpenshift,
+			}, nil).Times(1)
+			manifestsApi.EXPECT().CreateClusterManifestInternal(gomock.Any(), gomock.Any(), false).Return(&models.Manifest{
+				FileName: "50-arbiters-chrony-configuration.yaml",
+				Folder:   models.ManifestFolderOpenshift,
+			}, nil).Times(1)
+			manifestsApi.EXPECT().CreateClusterManifestInternal(gomock.Any(), gomock.Any(), false).Return(&models.Manifest{
+				FileName: "50-workers-chrony-configuration.yaml",
+				Folder:   models.ManifestFolderOpenshift,
+			}, nil).Times(1)
+			Expect(ntpUtils.AddChronyManifest(ctx, log, cluster)).ShouldNot(HaveOccurred())
+
+		})
+
 		It("CreateClusterManifest failure", func() {
 			fileName := "50-masters-chrony-configuration.yaml"
 			manifestsApi.EXPECT().CreateClusterManifestInternal(gomock.Any(), gomock.Any(), false).Return(nil, errors.Errorf("Failed to create manifest %s", fileName)).Times(1)
@@ -343,6 +368,26 @@ var _ = Describe("dnsmasq manifest", func() {
 	})
 
 	Context("Create dnsmasq Manifest", func() {
+		extractDnsmasqScript := func(machineConfigBytes []byte) string {
+			var machineConfig *mcfgv1.MachineConfig
+			err := yaml.Unmarshal(machineConfigBytes, &machineConfig)
+			Expect(err).ToNot(HaveOccurred())
+			config, _, err := configv31.Parse(machineConfig.Spec.Config.Raw)
+			Expect(err).ToNot(HaveOccurred())
+			var source string
+			for _, file := range config.Storage.Files {
+				if file.Path == "/usr/local/bin/dnsmasq_config.sh" {
+					Expect(file.Contents.Source).ToNot(BeNil())
+					source = *file.Contents.Source
+					break
+				}
+			}
+			Expect(source).ToNot(BeEmpty())
+			data, err := dataurl.DecodeString(source)
+			Expect(err).ToNot(HaveOccurred())
+			return string(data.Data)
+		}
+
 		It("Happy flow", func() {
 			cluster := createCluster("", "3.3.3.0/24",
 				createInventory(createInterface("3.3.3.3/24")))
@@ -475,6 +520,38 @@ var _ = Describe("dnsmasq manifest", func() {
 			Expect(created).To(ContainSubstring(base64.StdEncoding.EncodeToString(forcedns)))
 		})
 
+		It("includes RHODS dashboard DNS when OpenShift AI operator is enabled", func() {
+			cluster := createCluster("", "3.3.3.0/24",
+				createInventory(createInterface("3.3.3.3/24")))
+			cluster.Hosts[0].Bootstrap = true
+			cluster.Cluster.BaseDNSDomain = "test.com"
+			cluster.Cluster.Name = "test"
+			cluster.MonitoredOperators = []*models.MonitoredOperator{
+				{Name: openshiftai.Operator.Name},
+			}
+
+			created, err := createDnsmasqForSingleNode(logrus.New(), cluster)
+			Expect(err).To(Not(HaveOccurred()))
+
+			dnsmasqScript := extractDnsmasqScript(created)
+			Expect(dnsmasqScript).To(ContainSubstring("rhods-dashboard-redhat-ods-applications.apps.${CLUSTER_FULL_DOMAIN}"))
+		})
+
+		It("does not include RHODS dashboard DNS when OpenShift AI operator is not enabled", func() {
+			cluster := createCluster("", "3.3.3.0/24",
+				createInventory(createInterface("3.3.3.3/24")))
+			cluster.Hosts[0].Bootstrap = true
+			cluster.Cluster.BaseDNSDomain = "test.com"
+			cluster.Cluster.Name = "test"
+			cluster.MonitoredOperators = nil
+
+			created, err := createDnsmasqForSingleNode(logrus.New(), cluster)
+			Expect(err).To(Not(HaveOccurred()))
+
+			dnsmasqScript := extractDnsmasqScript(created)
+			Expect(dnsmasqScript).NotTo(ContainSubstring("rhods-dashboard-redhat-ods-applications"))
+		})
+
 		It("no bootstrap", func() {
 			cluster := createCluster("", "3.3.3.0/24",
 				createInventory(createInterface("3.3.3.3/24")))
@@ -579,7 +656,6 @@ var _ = Describe("telemeter manifest", func() {
 			envName: "Other envs",
 		},
 	} {
-		test := test
 		Context(test.envName, func() {
 
 			BeforeEach(func() {
@@ -702,9 +778,10 @@ var _ = Describe("disk encryption manifest", func() {
 		name           string
 		diskEncryption *models.DiskEncryption
 		numOfManifests int
+		isTNA          bool
 	}{
 		{
-			name: "masters and workers, tpmv2",
+			name: "all, tpmv2",
 			diskEncryption: &models.DiskEncryption{
 				EnableOn: swag.String(models.DiskEncryptionEnableOnAll),
 				Mode:     swag.String(models.DiskEncryptionModeTpmv2),
@@ -712,7 +789,16 @@ var _ = Describe("disk encryption manifest", func() {
 			numOfManifests: 2,
 		},
 		{
-			name: "masters and workers, tang",
+			name: "all, tpmv2 - TNA cluster",
+			diskEncryption: &models.DiskEncryption{
+				EnableOn: swag.String(models.DiskEncryptionEnableOnAll),
+				Mode:     swag.String(models.DiskEncryptionModeTpmv2),
+			},
+			numOfManifests: 3,
+			isTNA:          true,
+		},
+		{
+			name: "all, tang",
 			diskEncryption: &models.DiskEncryption{
 				EnableOn:    swag.String(models.DiskEncryptionEnableOnAll),
 				Mode:        swag.String(models.DiskEncryptionModeTang),
@@ -721,12 +807,175 @@ var _ = Describe("disk encryption manifest", func() {
 			numOfManifests: 2,
 		},
 		{
+			name: "all, tang - TNA cluster",
+			diskEncryption: &models.DiskEncryption{
+				EnableOn:    swag.String(models.DiskEncryptionEnableOnAll),
+				Mode:        swag.String(models.DiskEncryptionModeTang),
+				TangServers: `[{"url":"http://tang.invalid","thumbprint":"PLjNyRdGw03zlRoGjQYMahSZGu9"}]`,
+			},
+			numOfManifests: 3,
+			isTNA:          true,
+		},
+		{
+			name: "masters,arbiters,workers, tpmv2",
+			diskEncryption: &models.DiskEncryption{
+				EnableOn: swag.String(models.DiskEncryptionEnableOnMastersArbitersWorkers),
+				Mode:     swag.String(models.DiskEncryptionModeTpmv2),
+			},
+			numOfManifests: 2,
+		},
+		{
+			name: "masters,arbiters,workers, tpmv2 - TNA cluster",
+			diskEncryption: &models.DiskEncryption{
+				EnableOn: swag.String(models.DiskEncryptionEnableOnMastersArbitersWorkers),
+				Mode:     swag.String(models.DiskEncryptionModeTpmv2),
+			},
+			numOfManifests: 3,
+			isTNA:          true,
+		},
+		{
+			name: "masters,arbiters,workers, tang",
+			diskEncryption: &models.DiskEncryption{
+				EnableOn:    swag.String(models.DiskEncryptionEnableOnMastersArbitersWorkers),
+				Mode:        swag.String(models.DiskEncryptionModeTang),
+				TangServers: `[{"url":"http://tang.invalid","thumbprint":"PLjNyRdGw03zlRoGjQYMahSZGu9"}]`,
+			},
+			numOfManifests: 2,
+		},
+		{
+			name: "masters,arbiters,workers, tang - TNA cluster",
+			diskEncryption: &models.DiskEncryption{
+				EnableOn:    swag.String(models.DiskEncryptionEnableOnMastersArbitersWorkers),
+				Mode:        swag.String(models.DiskEncryptionModeTang),
+				TangServers: `[{"url":"http://tang.invalid","thumbprint":"PLjNyRdGw03zlRoGjQYMahSZGu9"}]`,
+			},
+			numOfManifests: 3,
+			isTNA:          true,
+		},
+		{
+			name: "masters,arbiters, tpmv2",
+			diskEncryption: &models.DiskEncryption{
+				EnableOn: swag.String(models.DiskEncryptionEnableOnMastersArbiters),
+				Mode:     swag.String(models.DiskEncryptionModeTpmv2),
+			},
+			numOfManifests: 1,
+		},
+		{
+			name: "masters,arbiters, tpmv2 - TNA cluster",
+			diskEncryption: &models.DiskEncryption{
+				EnableOn: swag.String(models.DiskEncryptionEnableOnMastersArbiters),
+				Mode:     swag.String(models.DiskEncryptionModeTpmv2),
+			},
+			numOfManifests: 2,
+			isTNA:          true,
+		},
+		{
+			name: "masters,arbiters, tang",
+			diskEncryption: &models.DiskEncryption{
+				EnableOn:    swag.String(models.DiskEncryptionEnableOnMastersArbiters),
+				Mode:        swag.String(models.DiskEncryptionModeTang),
+				TangServers: `[{"url":"http://tang.invalid","thumbprint":"PLjNyRdGw03zlRoGjQYMahSZGu9"}]`,
+			},
+			numOfManifests: 1,
+		},
+		{
+			name: "masters,arbiters, tang - TNA cluster",
+			diskEncryption: &models.DiskEncryption{
+				EnableOn:    swag.String(models.DiskEncryptionEnableOnMastersArbiters),
+				Mode:        swag.String(models.DiskEncryptionModeTang),
+				TangServers: `[{"url":"http://tang.invalid","thumbprint":"PLjNyRdGw03zlRoGjQYMahSZGu9"}]`,
+			},
+			numOfManifests: 2,
+			isTNA:          true,
+		},
+		{
+			name: "masters,workers, tpmv2",
+			diskEncryption: &models.DiskEncryption{
+				EnableOn: swag.String(models.DiskEncryptionEnableOnMastersWorkers),
+				Mode:     swag.String(models.DiskEncryptionModeTpmv2),
+			},
+			numOfManifests: 2,
+		},
+		{
+			name: "masters,workers, tpmv2 - TNA cluster",
+			diskEncryption: &models.DiskEncryption{
+				EnableOn: swag.String(models.DiskEncryptionEnableOnMastersWorkers),
+				Mode:     swag.String(models.DiskEncryptionModeTpmv2),
+			},
+			numOfManifests: 2,
+			isTNA:          true,
+		},
+		{
+			name: "masters,workers, tang",
+			diskEncryption: &models.DiskEncryption{
+				EnableOn:    swag.String(models.DiskEncryptionEnableOnMastersWorkers),
+				Mode:        swag.String(models.DiskEncryptionModeTang),
+				TangServers: `[{"url":"http://tang.invalid","thumbprint":"PLjNyRdGw03zlRoGjQYMahSZGu9"}]`,
+			},
+			numOfManifests: 2,
+		},
+		{
+			name: "masters,workers, tang - TNA cluster",
+			diskEncryption: &models.DiskEncryption{
+				EnableOn:    swag.String(models.DiskEncryptionEnableOnMastersWorkers),
+				Mode:        swag.String(models.DiskEncryptionModeTang),
+				TangServers: `[{"url":"http://tang.invalid","thumbprint":"PLjNyRdGw03zlRoGjQYMahSZGu9"}]`,
+			},
+			numOfManifests: 2,
+			isTNA:          true,
+		},
+		{
+			name: "arbiters,workers, tpmv2",
+			diskEncryption: &models.DiskEncryption{
+				EnableOn: swag.String(models.DiskEncryptionEnableOnArbitersWorkers),
+				Mode:     swag.String(models.DiskEncryptionModeTpmv2),
+			},
+			numOfManifests: 1,
+		},
+		{
+			name: "arbiters,workers, tpmv2 - TNA cluster",
+			diskEncryption: &models.DiskEncryption{
+				EnableOn: swag.String(models.DiskEncryptionEnableOnArbitersWorkers),
+				Mode:     swag.String(models.DiskEncryptionModeTpmv2),
+			},
+			numOfManifests: 2,
+			isTNA:          true,
+		},
+		{
+			name: "arbiters,workers, tang",
+			diskEncryption: &models.DiskEncryption{
+				EnableOn:    swag.String(models.DiskEncryptionEnableOnArbitersWorkers),
+				Mode:        swag.String(models.DiskEncryptionModeTang),
+				TangServers: `[{"url":"http://tang.invalid","thumbprint":"PLjNyRdGw03zlRoGjQYMahSZGu9"}]`,
+			},
+			numOfManifests: 1,
+		},
+		{
+			name: "arbiters,workers, tang - TNA cluster",
+			diskEncryption: &models.DiskEncryption{
+				EnableOn:    swag.String(models.DiskEncryptionEnableOnArbitersWorkers),
+				Mode:        swag.String(models.DiskEncryptionModeTang),
+				TangServers: `[{"url":"http://tang.invalid","thumbprint":"PLjNyRdGw03zlRoGjQYMahSZGu9"}]`,
+			},
+			numOfManifests: 2,
+			isTNA:          true,
+		},
+		{
 			name: "masters only, tpmv2",
 			diskEncryption: &models.DiskEncryption{
 				EnableOn: swag.String(models.DiskEncryptionEnableOnMasters),
 				Mode:     swag.String(models.DiskEncryptionModeTpmv2),
 			},
 			numOfManifests: 1,
+		},
+		{
+			name: "masters only, tpmv2 - TNA cluster",
+			diskEncryption: &models.DiskEncryption{
+				EnableOn: swag.String(models.DiskEncryptionEnableOnMasters),
+				Mode:     swag.String(models.DiskEncryptionModeTpmv2),
+			},
+			numOfManifests: 1,
+			isTNA:          true,
 		},
 		{
 			name: "masters only, tang",
@@ -738,12 +987,67 @@ var _ = Describe("disk encryption manifest", func() {
 			numOfManifests: 1,
 		},
 		{
+			name: "masters only, tang - TNA cluster",
+			diskEncryption: &models.DiskEncryption{
+				EnableOn:    swag.String(models.DiskEncryptionEnableOnMasters),
+				Mode:        swag.String(models.DiskEncryptionModeTang),
+				TangServers: `[{"url":"http://tang.invalid","thumbprint":"PLjNyRdGw03zlRoGjQYMahSZGu9"}]`,
+			},
+			numOfManifests: 1,
+			isTNA:          true,
+		},
+		{
+			name: "arbiters only, tpmv2",
+			diskEncryption: &models.DiskEncryption{
+				EnableOn: swag.String(models.DiskEncryptionEnableOnArbiters),
+				Mode:     swag.String(models.DiskEncryptionModeTpmv2),
+			},
+			numOfManifests: 0,
+		},
+		{
+			name: "arbiters only, tpmv2 - TNA cluster",
+			diskEncryption: &models.DiskEncryption{
+				EnableOn: swag.String(models.DiskEncryptionEnableOnArbiters),
+				Mode:     swag.String(models.DiskEncryptionModeTpmv2),
+			},
+			numOfManifests: 1,
+			isTNA:          true,
+		},
+		{
+			name: "arbiters only, tang",
+			diskEncryption: &models.DiskEncryption{
+				EnableOn:    swag.String(models.DiskEncryptionEnableOnArbiters),
+				Mode:        swag.String(models.DiskEncryptionModeTang),
+				TangServers: `[{"url":"http://tang.invalid","thumbprint":"PLjNyRdGw03zlRoGjQYMahSZGu9"}]`,
+			},
+			numOfManifests: 0,
+		},
+		{
+			name: "arbiters only, tang - TNA cluster",
+			diskEncryption: &models.DiskEncryption{
+				EnableOn:    swag.String(models.DiskEncryptionEnableOnArbiters),
+				Mode:        swag.String(models.DiskEncryptionModeTang),
+				TangServers: `[{"url":"http://tang.invalid","thumbprint":"PLjNyRdGw03zlRoGjQYMahSZGu9"}]`,
+			},
+			numOfManifests: 1,
+			isTNA:          true,
+		},
+		{
 			name: "workers only, tpmv2",
 			diskEncryption: &models.DiskEncryption{
 				EnableOn: swag.String(models.DiskEncryptionEnableOnWorkers),
 				Mode:     swag.String(models.DiskEncryptionModeTpmv2),
 			},
 			numOfManifests: 1,
+		},
+		{
+			name: "workers only, tpmv2 - TNA cluster",
+			diskEncryption: &models.DiskEncryption{
+				EnableOn: swag.String(models.DiskEncryptionEnableOnWorkers),
+				Mode:     swag.String(models.DiskEncryptionModeTpmv2),
+			},
+			numOfManifests: 1,
+			isTNA:          true,
 		},
 		{
 			name: "workers only, tang",
@@ -755,6 +1059,16 @@ var _ = Describe("disk encryption manifest", func() {
 			numOfManifests: 1,
 		},
 		{
+			name: "workers only, tang",
+			diskEncryption: &models.DiskEncryption{
+				EnableOn:    swag.String(models.DiskEncryptionEnableOnWorkers),
+				Mode:        swag.String(models.DiskEncryptionModeTang),
+				TangServers: `[{"url":"http://tang.invalid","thumbprint":"PLjNyRdGw03zlRoGjQYMahSZGu9"}]`,
+			},
+			numOfManifests: 1,
+			isTNA:          true,
+		},
+		{
 			name: "disks encryption not set",
 			// This is the default values for disk_encryption
 			diskEncryption: &models.DiskEncryption{
@@ -764,14 +1078,90 @@ var _ = Describe("disk encryption manifest", func() {
 			numOfManifests: 0,
 		},
 	} {
-		t := t
-
 		It(t.name, func() {
 			c.DiskEncryption = t.diskEncryption
+			if t.isTNA {
+				id := strfmt.UUID(uuid.New().String())
+				c.Hosts = []*models.Host{
+					{
+						ID:        &id,
+						ClusterID: c.ID,
+						Role:      models.HostRoleArbiter,
+					},
+				}
+			}
 			Expect(db.Create(&c).Error).NotTo(HaveOccurred())
 			mockManifestsApi.EXPECT().CreateClusterManifestInternal(ctx, gomock.Any(), false).Times(t.numOfManifests)
 			err := manifestsGeneratorApi.AddDiskEncryptionManifest(ctx, log, &c)
 			Expect(err).ToNot(HaveOccurred())
+		})
+	}
+})
+
+var _ = Describe("GetDiskEncryptionCipher", func() {
+	var (
+		log            *logrus.Logger
+		ctrl           *gomock.Controller
+		manifestsApi   *manifestsapi.MockManifestsAPI
+		mockSystemInfo *system.MockSystemInfo
+	)
+
+	BeforeEach(func() {
+		log = logrus.New()
+		ctrl = gomock.NewController(GinkgoT())
+		manifestsApi = manifestsapi.NewMockManifestsAPI(ctrl)
+		mockSystemInfo = system.NewMockSystemInfo(ctrl)
+	})
+
+	AfterEach(func() {
+		ctrl.Finish()
+	})
+
+	for _, t := range []struct {
+		name           string
+		fipsEnabled    bool
+		fipsError      bool
+		configCipher   string
+		expectedCipher string
+	}{
+		{
+			name:           "FIPS enabled",
+			fipsEnabled:    true,
+			expectedCipher: "aes-xts-plain64",
+		},
+		{
+			name:           "FIPS disabled",
+			fipsEnabled:    false,
+			expectedCipher: "aes-cbc-essiv:sha256",
+		},
+		{
+			name:           "explicit config",
+			configCipher:   "custom-cipher",
+			expectedCipher: "custom-cipher",
+		},
+		{
+			name:           "FIPS check error",
+			fipsError:      true,
+			expectedCipher: "aes-cbc-essiv:sha256",
+		},
+	} {
+		It(t.name, func() {
+			if t.configCipher == "" {
+				if t.fipsError {
+					mockSystemInfo.EXPECT().FIPSEnabled().Return(false, errors.New("failed to check FIPS status"))
+				} else {
+					mockSystemInfo.EXPECT().FIPSEnabled().Return(t.fipsEnabled, nil)
+				}
+			}
+
+			manifestsGeneratorApi := &ManifestsGenerator{
+				manifestsApi: manifestsApi,
+				Config:       Config{DiskEncryptionCipher: t.configCipher},
+				systemInfo:   mockSystemInfo,
+			}
+
+			cipher := manifestsGeneratorApi.GetDiskEncryptionCipher(log)
+			Expect(cipher).To(Equal(t.expectedCipher))
 		})
 	}
 })
@@ -867,7 +1257,7 @@ var _ = Describe("nic reaaply manifest", func() {
 			cluster.Cluster.Hosts = []*models.Host{&hostWithMultipathiSCSI, &hostWithSSD}
 			Expect(manifestsGeneratorApi.AddNicReapply(ctx, log, &cluster)).ShouldNot(HaveOccurred())
 		})
-		It("not added when one of the host installs on an Multipath FC drive", func() {
+		It("added when one of the host installs on an Multipath FC drive (manifest is always added)", func() {
 			inventory := fmt.Sprintf(`{
 			"disks":[
 				{
@@ -887,10 +1277,18 @@ var _ = Describe("nic reaaply manifest", func() {
 				Inventory:          inventory,
 				InstallationDiskID: "install-id",
 			}
+			manifestsApi.EXPECT().CreateClusterManifestInternal(gomock.Any(), gomock.Any(), false).Times(2).Return(&models.Manifest{
+				FileName: "manifest.yaml",
+				Folder:   models.ManifestFolderOpenshift,
+			}, nil)
 			cluster.Cluster.Hosts = []*models.Host{&hostWithMultipathFC, &hostWithSSD}
 			Expect(manifestsGeneratorApi.AddNicReapply(ctx, log, &cluster)).ShouldNot(HaveOccurred())
 		})
-		It("not added when no hosts installs on an iSCSI/ Multipath iSCSI drive", func() {
+		It("added even when no hosts install on an iSCSI drive to support day2 hosts", func() {
+			manifestsApi.EXPECT().CreateClusterManifestInternal(gomock.Any(), gomock.Any(), false).Times(2).Return(&models.Manifest{
+				FileName: "manifest.yaml",
+				Folder:   models.ManifestFolderOpenshift,
+			}, nil)
 			cluster.Cluster.Hosts = []*models.Host{&hostWithSSD, &hostWithSSD}
 			Expect(manifestsGeneratorApi.AddNicReapply(ctx, log, &cluster)).ShouldNot(HaveOccurred())
 		})

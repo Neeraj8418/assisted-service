@@ -3,6 +3,7 @@ package hardware
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"net/netip"
@@ -11,7 +12,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/dustin/go-humanize"
 	"github.com/go-openapi/swag"
 	"github.com/openshift/assisted-service/internal/common"
 	"github.com/openshift/assisted-service/internal/feature"
@@ -23,6 +23,7 @@ import (
 	"github.com/openshift/assisted-service/pkg/conversions"
 	"github.com/samber/lo"
 	"github.com/sirupsen/logrus"
+	"github.com/thoas/go-funk"
 	"k8s.io/utils/ptr"
 )
 
@@ -33,6 +34,9 @@ const (
 	mixedTypesInMultipath                   = "Multipath device has paths of different types, but they must all be the same type"
 	wrongISCSINetworkTemplate               = "iSCSI host IP %s is the same as host IP, they must be different"
 	ErrsInIscsiDisableMultipathInstallation = "Installation on multipath device is not possible due to errors on at least one iSCSI disk"
+	iscsiHostIPNotAvailable                 = "Host IP address is not available"
+	iscsiNetworkInterfaceNotFound           = "Cannot find the network interface behind the default route"
+	iscsiHostIPParseErrorTemplate           = "Cannot parse iSCSI host IP %s: %w"
 )
 
 //go:generate mockgen -source=validator.go -package=hardware -destination=mock_validator.go
@@ -56,6 +60,12 @@ func NewValidator(log logrus.FieldLogger, cfg ValidatorCfg, operatorsAPI operato
 		compileDiskReasonTemplate(tooSmallDiskTemplate, ".*", ".*"),
 		compileDiskReasonTemplate(wrongDriveTypeTemplate, ".*", ".*"),
 		compileDiskReasonTemplate(wrongMultipathTypeTemplate, ".*"),
+		compileDiskReasonTemplate(mixedTypesInMultipath),
+		compileDiskReasonTemplate(wrongISCSINetworkTemplate, ".*"),
+		compileDiskReasonTemplate(ErrsInIscsiDisableMultipathInstallation),
+		compileDiskReasonTemplate(iscsiHostIPNotAvailable),
+		compileDiskReasonTemplate(iscsiNetworkInterfaceNotFound),
+		compileDiskReasonTemplate(iscsiHostIPParseErrorTemplate, ".*", ".*"),
 	}
 
 	return &validator{
@@ -136,10 +146,17 @@ func (v *validator) DiskIsEligible(ctx context.Context, disk *models.Disk, infra
 
 	minSizeBytes := conversions.GbToBytes(requirements.Total.DiskSizeGb)
 	if disk.SizeBytes < minSizeBytes {
+		hasStr := preciseHumanizeBytes(disk.SizeBytes)
+		reqStr := preciseHumanizeBytes(minSizeBytes)
+		if hasStr == reqStr {
+			delta := minSizeBytes - disk.SizeBytes
+			deltaStr := preciseHumanizeBytes(delta)
+			hasStr = fmt.Sprintf("%s (short by %s)", hasStr, deltaStr)
+		}
 		notEligibleReasons = append(notEligibleReasons,
 			fmt.Sprintf(
 				tooSmallDiskTemplate,
-				humanize.Bytes(uint64(disk.SizeBytes)), humanize.Bytes(uint64(minSizeBytes))))
+				hasStr, reqStr))
 	}
 
 	hostArchitecture := inventory.CPU.Architecture
@@ -196,13 +213,13 @@ func (v *validator) DiskIsEligible(ctx context.Context, disk *models.Disk, infra
 // which is used by the default gateway.
 func isISCSINetworkingValid(disk *models.Disk, inventory *models.Inventory) error {
 	// get the IPv4 or the IPv6 of the interface connected to the iSCSI target
-	if disk.Iscsi == nil {
-		return fmt.Errorf("Host IP address is not available")
-
+	if disk.Iscsi == nil || disk.Iscsi.HostIPAddress == "" {
+		return errors.New(iscsiHostIPNotAvailable)
 	}
+
 	iSCSIHostIP, err := netip.ParseAddr(disk.Iscsi.HostIPAddress)
 	if err != nil {
-		return fmt.Errorf("Cannot parse iSCSI host IP %s: %w", disk.Iscsi.HostIPAddress, err)
+		return fmt.Errorf(iscsiHostIPParseErrorTemplate, disk.Iscsi.HostIPAddress, err)
 	}
 
 	defaultRoute := network.GetDefaultRouteByFamily(inventory.Routes, iSCSIHostIP.Is6())
@@ -214,7 +231,7 @@ func isISCSINetworkingValid(disk *models.Disk, inventory *models.Inventory) erro
 		return i.Name == defaultRoute.Interface
 	})
 	if !ok {
-		return fmt.Errorf("Cannot find the network interface behind the default route")
+		return errors.New(iscsiNetworkInterfaceNotFound)
 	}
 
 	// look if one of the IP assigned to the default interface interface
@@ -260,9 +277,15 @@ func (v *validator) ListEligibleDisks(inventory *models.Inventory) []*models.Dis
 		return disk.InstallationEligibility.Eligible
 	})
 
-	// Sorting list by size increase
+	// Sorting disks by installation preference
 	sort.Slice(eligibleDisks, func(i, j int) bool {
-		// 1. First, choose non-NVMe drives before NVMe drives (leave
+		// 1. Prefer bootable disks (installing to a non-bootable disk
+		// will result in a failed installation)
+		if eligibleDisks[i].Bootable != eligibleDisks[j].Bootable {
+			return eligibleDisks[i].Bootable
+		}
+
+		// 2. Choose non-NVMe drives before NVMe drives (leave
 		// the faster drives for workload storage)
 		isNvme1 := isNvme(eligibleDisks[i].Name)
 		isNvme2 := isNvme(eligibleDisks[j].Name)
@@ -272,19 +295,19 @@ func (v *validator) ListEligibleDisks(inventory *models.Inventory) []*models.Dis
 			return isNvme2
 		}
 
-		// 2. Sort by DriveType - HDD before SSD (leave the faster
+		// 3. Sort by DriveType - HDD before SSD (leave the faster
 		// drives for workload storage)
 		if v := strings.Compare(string(eligibleDisks[i].DriveType), string(eligibleDisks[j].DriveType)); v != 0 {
 			return v < 0
 		}
 
-		// 3. Sort according to disk size (use the smallest valid
+		// 4. Sort according to disk size (use the smallest valid
 		// disk size to leave more capacity for workload storage)
 		if eligibleDisks[i].SizeBytes != eligibleDisks[j].SizeBytes {
 			return eligibleDisks[i].SizeBytes < eligibleDisks[j].SizeBytes
 		}
 
-		// 4. Sort according to HCTL which indicates physical order
+		// 5. Sort according to HCTL which indicates physical order
 		// (increases the chance of booting from the correct disk
 		// after reboot)
 		return eligibleDisks[i].Hctl < eligibleDisks[j].Hctl
@@ -317,6 +340,10 @@ func (v *validator) GetInfraEnvHostRequirements(ctx context.Context, infraEnv *c
 	if err != nil {
 		return nil, err
 	}
+	arbiterOcpRequirements, err := v.getOCPInfraEnvHostRoleRequirementsForVersion(infraEnv, models.HostRoleArbiter)
+	if err != nil {
+		return nil, err
+	}
 	workerOcpRequirements, err := v.getOCPInfraEnvHostRoleRequirementsForVersion(infraEnv, models.HostRoleWorker)
 	if err != nil {
 		return nil, err
@@ -325,6 +352,9 @@ func (v *validator) GetInfraEnvHostRequirements(ctx context.Context, infraEnv *c
 	requirements := &workerOcpRequirements
 	if workerOcpRequirements.DiskSizeGb > masterOcpRequirements.DiskSizeGb {
 		requirements = &masterOcpRequirements
+	}
+	if requirements.DiskSizeGb > arbiterOcpRequirements.DiskSizeGb {
+		requirements = &arbiterOcpRequirements
 	}
 
 	return &models.ClusterHostRequirements{
@@ -351,15 +381,23 @@ func (v *validator) GetPreflightHardwareRequirements(ctx context.Context, cluste
 		return nil, err
 	}
 	if isDiskEncryptionSetWithTpm(cluster) {
-		switch swag.StringValue(cluster.DiskEncryption.EnableOn) {
-		case models.DiskEncryptionEnableOnAll:
+		valid := false
+		isDiskEncryptionOnAll := swag.StringValue(cluster.DiskEncryption.EnableOn) == models.DiskEncryptionEnableOnAll
+		enabledGroups := strings.Split(swag.StringValue(cluster.DiskEncryption.EnableOn), ",")
+
+		if isDiskEncryptionOnAll || funk.ContainsString(enabledGroups, models.DiskEncryptionEnableOnMasters) {
+			valid = true
 			ocpRequirements.Master.Quantitative.TpmEnabledInBios = true
+		}
+		if isDiskEncryptionOnAll || funk.ContainsString(enabledGroups, models.DiskEncryptionEnableOnArbiters) {
+			valid = true
+		}
+		if isDiskEncryptionOnAll || funk.ContainsString(enabledGroups, models.DiskEncryptionEnableOnWorkers) {
+			valid = true
 			ocpRequirements.Worker.Quantitative.TpmEnabledInBios = true
-		case models.DiskEncryptionEnableOnMasters:
-			ocpRequirements.Master.Quantitative.TpmEnabledInBios = true
-		case models.DiskEncryptionEnableOnWorkers:
-			ocpRequirements.Worker.Quantitative.TpmEnabledInBios = true
-		default:
+		}
+
+		if !valid {
 			return nil, fmt.Errorf("disk-encryption is enabled on non-valid role: %s", swag.StringValue(cluster.DiskEncryption.EnableOn))
 		}
 	}
@@ -435,6 +473,10 @@ func (v *validator) getOCPClusterHostRoleRequirementsForVersion(cluster *common.
 		return *requirements.MasterRequirements, nil
 	}
 
+	if common.GetEffectiveRole(host) == models.HostRoleArbiter {
+		return *requirements.ArbiterRequirements, nil
+	}
+
 	if v.isEdgeWorker(host) {
 		return *requirements.EdgeWorkerRequirements, nil
 	}
@@ -463,6 +505,9 @@ func (v *validator) getOCPInfraEnvHostRoleRequirementsForVersion(infraEnv *commo
 
 	if role == models.HostRoleMaster {
 		return *requirements.MasterRequirements, nil
+	}
+	if role == models.HostRoleArbiter {
+		return *requirements.ArbiterRequirements, nil
 	}
 	if role == models.HostRoleWorker || role == models.HostRoleAutoAssign {
 		return *requirements.WorkerRequirements, nil
@@ -541,4 +586,47 @@ func compileDiskReasonTemplate(template string, wildcards ...interface{}) *regex
 		panic(err)
 	}
 	return tmp
+}
+
+// preciseHumanizeBytes formats a byte size using SI units (KB, MB, GB, TB).
+// It displays one decimal place for non-integer values and rounds up to avoid
+// under-reporting the capacity in user-facing messages.
+func preciseHumanizeBytes(bytes int64) string {
+	const (
+		KB = 1000
+		MB = 1000 * KB
+		GB = 1000 * MB
+		TB = 1000 * GB
+	)
+
+	switch {
+	case bytes >= TB:
+		tb := float64(bytes) / float64(TB)
+		return formatUnitRoundedUp(tb, "TB")
+	case bytes >= GB:
+		gb := float64(bytes) / float64(GB)
+		return formatUnitRoundedUp(gb, "GB")
+	case bytes >= MB:
+		mb := float64(bytes) / float64(MB)
+		return formatUnitRoundedUp(mb, "MB")
+	case bytes >= KB:
+		kb := float64(bytes) / float64(KB)
+		return formatUnitRoundedUp(kb, "KB")
+	default:
+		return fmt.Sprintf("%d B", bytes)
+	}
+}
+
+// formatUnitRoundedUp returns either an integer or up to three-decimal string
+// for the given value and unit label, rounding up to the nearest thousandth.
+func formatUnitRoundedUp(value float64, unit string) string {
+	rounded := math.Ceil(value*1000) / 1000
+	if rounded == float64(int64(rounded)) {
+		return fmt.Sprintf("%d %s", int64(rounded), unit)
+	}
+	// Format with 3 decimals then trim trailing zeros and optional dot
+	str := fmt.Sprintf("%.3f", rounded)
+	str = strings.TrimRight(str, "0")
+	str = strings.TrimSuffix(str, ".")
+	return fmt.Sprintf("%s %s", str, unit)
 }

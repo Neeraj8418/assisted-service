@@ -50,11 +50,13 @@ const (
 	mirrorRegistryRefCertKey         = caBundleKey
 	mirrorRegistryRefRegistryConfKey = "registries.conf"
 	mirrorRegistryConfigVolume       = "mirror-registry-config"
+	mirrorRegistryCertBundleVolume   = "mirror-registry-ca-bundle"
 	WatchResourceLabel               = "agent-install.openshift.io/watch"
 	WatchResourceValue               = "true"
 	BackupLabel                      = "cluster.open-cluster-management.io/backup"
 	BackupLabelValue                 = "true"
 	InfraEnvLabel                    = "infraenvs.agent-install.openshift.io"
+	VeleroExcludeBackupLabel         = "velero.io/exclude-from-backup"
 )
 
 //go:generate mockgen --build_flags=--mod=mod -package=controllers -destination=mock_sub_resource_writer.go sigs.k8s.io/controller-runtime/pkg/client SubResourceWriter
@@ -69,13 +71,13 @@ func getSecret(ctx context.Context, c client.Client, r client.Reader, key types.
 	errorMessage := fmt.Sprintf("failed to get secret %s/%s from cache", key.Namespace, key.Name)
 	if err := c.Get(ctx, key, secret); err != nil {
 		if !k8serrors.IsNotFound(err) {
-			return nil, errors.Wrapf(err, errorMessage)
+			return nil, errors.Wrap(err, errorMessage)
 		}
 		// Secret not in cache; check API directly for unlabelled Secret
 		err = r.Get(ctx, key, secret)
 		if err != nil {
 			errorMessage = fmt.Sprintf("failed to get secret %s/%s from API", key.Namespace, key.Name)
-			return nil, errors.Wrapf(err, errorMessage)
+			return nil, errors.Wrap(err, errorMessage)
 		}
 	}
 	return secret, nil
@@ -94,7 +96,7 @@ func ensureSecretIsLabelled(ctx context.Context, c client.Client, secret *corev1
 		err := c.Update(ctx, secret)
 		if err != nil {
 			errorMessage := fmt.Sprintf("failed to set label %s:%s for secret %s/%s", BackupLabel, BackupLabelValue, key.Namespace, key.Name)
-			return errors.Wrapf(err, errorMessage)
+			return errors.Wrap(err, errorMessage)
 		}
 	}
 
@@ -104,7 +106,7 @@ func ensureSecretIsLabelled(ctx context.Context, c client.Client, secret *corev1
 		err := c.Update(ctx, secret)
 		if err != nil {
 			errorMessage := fmt.Sprintf("failed to set label %s:%s for secret %s/%s", WatchResourceLabel, WatchResourceValue, key.Namespace, key.Name)
-			return errors.Wrapf(err, errorMessage)
+			return errors.Wrap(err, errorMessage)
 		}
 	}
 	return nil
@@ -130,7 +132,7 @@ func ensureConfigMapIsLabelled(ctx context.Context, c client.Client, cm *corev1.
 		err := c.Update(ctx, cm)
 		if err != nil {
 			errorMessage := fmt.Sprintf("failed to set label %s:%s for configmap %s/%s", BackupLabel, BackupLabelValue, key.Namespace, key.Name)
-			return errors.Wrapf(err, errorMessage)
+			return errors.Wrap(err, errorMessage)
 		}
 	}
 
@@ -140,7 +142,7 @@ func ensureConfigMapIsLabelled(ctx context.Context, c client.Client, cm *corev1.
 		err := c.Update(ctx, cm)
 		if err != nil {
 			errorMessage := fmt.Sprintf("failed to set label %s:%s for configmap %s/%s", WatchResourceLabel, WatchResourceValue, key.Namespace, key.Name)
-			return errors.Wrapf(err, errorMessage)
+			return errors.Wrap(err, errorMessage)
 		}
 	}
 	return nil
@@ -314,7 +316,7 @@ func checksumSecret(m map[string][]byte) (string, error) {
 
 func clusterNetworksArrayToEntries(networks []*models.ClusterNetwork) []hiveext.ClusterNetworkEntry {
 	return funk.Map(networks, func(net *models.ClusterNetwork) hiveext.ClusterNetworkEntry {
-		return hiveext.ClusterNetworkEntry{CIDR: string(net.Cidr), HostPrefix: int32(net.HostPrefix)}
+		return hiveext.ClusterNetworkEntry{CIDR: string(net.Cidr), HostPrefix: int32(net.HostPrefix)} // nolint: gosec
 	}).([]hiveext.ClusterNetworkEntry)
 }
 
@@ -505,4 +507,27 @@ func spokeKubeconfigSecret(ctx context.Context, log logrus.FieldLogger, c client
 	}
 
 	return secret, nil
+}
+
+func ensureVeleroExcludeBackupLabel(ctx context.Context, log logrus.FieldLogger, c client.Client, obj client.Object) error {
+	labels := obj.GetLabels()
+	if labels == nil {
+		labels = make(map[string]string)
+	}
+
+	if val, ok := labels[VeleroExcludeBackupLabel]; ok && val == "true" {
+		return nil
+	}
+
+	patch := client.MergeFrom(obj.DeepCopyObject().(client.Object))
+	labels[VeleroExcludeBackupLabel] = "true"
+	obj.SetLabels(labels)
+
+	if err := c.Patch(ctx, obj, patch); err != nil {
+		log.WithError(err).Errorf("failed to patch %s label on %s/%s", VeleroExcludeBackupLabel, obj.GetNamespace(), obj.GetName())
+		return err
+	}
+
+	log.Debugf("Set %s label on %s/%s", VeleroExcludeBackupLabel, obj.GetNamespace(), obj.GetName())
+	return nil
 }

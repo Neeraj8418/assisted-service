@@ -3,8 +3,8 @@ package lvm
 import (
 	"context"
 	"fmt"
+	"slices"
 
-	"github.com/go-openapi/swag"
 	"github.com/kelseyhightower/envconfig"
 	"github.com/openshift/assisted-service/internal/common"
 	"github.com/openshift/assisted-service/internal/operators/api"
@@ -12,6 +12,11 @@ import (
 	"github.com/openshift/assisted-service/models"
 	logutil "github.com/openshift/assisted-service/pkg/log"
 	"github.com/sirupsen/logrus"
+)
+
+const (
+	clusterValidationID = string(models.ClusterValidationIDLvmRequirementsSatisfied)
+	hostValidationID    = string(models.HostValidationIDLvmRequirementsSatisfied)
 )
 
 // operator is an ODF LVM OLM operator plugin; it implements api.Operator
@@ -66,30 +71,48 @@ func (o *operator) GetDependencies(cluster *common.Cluster) ([]string, error) {
 	return make([]string, 0), nil
 }
 
-// GetClusterValidationID returns cluster validation ID for the Operator
-func (o *operator) GetClusterValidationID() string {
-	return string(models.ClusterValidationIDLvmRequirementsSatisfied)
+func (o *operator) GetDependenciesFeatureSupportID() []models.FeatureSupportLevelID {
+	return nil
+}
+
+// GetClusterValidationIDs returns cluster validation IDs for the Operator
+func (o *operator) GetClusterValidationIDs() []string {
+	return []string{clusterValidationID}
 }
 
 // GetHostValidationID returns host validation ID for the Operator
 func (o *operator) GetHostValidationID() string {
-	return string(models.HostValidationIDLvmRequirementsSatisfied)
+	return hostValidationID
 }
 
 // ValidateCluster always return "valid" result
-func (o *operator) ValidateCluster(_ context.Context, cluster *common.Cluster) (api.ValidationResult, error) {
+func (o *operator) ValidateCluster(_ context.Context, cluster *common.Cluster) ([]api.ValidationResult, error) {
+	result := []api.ValidationResult{{
+		Status:       api.Success,
+		ValidationId: clusterValidationID,
+	}}
+
 	if ok, _ := common.BaseVersionLessThan(LvmoMinOpenshiftVersion, cluster.OpenshiftVersion); ok {
-		message := fmt.Sprintf("Logical Volume Manager is only supported for openshift versions %s and above", LvmoMinOpenshiftVersion)
-		return api.ValidationResult{Status: api.Failure, ValidationId: o.GetClusterValidationID(), Reasons: []string{message}}, nil
+		result[0].Status = api.Failure
+		result[0].Reasons = []string{
+			fmt.Sprintf("Logical Volume Manager is only supported for openshift versions %s and above", LvmoMinOpenshiftVersion),
+		}
+
+		return result, nil
 	}
 
-	if swag.StringValue(cluster.HighAvailabilityMode) == models.ClusterHighAvailabilityModeFull {
+	if !common.IsSingleNodeCluster(cluster) {
 		if ok, _ := common.BaseVersionLessThan(LvmMinMultiNodeSupportVersion, cluster.OpenshiftVersion); ok {
-			message := fmt.Sprintf("Logical Volume Manager is only supported for highly available openshift with version %s or above", LvmMinMultiNodeSupportVersion)
-			return api.ValidationResult{Status: api.Failure, ValidationId: o.GetHostValidationID(), Reasons: []string{message}}, nil
+			result[0].Status = api.Failure
+			result[0].Reasons = []string{
+				fmt.Sprintf("Logical Volume Manager is only supported for highly available openshift with version %s or above", LvmMinMultiNodeSupportVersion),
+			}
+
+			return result, nil
 		}
 	}
-	return api.ValidationResult{Status: api.Success, ValidationId: o.GetClusterValidationID()}, nil
+
+	return result, nil
 }
 
 // ValidateHost always return "valid" result
@@ -119,7 +142,7 @@ func (o *operator) ValidateHost(ctx context.Context, cluster *common.Cluster, ho
 	}
 	message := fmt.Sprintf("Logical Volume Manager requires at least one non-installation HDD/SSD disk%s on the host", minSizeMessage)
 
-	if role == models.HostRoleWorker || areSchedulable {
+	if role == models.HostRoleWorker || (areSchedulable && role != models.HostRoleArbiter) {
 		if diskCount == 0 {
 			return api.ValidationResult{Status: api.Failure, ValidationId: o.GetHostValidationID(), Reasons: []string{message}}, nil
 		}
@@ -159,7 +182,7 @@ func (o *operator) GetHostRequirements(ctx context.Context, cluster *common.Clus
 	role := common.GetEffectiveRole(host)
 	areSchedulable := common.ShouldMastersBeSchedulable(&cluster.Cluster)
 
-	if role == models.HostRoleMaster && !areSchedulable {
+	if (role == models.HostRoleMaster && !areSchedulable) || role == models.HostRoleArbiter {
 		return &models.ClusterHostRequirementsDetails{
 			CPUCores: 0,
 			RAMMib:   0,
@@ -216,7 +239,13 @@ func (o *operator) GetFeatureSupportID() models.FeatureSupportLevelID {
 	return models.FeatureSupportLevelIDLVM
 }
 
-// GetBundleLabels returns the bundle labels for the LSO operator
-func (o *operator) GetBundleLabels() []string {
-	return []string(Operator.Bundles)
+// GetBundleLabels returns the bundle labels for the LVM operator
+func (o *operator) GetBundleLabels(featureIDs []models.FeatureSupportLevelID) []string {
+	// For SNO feature, include in openshift-ai bundle
+	if slices.Contains(featureIDs, models.FeatureSupportLevelIDSNO) {
+		return []string{"openshift-ai"}
+	}
+
+	// For non-SNO deployments, LVM is not in any bundle by default
+	return []string{}
 }

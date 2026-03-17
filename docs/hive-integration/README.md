@@ -171,6 +171,12 @@ In case that the Bare Metal Operator is installed, the Baremetal Agent Controlle
       - `bmac.agent-install.openshift.io/installer-args`
     - IgnitionConfigOverrides (optional for user to set)
       - `bmac.agent-install.openshift.io/ignition-config-overrides`
+    - ClusterReference (optional for user to set)
+      - `bmac.agent-install.openshift.io/cluster-reference`
+      - Format: `namespace/name` (e.g., `my-namespace/my-cluster`)
+      - Associates the agent with a specific ClusterDeployment
+      - Can only be used when the InfraEnv doesn't already have a cluster reference
+      - Setting an empty string ("") will clear the cluster reference
     - AgentLabels (optional for user to set)
       -  `bmac.agent-install.openshift.io.agent-label.` (prefix)
 - Reconcile the BareMetalHost hardware details by copying the Agent's inventory data to the BMH's `hardwaredetails` annotation.
@@ -212,7 +218,13 @@ The converged flow is enabled by default, you can disable the converged flow by 
 ### Ironic Agent Image
 
 The ironic agent image will be determined based on the hub release image set in the ClusterVersion resource.
-If the hub cluster architecture does not match that of the InfraEnv or if the release image cannot be retrieved for some reason a default ironic agent image will be used.
+For cases where the hub and spoke architectures are different (e.g., hub is x86_64 and spoke is arm64), the system can automatically detect the appropriate ironic agent image if:
+- The hub is using a multi-architecture release image that contains the spoke's architecture, OR
+- Two ClusterImageSets exist:
+    - one for the hub's architecture and the spoke's version
+    - one for the spoke's architecture and the spoke's version
+
+If none of the above conditions are met, and no ironic-agent-image-override annotation has been provided, a default ironic agent image will be used.
 The defaults are:
 - x86_64: `quay.io/openshift-release-dev/ocp-v4.0-art-dev@sha256:d3f1d4d3cd5fbcf1b9249dd71d01be4b901d337fdc5f8f66569eb71df4d9d446`
 - arm64: `quay.io/openshift-release-dev/ocp-v4.0-art-dev@sha256:cb0edf19fffc17f542a7efae76939b1e9757dc75782d4727fb0aa77ed5809b43`
@@ -259,6 +271,7 @@ Those examples are here for reference.
 
 You will likely need to adapt those for your own needs.
 
+* [Agent](crds/agent.yaml)
 * [InfraEnv](crds/infraEnv.yaml)
 * [InfraEnv Late Binding](crds/infraEnvLateBinding.yaml)
 * [NMState Config](crds/nmstate.yaml)

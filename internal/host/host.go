@@ -94,7 +94,7 @@ type API interface {
 	// auto assign host role
 	AutoAssignRole(ctx context.Context, h *models.Host, db *gorm.DB) (bool, error)
 	RefreshRole(ctx context.Context, h *models.Host, db *gorm.DB) error
-	IsValidMasterCandidate(h *models.Host, c *common.Cluster, db *gorm.DB, log logrus.FieldLogger, validateAgainstOperators bool) (bool, error)
+	IsValidCandidate(h *models.Host, c *common.Cluster, role models.HostRole, db *gorm.DB, log logrus.FieldLogger, validateAgainstOperators bool) (bool, error)
 	SetUploadLogsAt(ctx context.Context, h *models.Host, db *gorm.DB) error
 	UpdateLogsProgress(ctx context.Context, h *models.Host, progress string) error
 	PermanentHostsDeletion(olderThan strfmt.DateTime) error
@@ -112,6 +112,7 @@ type API interface {
 	UpdateIgnitionEndpointHTTPHeaders(ctx context.Context, h *models.Host, nodeLabelsStr string, db *gorm.DB) error
 	UpdateNodeLabels(ctx context.Context, h *models.Host, nodeLabelsStr string, db *gorm.DB) error
 	UpdateNodeSkipDiskFormatting(ctx context.Context, h *models.Host, skipDiskFormatting string, db *gorm.DB) error
+	UpdateFencing(ctx context.Context, h *models.Host, fencingCredentials string, db *gorm.DB) error
 	UpdateInstallationDisk(ctx context.Context, db *gorm.DB, h *models.Host, installationDiskId string) error
 	UpdateKubeKeyNS(ctx context.Context, hostID, namespace string) error
 	GetHostValidDisks(role *models.Host) ([]*models.Disk, error)
@@ -439,14 +440,13 @@ func (m *Manager) refreshRoleInternal(ctx context.Context, h *models.Host, db *g
 		//suggested role is already set
 		if h.Role == models.HostRoleAutoAssign &&
 			funk.ContainsString(hostStatusesBeforeInstallation[:], *h.Status) {
-			host := *h //must have a defensive copy becuase selectRole changes the host object
-			if suggestedRole, err = m.selectRole(ctx, &host, db); err == nil {
+			if suggestedRole, err = m.selectRole(ctx, h, db); err == nil {
 				m.log.Debugf("calculated role for host %s is %s (original suggested = %s)", hostutil.GetHostnameForMsg(h), suggestedRole, h.SuggestedRole)
 				if h.SuggestedRole != suggestedRole {
 					if err = updateRole(m.log, h, h.Role, suggestedRole, db, string(h.Role)); err == nil {
 						h.SuggestedRole = suggestedRole
 						m.log.Infof("suggested role for host %s is %s", *h.ID, suggestedRole)
-						eventgen.SendHostRoleUpdatedEvent(ctx, m.eventsHandler, *h.ID, h.InfraEnvID, hostutil.GetHostnameForMsg(h), string(suggestedRole))
+						eventgen.SendHostRoleUpdatedEvent(ctx, m.eventsHandler, h.ClusterID, *h.ID, h.InfraEnvID, hostutil.GetHostnameForMsg(h), string(suggestedRole))
 					}
 				}
 			}
@@ -862,6 +862,24 @@ func (m *Manager) UpdateNodeSkipDiskFormatting(ctx context.Context, h *models.Ho
 	return m.updateHost(ctx, cdb, h, updates).Error
 }
 
+func (m *Manager) UpdateFencing(ctx context.Context, h *models.Host, fencingCredentials string, db *gorm.DB) error {
+	hostStatus := swag.StringValue(h.Status)
+	if !funk.ContainsString(hostStatusesBeforeInstallationOrUnbound[:], hostStatus) {
+		return common.NewApiError(http.StatusBadRequest,
+			errors.Errorf("Host is in %s state, fencing credentials can be set only in one of %s states",
+				hostStatus, hostStatusesBeforeInstallation[:]))
+	}
+
+	h.FencingCredentials = fencingCredentials
+	cdb := m.db
+	if db != nil {
+		cdb = db
+	}
+	updates := map[string]interface{}{"fencing_credentials": h.FencingCredentials, "trigger_monitor_timestamp": time.Now()}
+
+	return m.updateHost(ctx, cdb, h, updates).Error
+}
+
 func (m *Manager) UpdateNTP(ctx context.Context, h *models.Host, ntpSources []*models.NtpSource, db *gorm.DB) error {
 	bytes, err := json.Marshal(ntpSources)
 	if err != nil {
@@ -1172,7 +1190,7 @@ func (m *Manager) reportValidationStatusChanged(ctx context.Context, vc *validat
 						hostutil.GetHostnameForMsg(h), v.ID.String())
 				} else if v.Status != previousStatus {
 					msg := fmt.Sprintf("Host %s: validation '%s' status changed from %s to %s", hostutil.GetHostnameForMsg(h), v.ID, previousStatus, v.Status)
-					log.Infof(msg)
+					log.Info(msg)
 					m.eventsHandler.NotifyInternalEvent(ctx, h.ClusterID, h.ID, &h.InfraEnvID, msg)
 				}
 			}
@@ -1265,14 +1283,14 @@ func (m *Manager) selectRole(ctx context.Context, h *models.Host, db *gorm.DB) (
 		return autoSelectedRole, errors.Wrapf(err, "failed fetching cluster with ID: %s from the DB", h.ClusterID.String())
 	}
 
-	masterCountNotIncludingHost := countNumberOfMastersNotIncludingHost(h, cluster)
+	masterCountNotIncludingHost := countNumberOfHostsInRoleNotIncludingHost(h, cluster, models.HostRoleMaster)
 	log.Debugf("Current master count not including the host: %d", masterCountNotIncludingHost)
 
 	expectedMasterCount := int(cluster.ControlPlaneCount)
 	log.Debugf("Current expected master count: %d", expectedMasterCount)
 
 	if masterCountNotIncludingHost < expectedMasterCount {
-		validMaster, err := m.IsValidMasterCandidate(h, cluster, db, log, true)
+		validMaster, err := m.IsValidCandidate(h, cluster, models.HostRoleMaster, db, log, true)
 		if err != nil {
 			return autoSelectedRole, errors.Wrapf(err, "error occurred while checking if host: %s is a valid master candidate", h.ID.String())
 		}
@@ -1282,37 +1300,61 @@ func (m *Manager) selectRole(ctx context.Context, h *models.Host, db *gorm.DB) (
 		}
 	}
 
+	if expectedMasterCount < common.MinMasterHostsNeededForInstallationInHaMode &&
+		expectedMasterCount >= common.MinMasterHostsNeededForInstallationInHaArbiterMode &&
+		countNumberOfHostsInRoleNotIncludingHost(h, cluster, models.HostRoleArbiter) == 0 {
+		validArbiter, err := m.IsValidCandidate(h, cluster, models.HostRoleArbiter, db, log, false)
+		if err != nil {
+			return autoSelectedRole, errors.Wrapf(err, "error occurred while checking if host: %s is a valid arbiter candidate", h.ID.String())
+		}
+
+		if validArbiter {
+			return models.HostRoleArbiter, nil
+		}
+	}
+
 	return models.HostRoleWorker, nil
 }
 
-func countNumberOfMastersNotIncludingHost(h *models.Host, cluster *common.Cluster) int {
+func countNumberOfHostsInRoleNotIncludingHost(h *models.Host, cluster *common.Cluster, role models.HostRole) int {
 	return lo.CountBy(cluster.Hosts, func(host *models.Host) bool {
-		return host.ID.String() != h.ID.String() && models.HostRoleMaster == common.GetEffectiveRole(host)
+		return host.ID != nil && h.ID != nil &&
+			host.ID.String() != h.ID.String() &&
+			role == common.GetEffectiveRole(host)
 	})
 }
 
-func assignMasterRoleToHost(h *models.Host, cluster *common.Cluster) error {
-	if clusterHost, ok := lo.Find(cluster.Hosts, func(host *models.Host) bool {
-		return h.ID.String() == host.ID.String()
-	}); ok {
-		clusterHost.Role = models.HostRoleMaster
-		h.Role = models.HostRoleMaster
-		return nil
-	}
-
-	return fmt.Errorf("host: %s was not found in cluster: %s", h.ID.String(), cluster.ID.String())
-}
-
-func (m *Manager) IsValidMasterCandidate(h *models.Host, c *common.Cluster, db *gorm.DB, log logrus.FieldLogger, validateAgainstOperators bool) (bool, error) {
-	if h.Role == models.HostRoleWorker {
+func (m *Manager) IsValidCandidate(h *models.Host, c *common.Cluster, role models.HostRole, db *gorm.DB, log logrus.FieldLogger, validateAgainstOperators bool) (bool, error) {
+	// in general if the host already has a role that is different from the one we want to check, then we should return false
+	// but if the host's role is bootstrap and the role we want to check is master, then we should allow it since the bootstrap is a master
+	if h.Role != models.HostRoleAutoAssign && h.Role != role &&
+		!(role == models.HostRoleMaster && h.Role == models.HostRoleBootstrap) {
 		return false, nil
 	}
 
-	cluster := *c // Make a copy to avoid changing the original cluster (host copy was already made)
+	found := false
 
-	if err := assignMasterRoleToHost(h, &cluster); err != nil {
-		return false, errors.Wrapf(err, "failed to assign master role to host: %s in cluster: %s", h.ID.String(), cluster.ID.String())
+	// struct copy
+	cluster := *c
+	// deep-copy the Hosts slice so mutations don’t leak out
+	cluster.Hosts = make([]*models.Host, len(c.Hosts))
+	for i, src := range c.Hosts {
+		dst := *src // copy the struct value
+		if src.ID != nil && h.ID != nil &&
+			src.ID.String() == h.ID.String() {
+			// point h at the copied host so we only mutate the copy
+			h = &dst
+			found = true
+		}
+		cluster.Hosts[i] = &dst
 	}
+
+	if !found {
+		return false, errors.New("host not found in cluster")
+	}
+
+	// update the copied host's role in order to run validations on it
+	h.Role = role
 
 	ctx := context.TODO()
 
@@ -1328,10 +1370,10 @@ func (m *Manager) IsValidMasterCandidate(h *models.Host, c *common.Cluster, db *
 		return false, err
 	}
 
-	return m.areMasterConditionsSatisfied(conditions, validateAgainstOperators, h, log), nil
+	return m.areRoleConditionsSatisfied(conditions, validateAgainstOperators, h, log), nil
 }
 
-func (m *Manager) areMasterConditionsSatisfied(conditions map[string]bool, validateAgainstOperators bool, h *models.Host, log logrus.FieldLogger) bool {
+func (m *Manager) areRoleConditionsSatisfied(conditions map[string]bool, validateAgainstOperators bool, h *models.Host, log logrus.FieldLogger) bool {
 	satisfied := conditions[HasCPUCoresForRole.String()] &&
 		conditions[HasMemoryForRole.String()]
 

@@ -12,14 +12,17 @@ import (
 	"github.com/go-openapi/swag"
 	"github.com/kelseyhightower/envconfig"
 	"github.com/openshift/assisted-service/internal/common"
-	"github.com/openshift/assisted-service/internal/host/hostutil"
 	manifestsapi "github.com/openshift/assisted-service/internal/manifests/api"
+	operatorcommon "github.com/openshift/assisted-service/internal/operators/common"
+	"github.com/openshift/assisted-service/internal/operators/openshiftai"
+	"github.com/openshift/assisted-service/internal/system"
 	"github.com/openshift/assisted-service/models"
 	"github.com/openshift/assisted-service/pkg/tang"
 	operations "github.com/openshift/assisted-service/restapi/operations/manifests"
 	"github.com/pkg/errors"
 	"github.com/samber/lo"
 	"github.com/sirupsen/logrus"
+	"github.com/thoas/go-funk"
 	"gorm.io/gorm"
 )
 
@@ -38,12 +41,14 @@ type ManifestsGeneratorAPI interface {
 type Config struct {
 	ServiceBaseURL          string `envconfig:"SERVICE_BASE_URL"`
 	EnableSingleNodeDnsmasq bool   `envconfig:"ENABLE_SINGLE_NODE_DNSMASQ" default:"false"`
+	DiskEncryptionCipher    string `envconfig:"DISK_ENCRYPTION_CIPHER" default:""`
 }
 
 type ManifestsGenerator struct {
 	manifestsApi manifestsapi.ManifestsAPI
 	Config       Config
 	DB           *gorm.DB
+	systemInfo   system.SystemInfo
 }
 
 func NewManifestsGenerator(manifestsApi manifestsapi.ManifestsAPI, config Config, db *gorm.DB) *ManifestsGenerator {
@@ -51,8 +56,14 @@ func NewManifestsGenerator(manifestsApi manifestsapi.ManifestsAPI, config Config
 		manifestsApi: manifestsApi,
 		Config:       config,
 		DB:           db,
+		systemInfo:   system.NewLocalSystemInfo(),
 	}
 }
+
+const (
+	cipherAesXtsPlain64     = "aes-xts-plain64"
+	cipherAesCbcEssivSha256 = "aes-cbc-essiv:sha256"
+)
 
 const defaultChronyConf = `
 pool 0.rhel.pool.ntp.org iburst
@@ -100,6 +111,7 @@ cat << EOF > /etc/dnsmasq.d/single-node.conf
 address=/apps.${CLUSTER_FULL_DOMAIN}/${HOST_IP}
 address=/api-int.${CLUSTER_FULL_DOMAIN}/${HOST_IP}
 address=/api.${CLUSTER_FULL_DOMAIN}/${HOST_IP}
+{{if .RHODS_DASHBOARD_ENABLED}}address=/rhods-dashboard-redhat-ods-applications.apps.${CLUSTER_FULL_DOMAIN}/${HOST_IP}{{end}}
 EOF
 `
 
@@ -237,7 +249,11 @@ func (m *ManifestsGenerator) createChronyManifestContent(c *common.Cluster, role
 }
 
 func (m *ManifestsGenerator) AddChronyManifest(ctx context.Context, log logrus.FieldLogger, cluster *common.Cluster) error {
-	for _, role := range []models.HostRole{models.HostRoleMaster, models.HostRoleWorker} {
+	roles := []models.HostRole{models.HostRoleMaster, models.HostRoleWorker}
+	if common.IsClusterTopologyHighlyAvailableArbiter(cluster) {
+		roles = append(roles, models.HostRoleArbiter)
+	}
+	for _, role := range roles {
 		content, err := m.createChronyManifestContent(cluster, role, log)
 
 		if err != nil {
@@ -288,7 +304,7 @@ spec:
                 thumbprint: {{ .Thumbprint }}
             {{- end }}
 		  {{- end }}
-          options: [--cipher, aes-cbc-essiv:sha256]
+          options: [--cipher, {{ .CIPHER }}]
           wipeVolume: true
       filesystems:
         - device: /dev/mapper/root
@@ -326,7 +342,9 @@ func (m *ManifestsGenerator) AddDiskEncryptionManifest(ctx context.Context, log 
 		return nil
 	}
 
-	manifestParams := map[string]interface{}{}
+	manifestParams := map[string]interface{}{
+		"CIPHER": m.GetDiskEncryptionCipher(log),
+	}
 
 	switch *c.DiskEncryption.Mode {
 
@@ -346,29 +364,25 @@ func (m *ManifestsGenerator) AddDiskEncryptionManifest(ctx context.Context, log 
 		manifestParams["TANG_SERVERS"] = tangServers
 	}
 
-	switch *c.DiskEncryption.EnableOn {
+	enabledGroups := strings.Split(swag.StringValue(c.DiskEncryption.EnableOn), ",")
+	isDiskEncryptionOnAll := swag.StringValue(c.DiskEncryption.EnableOn) == models.DiskEncryptionEnableOnAll
 
-	case models.DiskEncryptionEnableOnAll:
-
+	if isDiskEncryptionOnAll || funk.ContainsString(enabledGroups, models.DiskEncryptionEnableOnMasters) {
 		manifestParams["ROLE"] = "master"
 		if err := m.createDiskEncryptionManifest(ctx, log, c, manifestParams); err != nil {
 			return err
 		}
+	}
 
-		manifestParams["ROLE"] = "worker"
+	if (isDiskEncryptionOnAll || funk.ContainsString(enabledGroups, models.DiskEncryptionEnableOnArbiters)) &&
+		common.IsClusterTopologyHighlyAvailableArbiter(c) {
+		manifestParams["ROLE"] = "arbiter"
 		if err := m.createDiskEncryptionManifest(ctx, log, c, manifestParams); err != nil {
 			return err
 		}
+	}
 
-	case models.DiskEncryptionEnableOnMasters:
-
-		manifestParams["ROLE"] = "master"
-		if err := m.createDiskEncryptionManifest(ctx, log, c, manifestParams); err != nil {
-			return err
-		}
-
-	case models.DiskEncryptionEnableOnWorkers:
-
+	if isDiskEncryptionOnAll || funk.ContainsString(enabledGroups, models.DiskEncryptionEnableOnWorkers) {
 		manifestParams["ROLE"] = "worker"
 		if err := m.createDiskEncryptionManifest(ctx, log, c, manifestParams); err != nil {
 			return err
@@ -423,14 +437,17 @@ func createDnsmasqForSingleNode(log logrus.FieldLogger, cluster *common.Cluster)
 		return nil, err
 	}
 
+	rhodsEnabled := operatorcommon.HasOperator(cluster.MonitoredOperators, openshiftai.Operator.Name)
+
 	var manifestParams = map[string]interface{}{
-		"CLUSTER_NAME": cluster.Cluster.Name,
-		"DNS_DOMAIN":   cluster.Cluster.BaseDNSDomain,
-		"HOST_IP":      hostIp,
+		"CLUSTER_NAME":            cluster.Cluster.Name,
+		"DNS_DOMAIN":              cluster.Cluster.BaseDNSDomain,
+		"HOST_IP":                 hostIp,
+		"RHODS_DASHBOARD_ENABLED": rhodsEnabled,
 	}
 
-	log.Infof("Creating dnsmasq manifest with values: cluster name: %q, domain - %q, host ip - %q",
-		cluster.Cluster.Name, cluster.Cluster.BaseDNSDomain, hostIp)
+	log.Infof("Creating dnsmasq manifest with values: cluster name: %q, domain - %q, host ip - %q, rhods dashboard enabled - %t",
+		cluster.Cluster.Name, cluster.Cluster.BaseDNSDomain, hostIp, rhodsEnabled)
 
 	content, err := fillTemplate(manifestParams, snoDnsmasqConf, log)
 	if err != nil {
@@ -469,6 +486,27 @@ func fillTemplate(manifestParams map[string]interface{}, templateData string, lo
 		return nil, err
 	}
 	return buf.Bytes(), nil
+}
+
+func (m *ManifestsGenerator) GetDiskEncryptionCipher(log logrus.FieldLogger) string {
+	if m.Config.DiskEncryptionCipher != "" {
+		log.Infof("Using explicitly configured disk encryption cipher: %s", m.Config.DiskEncryptionCipher)
+		return m.Config.DiskEncryptionCipher
+	}
+
+	fipsEnabled, err := m.systemInfo.FIPSEnabled()
+	if err != nil {
+		log.WithError(err).Warn("Failed to check FIPS status, using aes-cbc-essiv:sha256 cipher")
+		return cipherAesCbcEssivSha256
+	}
+
+	if fipsEnabled {
+		log.Info("FIPS is enabled, using aes-xts-plain64 cipher")
+		return cipherAesXtsPlain64
+	}
+
+	log.Info("FIPS is not enabled, using aes-cbc-essiv:sha256 cipher")
+	return cipherAesCbcEssivSha256
 }
 
 const (
@@ -573,27 +611,16 @@ spec:
 `
 
 func (m *ManifestsGenerator) AddNicReapply(ctx context.Context, log logrus.FieldLogger, c *common.Cluster) error {
-	// Add this manifest only if one of the host is installing on an iSCSI / multiapth + iSCSI boot drive
-	_, isUsingISCSIBootDrive := lo.Find(c.Cluster.Hosts, func(h *models.Host) bool {
-		inventory, err := common.UnmarshalInventory(h.Inventory)
-		if err != nil {
-			return false
-		}
-		installationDisk := hostutil.GetDiskByInstallationPath(inventory.Disks, hostutil.GetHostInstallationPath(h))
-		if installationDisk.DriveType == models.DriveTypeMultipath {
-			iSCSIDisks := hostutil.GetDisksOfHolderByType(inventory.Disks, installationDisk, models.DriveTypeISCSI)
-			return len(iSCSIDisks) > 0
-		}
-		return installationDisk.DriveType == models.DriveTypeISCSI
-	})
-
-	if !isUsingISCSIBootDrive {
-		return nil
-	}
+	// Always add this manifest to support hosts with iSCSI boot drives, including day2 hosts.
+	// The manifest performs runtime detection and is a no-op on nodes without iSCSI.
+	log.Info("Adding NIC reapply manifest for iSCSI boot drive support")
 
 	manifestParamsList := []map[string]interface{}{
 		{"ROLE": "master"},
 		{"ROLE": "worker"},
+	}
+	if common.IsClusterTopologyHighlyAvailableArbiter(c) {
+		manifestParamsList = append(manifestParamsList, map[string]interface{}{"ROLE": "arbiter"})
 	}
 	for _, manifestParams := range manifestParamsList {
 		content, err := fillTemplate(manifestParams, nicReapplyManifest, log)

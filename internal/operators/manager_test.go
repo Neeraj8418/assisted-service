@@ -16,24 +16,41 @@ import (
 	. "github.com/onsi/ginkgo/extensions/table"
 	. "github.com/onsi/gomega"
 	"github.com/openshift/assisted-service/internal/common"
+	"github.com/openshift/assisted-service/internal/featuresupport"
 	manifestsapi "github.com/openshift/assisted-service/internal/manifests/api"
 	"github.com/openshift/assisted-service/internal/operators"
 	"github.com/openshift/assisted-service/internal/operators/api"
+	"github.com/openshift/assisted-service/internal/operators/authorino"
+	"github.com/openshift/assisted-service/internal/operators/clusterobservability"
 	"github.com/openshift/assisted-service/internal/operators/cnv"
 	operatorscommon "github.com/openshift/assisted-service/internal/operators/common"
+	"github.com/openshift/assisted-service/internal/operators/fenceagentsremediation"
+	"github.com/openshift/assisted-service/internal/operators/kubedescheduler"
+	"github.com/openshift/assisted-service/internal/operators/loki"
 	"github.com/openshift/assisted-service/internal/operators/lso"
 	"github.com/openshift/assisted-service/internal/operators/lvm"
 	"github.com/openshift/assisted-service/internal/operators/mce"
+	"github.com/openshift/assisted-service/internal/operators/metallb"
 	"github.com/openshift/assisted-service/internal/operators/mtv"
 	"github.com/openshift/assisted-service/internal/operators/nmstate"
+	"github.com/openshift/assisted-service/internal/operators/nodefeaturediscovery"
+	"github.com/openshift/assisted-service/internal/operators/nodehealthcheck"
+	"github.com/openshift/assisted-service/internal/operators/nodemaintenance"
+	"github.com/openshift/assisted-service/internal/operators/numaresources"
+	"github.com/openshift/assisted-service/internal/operators/oadp"
 	"github.com/openshift/assisted-service/internal/operators/odf"
 	"github.com/openshift/assisted-service/internal/operators/openshiftai"
+	"github.com/openshift/assisted-service/internal/operators/openshiftlogging"
+	"github.com/openshift/assisted-service/internal/operators/pipelines"
+	"github.com/openshift/assisted-service/internal/operators/selfnoderemediation"
 	"github.com/openshift/assisted-service/internal/operators/serverless"
+	"github.com/openshift/assisted-service/internal/operators/servicemesh"
 	"github.com/openshift/assisted-service/models"
 	"github.com/openshift/assisted-service/pkg/conversions"
 	"github.com/openshift/assisted-service/pkg/s3wrapper"
 	operations "github.com/openshift/assisted-service/restapi/operations/manifests"
 	"github.com/sirupsen/logrus"
+	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/yaml"
 )
 
@@ -101,6 +118,14 @@ var (
 	mockS3Api    *s3wrapper.MockAPI
 )
 
+var (
+	lsoDependency = lso.Operator
+)
+
+func init() {
+	lsoDependency.DependencyOnly = true
+}
+
 var _ = BeforeEach(func() {
 	// create simple cluster
 	clusterID := strfmt.UUID(uuid.New().String())
@@ -153,7 +178,7 @@ var _ = Describe("Operators manager", func() {
 			m := models.Manifest{}
 
 			mockS3Api.EXPECT().Upload(gomock.Any(), MatchControllerManifest(odf.Operator.Name, "(?s).*AgentServiceConfig.*storageClassName: ocs-storagecluster-cephfs.*"), gomock.Any()).Return(nil).Times(1)
-			manifestsAPI.EXPECT().CreateClusterManifestInternal(gomock.Any(), gomock.Any(), false).Return(&m, nil).Times(6)
+			manifestsAPI.EXPECT().CreateClusterManifestInternal(gomock.Any(), gomock.Any(), false).Return(&m, nil).Times(7)
 			Expect(manager.GenerateManifests(ctx, cluster)).ShouldNot(HaveOccurred())
 		})
 
@@ -166,7 +191,7 @@ var _ = Describe("Operators manager", func() {
 			m := models.Manifest{}
 
 			mockS3Api.EXPECT().Upload(gomock.Any(), MatchControllerManifest(lvm.Operator.Name, "(?s).*AgentServiceConfig.*storageClassName: lvms-vg1.*"), gomock.Any()).Return(nil).Times(1)
-			manifestsAPI.EXPECT().CreateClusterManifestInternal(gomock.Any(), gomock.Any(), false).Return(&m, nil).Times(6)
+			manifestsAPI.EXPECT().CreateClusterManifestInternal(gomock.Any(), gomock.Any(), false).Return(&m, nil).Times(7)
 			Expect(manager.GenerateManifests(ctx, cluster)).ShouldNot(HaveOccurred())
 		})
 
@@ -179,7 +204,7 @@ var _ = Describe("Operators manager", func() {
 			m := models.Manifest{}
 
 			mockS3Api.EXPECT().Upload(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
-			manifestsAPI.EXPECT().CreateClusterManifestInternal(gomock.Any(), gomock.Any(), false).Return(&m, nil).Times(6)
+			manifestsAPI.EXPECT().CreateClusterManifestInternal(gomock.Any(), gomock.Any(), false).Return(&m, nil).Times(9)
 			Expect(manager.GenerateManifests(ctx, cluster)).ShouldNot(HaveOccurred())
 		})
 
@@ -193,29 +218,96 @@ var _ = Describe("Operators manager", func() {
 			m := models.Manifest{}
 
 			mockS3Api.EXPECT().Upload(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
-			manifestsAPI.EXPECT().CreateClusterManifestInternal(gomock.Any(), gomock.Any(), false).Return(&m, nil).Times(6)
+			manifestsAPI.EXPECT().CreateClusterManifestInternal(gomock.Any(), gomock.Any(), false).Return(&m, nil).Times(9)
 			Expect(manager.GenerateManifests(ctx, cluster)).ShouldNot(HaveOccurred())
 		})
 
-		It("should create 4 manifests (LSO) using the manifest API", func() {
+		It("should create 5 manifests (LSO) using the manifest API", func() {
 			cluster.MonitoredOperators = []*models.MonitoredOperator{
 				&lso.Operator,
 			}
 			m := models.Manifest{}
 			mockS3Api.EXPECT().Upload(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
-			manifestsAPI.EXPECT().CreateClusterManifestInternal(gomock.Any(), gomock.Any(), false).Return(&m, nil).Times(3)
+			manifestsAPI.EXPECT().CreateClusterManifestInternal(gomock.Any(), gomock.Any(), false).Return(&m, nil).Times(6)
 			Expect(manager.GenerateManifests(ctx, cluster)).ShouldNot(HaveOccurred())
 		})
 
-		It("should create 8 manifests (CNV + LSO) using the manifest API", func() {
+		It("should create 11 manifests (CNV + LSO) using the manifest API", func() {
 			cluster.MonitoredOperators = []*models.MonitoredOperator{
 				&cnv.Operator,
 				&lso.Operator,
 			}
 			m := models.Manifest{}
 			mockS3Api.EXPECT().Upload(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
-			manifestsAPI.EXPECT().CreateClusterManifestInternal(gomock.Any(), gomock.Any(), false).Return(&m, nil).Times(6)
+			manifestsAPI.EXPECT().CreateClusterManifestInternal(gomock.Any(), gomock.Any(), false).Return(&m, nil).Times(11)
 			Expect(manager.GenerateManifests(ctx, cluster)).ShouldNot(HaveOccurred())
+		})
+
+		It("should create a configmap with the manifests", func() {
+			cluster.MonitoredOperators = []*models.MonitoredOperator{
+				&cnv.Operator,
+				&lso.Operator,
+			}
+			m := models.Manifest{}
+			mockS3Api.EXPECT().Upload(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).Times(1)
+
+			manifestsAPI.EXPECT().CreateClusterManifestInternal(gomock.Any(), gomock.Any(), false).Return(&m, nil).Times(10)
+
+			var capturedBase64Body string
+			manifestsAPI.EXPECT().CreateClusterManifestInternal(gomock.Any(), gomock.Any(), false).Do(
+				func(_ context.Context, params operations.V2CreateClusterManifestParams, _ bool) {
+					capturedBase64Body = *params.CreateManifestParams.Content
+				},
+			).Return(&models.Manifest{
+				FileName: "olm_operator_manifests.yaml",
+				Folder:   models.ManifestFolderOpenshift,
+			}, nil).Times(1)
+			Expect(manager.GenerateManifests(ctx, cluster)).ShouldNot(HaveOccurred())
+
+			Expect(capturedBase64Body).ShouldNot(BeEmpty(), "Expected Base64 manifest body to be captured.")
+
+			rawYAML, err := base64.StdEncoding.DecodeString(capturedBase64Body)
+			Expect(err).ShouldNot(HaveOccurred(), "Expected Base64 content to be successfully decoded.")
+
+			var cm corev1.ConfigMap
+			Expect(yaml.Unmarshal(rawYAML, &cm)).ShouldNot(HaveOccurred(), "Expected decoded content to be valid YAML for ConfigMap.")
+
+			Expect(cm.Kind).Should(Equal("ConfigMap"), "Expected Kind to be ConfigMap")
+			Expect(cm.ObjectMeta.Name).Should(Equal("olm-operator-manifests"), "Expected metadata.name to be olm-operator-manifests")
+
+			Expect(cm.Data).ShouldNot(BeEmpty(), "Expected data field not to be empty")
+
+			Expect(cm.Data).Should(HaveKey("cnv-01.yaml"), "Expected 'cnv-01.yaml' entry for CNV")
+			Expect(cm.Data).Should(HaveKey("cnv.metadata.yaml"), "Expected 'cnv.metadata.yaml' entry for CNV")
+			manifestContent, exists := cm.Data["cnv-01.yaml"]
+			Expect(exists).Should(BeTrue(), "Expected cnv-01.yaml in ConfigMap data")
+			Expect(manifestContent).ShouldNot(BeEmpty())
+			_, err = base64.StdEncoding.DecodeString(manifestContent)
+			Expect(err).ShouldNot(HaveOccurred(), "Expected manifest value to be valid base64")
+
+			Expect(cm.Data).Should(HaveKey("lso-01.yaml"), "Expected 'lso-01.yaml' entry for LSO")
+			Expect(cm.Data).Should(HaveKey("lso.metadata.yaml"), "Expected 'lso.metadata.yaml' entry for LSO")
+
+			// Validate metadata content has correct field names (lowercase/camelCase, not capitalized)
+			metadataContent, exists := cm.Data["cnv.metadata.yaml"]
+			Expect(exists).Should(BeTrue(), "Expected cnv.metadata.yaml in ConfigMap data")
+			Expect(metadataContent).ShouldNot(BeEmpty())
+
+			// Unmarshal into a map to check field names
+			var metadata map[string]interface{}
+			err = yaml.Unmarshal([]byte(metadataContent), &metadata)
+			Expect(err).ShouldNot(HaveOccurred(), "Expected metadata to be valid YAML")
+
+			// Verify fields are lowercase/camelCase (not capitalized)
+			Expect(metadata).Should(HaveKey("namespace"), "Expected 'namespace' field (lowercase)")
+			Expect(metadata).Should(HaveKey("subscriptionName"), "Expected 'subscriptionName' field (camelCase)")
+			Expect(metadata).Should(HaveKey("manifests"), "Expected 'manifests' field (lowercase)")
+
+			// Validate the actual values
+			Expect(metadata["namespace"]).Should(Equal("kubevirt-hyperconverged"), "Expected correct namespace value")
+			Expect(metadata["subscriptionName"]).Should(Equal("hco-operatorhub"), "Expected correct subscriptionName value")
+			Expect(metadata["manifests"]).Should(ContainElement("cnv-01.yaml"), "Expected manifests to contain cnv-01.yaml")
+
 		})
 	})
 
@@ -256,7 +348,7 @@ var _ = Describe("Operators manager", func() {
 		})
 		It("no error when both cnv and lvm operator enabled after 4.12", func() {
 			testVersion := "4.12.0"
-			cluster.HighAvailabilityMode = swag.String(models.ClusterHighAvailabilityModeNone)
+			cluster.ControlPlaneCount = 1
 			monitoredOperators := []*models.MonitoredOperator{
 				{Name: "lvm"},
 				{Name: "lso"},
@@ -320,7 +412,7 @@ var _ = Describe("Operators manager", func() {
 		})
 		It("cnv operator enabled with lvm after 4.15 multinode", func() {
 			testVersion := "4.15.0"
-			cluster.HighAvailabilityMode = swag.String(models.ClusterHighAvailabilityModeFull)
+			cluster.ControlPlaneCount = common.MinMasterHostsNeededForInstallationInHaMode
 			monitoredOperators := []*models.MonitoredOperator{
 				{Name: "cnv"},
 				{Name: "lso"},
@@ -332,7 +424,7 @@ var _ = Describe("Operators manager", func() {
 		})
 		It("fail cnv operator enabled with lvm before 4.15 multinode", func() {
 			testVersion := "4.14.0"
-			cluster.HighAvailabilityMode = swag.String(models.ClusterHighAvailabilityModeFull)
+			cluster.ControlPlaneCount = common.MinMasterHostsNeededForInstallationInHaMode
 			monitoredOperators := []*models.MonitoredOperator{
 				{Name: "cnv"},
 				{Name: "lso"},
@@ -452,7 +544,7 @@ var _ = Describe("Operators manager", func() {
 			results, err := manager.ValidateCluster(context.TODO(), cluster)
 
 			Expect(err).ToNot(HaveOccurred())
-			Expect(results).To(HaveLen(17))
+			Expect(results).To(HaveLen(28))
 			Expect(results).To(ContainElements(
 				api.ValidationResult{Status: api.Success, ValidationId: string(models.ClusterValidationIDLsoRequirementsSatisfied), Reasons: []string{"lso is disabled"}},
 				api.ValidationResult{Status: api.Success, ValidationId: string(models.ClusterValidationIDOdfRequirementsSatisfied), Reasons: []string{"odf is disabled"}},
@@ -471,6 +563,17 @@ var _ = Describe("Operators manager", func() {
 				api.ValidationResult{Status: api.Success, ValidationId: string(models.ClusterValidationIDNmstateRequirementsSatisfied), Reasons: []string{"nmstate is disabled"}},
 				api.ValidationResult{Status: api.Success, ValidationId: string(models.ClusterValidationIDAmdGpuRequirementsSatisfied), Reasons: []string{"amd-gpu is disabled"}},
 				api.ValidationResult{Status: api.Success, ValidationId: string(models.ClusterValidationIDKmmRequirementsSatisfied), Reasons: []string{"kmm is disabled"}},
+				api.ValidationResult{Status: api.Success, ValidationId: string(models.HostValidationIDNodeHealthcheckRequirementsSatisfied), Reasons: []string{fmt.Sprintf("%s is disabled", nodehealthcheck.Operator.Name)}},
+				api.ValidationResult{Status: api.Success, ValidationId: string(models.HostValidationIDSelfNodeRemediationRequirementsSatisfied), Reasons: []string{fmt.Sprintf("%s is disabled", selfnoderemediation.Operator.Name)}},
+				api.ValidationResult{Status: api.Success, ValidationId: string(models.ClusterValidationIDFenceAgentsRemediationRequirementsSatisfied), Reasons: []string{fmt.Sprintf("%s is disabled", fenceagentsremediation.Operator.Name)}},
+				api.ValidationResult{Status: api.Success, ValidationId: string(models.ClusterValidationIDNodeMaintenanceRequirementsSatisfied), Reasons: []string{fmt.Sprintf("%s is disabled", nodemaintenance.Operator.Name)}},
+				api.ValidationResult{Status: api.Success, ValidationId: string(models.ClusterValidationIDKubeDeschedulerRequirementsSatisfied), Reasons: []string{fmt.Sprintf("%s is disabled", kubedescheduler.Operator.Name)}},
+				api.ValidationResult{Status: api.Success, ValidationId: string(models.ClusterValidationIDClusterObservabilityRequirementsSatisfied), Reasons: []string{fmt.Sprintf("%s is disabled", clusterobservability.Operator.Name)}},
+				api.ValidationResult{Status: api.Success, ValidationId: string(models.ClusterValidationIDNumaResourcesRequirementsSatisfied), Reasons: []string{fmt.Sprintf("%s is disabled", numaresources.Operator.Name)}},
+				api.ValidationResult{Status: api.Success, ValidationId: string(models.ClusterValidationIDOadpRequirementsSatisfied), Reasons: []string{fmt.Sprintf("%s is disabled", oadp.Operator.Name)}},
+				api.ValidationResult{Status: api.Success, ValidationId: string(models.ClusterValidationIDMetallbRequirementsSatisfied), Reasons: []string{fmt.Sprintf("%s is disabled", metallb.Operator.Name)}},
+				api.ValidationResult{Status: api.Success, ValidationId: string(models.ClusterValidationIDLokiRequirementsSatisfied), Reasons: []string{fmt.Sprintf("%s is disabled", loki.Operator.Name)}},
+				api.ValidationResult{Status: api.Success, ValidationId: string(models.ClusterValidationIDOpenshiftLoggingRequirementsSatisfied), Reasons: []string{fmt.Sprintf("%s is disabled", openshiftlogging.Operator.Name)}},
 			))
 		})
 
@@ -483,9 +586,9 @@ var _ = Describe("Operators manager", func() {
 			results, err := manager.ValidateCluster(context.TODO(), cluster)
 
 			Expect(err).ToNot(HaveOccurred())
-			Expect(results).To(HaveLen(17))
+			Expect(results).To(HaveLen(28))
 			Expect(results).To(ContainElements(
-				api.ValidationResult{Status: api.Success, ValidationId: string(models.ClusterValidationIDLsoRequirementsSatisfied), Reasons: []string{}},
+				api.ValidationResult{Status: api.Success, ValidationId: string(models.ClusterValidationIDLsoRequirementsSatisfied)},
 				api.ValidationResult{Status: api.Failure, ValidationId: string(models.ClusterValidationIDOdfRequirementsSatisfied),
 					Reasons: []string{"The cluster must either have no dedicated worker nodes or at least three. Add or remove hosts, or change their roles configurations to meet the requirement."}},
 				api.ValidationResult{Status: api.Success, ValidationId: string(models.ClusterValidationIDCnvRequirementsSatisfied), Reasons: []string{"cnv is disabled"}},
@@ -503,6 +606,17 @@ var _ = Describe("Operators manager", func() {
 				api.ValidationResult{Status: api.Success, ValidationId: string(models.ClusterValidationIDNmstateRequirementsSatisfied), Reasons: []string{"nmstate is disabled"}},
 				api.ValidationResult{Status: api.Success, ValidationId: string(models.ClusterValidationIDAmdGpuRequirementsSatisfied), Reasons: []string{"amd-gpu is disabled"}},
 				api.ValidationResult{Status: api.Success, ValidationId: string(models.ClusterValidationIDKmmRequirementsSatisfied), Reasons: []string{"kmm is disabled"}},
+				api.ValidationResult{Status: api.Success, ValidationId: string(models.HostValidationIDNodeHealthcheckRequirementsSatisfied), Reasons: []string{fmt.Sprintf("%s is disabled", nodehealthcheck.Operator.Name)}},
+				api.ValidationResult{Status: api.Success, ValidationId: string(models.HostValidationIDSelfNodeRemediationRequirementsSatisfied), Reasons: []string{fmt.Sprintf("%s is disabled", selfnoderemediation.Operator.Name)}},
+				api.ValidationResult{Status: api.Success, ValidationId: string(models.ClusterValidationIDFenceAgentsRemediationRequirementsSatisfied), Reasons: []string{fmt.Sprintf("%s is disabled", fenceagentsremediation.Operator.Name)}},
+				api.ValidationResult{Status: api.Success, ValidationId: string(models.ClusterValidationIDNodeMaintenanceRequirementsSatisfied), Reasons: []string{fmt.Sprintf("%s is disabled", nodemaintenance.Operator.Name)}},
+				api.ValidationResult{Status: api.Success, ValidationId: string(models.ClusterValidationIDKubeDeschedulerRequirementsSatisfied), Reasons: []string{fmt.Sprintf("%s is disabled", kubedescheduler.Operator.Name)}},
+				api.ValidationResult{Status: api.Success, ValidationId: string(models.ClusterValidationIDClusterObservabilityRequirementsSatisfied), Reasons: []string{fmt.Sprintf("%s is disabled", clusterobservability.Operator.Name)}},
+				api.ValidationResult{Status: api.Success, ValidationId: string(models.ClusterValidationIDNumaResourcesRequirementsSatisfied), Reasons: []string{fmt.Sprintf("%s is disabled", numaresources.Operator.Name)}},
+				api.ValidationResult{Status: api.Success, ValidationId: string(models.ClusterValidationIDOadpRequirementsSatisfied), Reasons: []string{fmt.Sprintf("%s is disabled", oadp.Operator.Name)}},
+				api.ValidationResult{Status: api.Success, ValidationId: string(models.ClusterValidationIDMetallbRequirementsSatisfied), Reasons: []string{fmt.Sprintf("%s is disabled", metallb.Operator.Name)}},
+				api.ValidationResult{Status: api.Success, ValidationId: string(models.ClusterValidationIDLokiRequirementsSatisfied), Reasons: []string{fmt.Sprintf("%s is disabled", loki.Operator.Name)}},
+				api.ValidationResult{Status: api.Success, ValidationId: string(models.ClusterValidationIDOpenshiftLoggingRequirementsSatisfied), Reasons: []string{fmt.Sprintf("%s is disabled", openshiftlogging.Operator.Name)}},
 			))
 		})
 	})
@@ -514,7 +628,8 @@ var _ = Describe("Operators manager", func() {
 			results, err := manager.ValidateHost(context.TODO(), cluster, clusterHost)
 
 			Expect(err).ToNot(HaveOccurred())
-			Expect(results).To(HaveLen(17))
+			Expect(results).To(HaveLen(28))
+
 			Expect(results).To(ContainElements(
 				api.ValidationResult{Status: api.Success, ValidationId: string(models.HostValidationIDLsoRequirementsSatisfied), Reasons: []string{"lso is disabled"}},
 				api.ValidationResult{Status: api.Success, ValidationId: string(models.HostValidationIDOdfRequirementsSatisfied), Reasons: []string{"odf is disabled"}},
@@ -533,6 +648,17 @@ var _ = Describe("Operators manager", func() {
 				api.ValidationResult{Status: api.Success, ValidationId: string(models.HostValidationIDNmstateRequirementsSatisfied), Reasons: []string{"nmstate is disabled"}},
 				api.ValidationResult{Status: api.Success, ValidationId: string(models.HostValidationIDAmdGpuRequirementsSatisfied), Reasons: []string{"amd-gpu is disabled"}},
 				api.ValidationResult{Status: api.Success, ValidationId: string(models.ClusterValidationIDKmmRequirementsSatisfied), Reasons: []string{"kmm is disabled"}},
+				api.ValidationResult{Status: api.Success, ValidationId: string(models.HostValidationIDNodeHealthcheckRequirementsSatisfied), Reasons: []string{fmt.Sprintf("%s is disabled", nodehealthcheck.Operator.Name)}},
+				api.ValidationResult{Status: api.Success, ValidationId: string(models.HostValidationIDSelfNodeRemediationRequirementsSatisfied), Reasons: []string{fmt.Sprintf("%s is disabled", selfnoderemediation.Operator.Name)}},
+				api.ValidationResult{Status: api.Success, ValidationId: string(models.ClusterValidationIDFenceAgentsRemediationRequirementsSatisfied), Reasons: []string{fmt.Sprintf("%s is disabled", fenceagentsremediation.Operator.Name)}},
+				api.ValidationResult{Status: api.Success, ValidationId: string(models.ClusterValidationIDNodeMaintenanceRequirementsSatisfied), Reasons: []string{fmt.Sprintf("%s is disabled", nodemaintenance.Operator.Name)}},
+				api.ValidationResult{Status: api.Success, ValidationId: string(models.ClusterValidationIDKubeDeschedulerRequirementsSatisfied), Reasons: []string{fmt.Sprintf("%s is disabled", kubedescheduler.Operator.Name)}},
+				api.ValidationResult{Status: api.Success, ValidationId: string(models.ClusterValidationIDClusterObservabilityRequirementsSatisfied), Reasons: []string{fmt.Sprintf("%s is disabled", clusterobservability.Operator.Name)}},
+				api.ValidationResult{Status: api.Success, ValidationId: string(models.ClusterValidationIDNumaResourcesRequirementsSatisfied), Reasons: []string{fmt.Sprintf("%s is disabled", numaresources.Operator.Name)}},
+				api.ValidationResult{Status: api.Success, ValidationId: string(models.ClusterValidationIDOadpRequirementsSatisfied), Reasons: []string{fmt.Sprintf("%s is disabled", oadp.Operator.Name)}},
+				api.ValidationResult{Status: api.Success, ValidationId: string(models.ClusterValidationIDMetallbRequirementsSatisfied), Reasons: []string{fmt.Sprintf("%s is disabled", metallb.Operator.Name)}},
+				api.ValidationResult{Status: api.Success, ValidationId: string(models.HostValidationIDLokiRequirementsSatisfied), Reasons: []string{fmt.Sprintf("%s is disabled", loki.Operator.Name)}},
+				api.ValidationResult{Status: api.Success, ValidationId: string(models.HostValidationIDOpenshiftLoggingRequirementsSatisfied), Reasons: []string{fmt.Sprintf("%s is disabled", openshiftlogging.Operator.Name)}},
 			))
 		})
 
@@ -544,7 +670,7 @@ var _ = Describe("Operators manager", func() {
 
 			results, err := manager.ValidateHost(context.TODO(), cluster, clusterHost)
 			Expect(err).ToNot(HaveOccurred())
-			Expect(results).To(HaveLen(17))
+			Expect(results).To(HaveLen(28))
 
 			Expect(results).To(ContainElements(
 				api.ValidationResult{Status: api.Success, ValidationId: string(models.HostValidationIDLsoRequirementsSatisfied), Reasons: []string{}},
@@ -564,6 +690,17 @@ var _ = Describe("Operators manager", func() {
 				api.ValidationResult{Status: api.Success, ValidationId: string(models.HostValidationIDNmstateRequirementsSatisfied), Reasons: []string{"nmstate is disabled"}},
 				api.ValidationResult{Status: api.Success, ValidationId: string(models.HostValidationIDAmdGpuRequirementsSatisfied), Reasons: []string{"amd-gpu is disabled"}},
 				api.ValidationResult{Status: api.Success, ValidationId: string(models.ClusterValidationIDKmmRequirementsSatisfied), Reasons: []string{"kmm is disabled"}},
+				api.ValidationResult{Status: api.Success, ValidationId: string(models.HostValidationIDNodeHealthcheckRequirementsSatisfied), Reasons: []string{fmt.Sprintf("%s is disabled", nodehealthcheck.Operator.Name)}},
+				api.ValidationResult{Status: api.Success, ValidationId: string(models.HostValidationIDSelfNodeRemediationRequirementsSatisfied), Reasons: []string{fmt.Sprintf("%s is disabled", selfnoderemediation.Operator.Name)}},
+				api.ValidationResult{Status: api.Success, ValidationId: string(models.ClusterValidationIDFenceAgentsRemediationRequirementsSatisfied), Reasons: []string{fmt.Sprintf("%s is disabled", fenceagentsremediation.Operator.Name)}},
+				api.ValidationResult{Status: api.Success, ValidationId: string(models.ClusterValidationIDNodeMaintenanceRequirementsSatisfied), Reasons: []string{fmt.Sprintf("%s is disabled", nodemaintenance.Operator.Name)}},
+				api.ValidationResult{Status: api.Success, ValidationId: string(models.ClusterValidationIDKubeDeschedulerRequirementsSatisfied), Reasons: []string{fmt.Sprintf("%s is disabled", kubedescheduler.Operator.Name)}},
+				api.ValidationResult{Status: api.Success, ValidationId: string(models.ClusterValidationIDClusterObservabilityRequirementsSatisfied), Reasons: []string{fmt.Sprintf("%s is disabled", clusterobservability.Operator.Name)}},
+				api.ValidationResult{Status: api.Success, ValidationId: string(models.ClusterValidationIDNumaResourcesRequirementsSatisfied), Reasons: []string{fmt.Sprintf("%s is disabled", numaresources.Operator.Name)}},
+				api.ValidationResult{Status: api.Success, ValidationId: string(models.ClusterValidationIDOadpRequirementsSatisfied), Reasons: []string{fmt.Sprintf("%s is disabled", oadp.Operator.Name)}},
+				api.ValidationResult{Status: api.Success, ValidationId: string(models.ClusterValidationIDMetallbRequirementsSatisfied), Reasons: []string{fmt.Sprintf("%s is disabled", metallb.Operator.Name)}},
+				api.ValidationResult{Status: api.Success, ValidationId: string(models.HostValidationIDLokiRequirementsSatisfied), Reasons: []string{fmt.Sprintf("%s is disabled", loki.Operator.Name)}},
+				api.ValidationResult{Status: api.Success, ValidationId: string(models.HostValidationIDOpenshiftLoggingRequirementsSatisfied), Reasons: []string{fmt.Sprintf("%s is disabled", openshiftlogging.Operator.Name)}},
 			))
 		})
 
@@ -665,8 +802,7 @@ var _ = Describe("Operators manager", func() {
 		resolvedDependencies, err := manager.ResolveDependencies(cluster, cluster.MonitoredOperators)
 		Expect(err).ToNot(HaveOccurred())
 
-		Expect(resolvedDependencies).To(HaveLen(len(expected)))
-		Expect(resolvedDependencies).To(ContainElements(expected))
+		Expect(resolvedDependencies).To(ConsistOf(expected))
 	},
 		Entry("when only LSO is specified",
 			[]*models.MonitoredOperator{&lso.Operator},
@@ -674,7 +810,7 @@ var _ = Describe("Operators manager", func() {
 		),
 		Entry("when only ODF is specified",
 			[]*models.MonitoredOperator{&odf.Operator},
-			[]*models.MonitoredOperator{&odf.Operator, &lso.Operator},
+			[]*models.MonitoredOperator{&odf.Operator, &lsoDependency},
 		),
 		Entry("when both ODF and LSO are specified",
 			[]*models.MonitoredOperator{&odf.Operator, &lso.Operator},
@@ -682,7 +818,7 @@ var _ = Describe("Operators manager", func() {
 		),
 		Entry("when only CNV is specified",
 			[]*models.MonitoredOperator{&cnv.Operator},
-			[]*models.MonitoredOperator{&cnv.Operator, &lso.Operator},
+			[]*models.MonitoredOperator{&cnv.Operator, &lsoDependency},
 		),
 		Entry("when CNV, ODF and LSO are specified",
 			[]*models.MonitoredOperator{&cnv.Operator, &odf.Operator, &lso.Operator},
@@ -712,6 +848,17 @@ var _ = Describe("Operators manager", func() {
 				"nmstate",
 				"amd-gpu",
 				"kmm",
+				"metallb",
+				nodehealthcheck.Operator.Name,
+				selfnoderemediation.Operator.Name,
+				fenceagentsremediation.Operator.Name,
+				nodemaintenance.Operator.Name,
+				kubedescheduler.Operator.Name,
+				clusterobservability.Operator.Name,
+				numaresources.Operator.Name,
+				oadp.Operator.Name,
+				loki.Operator.Name,
+				openshiftlogging.Operator.Name,
 			))
 		})
 
@@ -820,8 +967,9 @@ var _ = Describe("Operators manager", func() {
 	Context("Bundles", func() {
 		// we use the real operators here, as we want to test the manager's ability to group them into bundles
 		var (
-			manager                                                                                              *operators.Manager
-			cnvOperator, odfOperator, oaiOperator, serverlessOperator, lsoOperator, nmstateOperator, mtvOperator api.Operator
+			manager                                                                                 *operators.Manager
+			cnvOperator, odfOperator, oaiOperator, serverlessOperator, lsoOperator, nmstateOperator api.Operator
+			mtvOperator, serviceMeshOperator, pipelinesOperator, authorinoOperator, nfdOperator     api.Operator
 		)
 		BeforeEach(func() {
 			cfg := cnv.Config{}
@@ -835,24 +983,36 @@ var _ = Describe("Operators manager", func() {
 			lsoOperator = lso.NewLSOperator()
 			mtvOperator = mtv.NewMTVOperator(log)
 
-			manager = operators.NewManagerWithOperators(log, manifestsAPI, operators.Options{}, nil, cnvOperator, odfOperator, oaiOperator, serverlessOperator, lsoOperator, nmstateOperator, mtvOperator)
+			serviceMeshOperator = servicemesh.NewServiceMeshOperator(log)
+			pipelinesOperator = pipelines.NewPipelinesOperator(log)
+			authorinoOperator = authorino.NewAuthorinoOperator(log)
+			nfdOperator = nodefeaturediscovery.NewNodeFeatureDiscoveryOperator(log)
+
+			manager = operators.NewManagerWithOperators(log, manifestsAPI, operators.Options{}, nil,
+				cnvOperator, odfOperator, oaiOperator, serverlessOperator, lsoOperator, nmstateOperator,
+				mtvOperator, serviceMeshOperator, pipelinesOperator, authorinoOperator, nfdOperator,
+			)
 		})
 
 		It("ListBundles should return the list of available bundles", func() {
-			bundles := manager.ListBundles()
+			filter := &featuresupport.SupportLevelFilters{
+				OpenshiftVersion: "4.14.0",
+				CPUArchitecture:  swag.String(models.ClusterCPUArchitectureX8664),
+			}
+
+			bundles := manager.ListBundles(filter, nil)
 			bundleIDs := make([]string, len(bundles))
 			for i, bundle := range bundles {
 				bundleIDs[i] = bundle.ID
 			}
 			Expect(bundleIDs).To(ConsistOf(
 				operatorscommon.BundleVirtualization.ID,
-				operatorscommon.BundleOpenShiftAINVIDIA.ID,
-				operatorscommon.BundleOpenShiftAIAMD.ID,
+				operatorscommon.BundleOpenShiftAI.ID,
 			))
 		})
 
 		It("Virtualization bundle contains the MTV and CNV operators", func() {
-			bundle, err := manager.GetBundle(operatorscommon.BundleVirtualization.ID)
+			bundle, err := manager.GetBundle(operatorscommon.BundleVirtualization.ID, nil)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(bundle).ToNot(BeNil())
 			Expect(bundle.Operators).To(ContainElements(
@@ -861,63 +1021,60 @@ var _ = Describe("Operators manager", func() {
 			))
 		})
 
-		It("OpenShift AI NVIDIA bundle contains the OpenShift AI, Serverless and ODF operators", func() {
-			bundle, err := manager.GetBundle(operatorscommon.BundleOpenShiftAINVIDIA.ID)
+		It("OpenShift AI bundle contains the OpenShift AI, Serverless, ODF, ServiceMesh, pipelines, authorino and NFD operators", func() {
+			bundle, err := manager.GetBundle(operatorscommon.BundleOpenShiftAI.ID, nil)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(bundle).ToNot(BeNil())
-			Expect(bundle.Operators).To(ContainElements(
+			Expect(bundle.Operators).To(ConsistOf(
 				oaiOperator.GetName(),
 				serverlessOperator.GetName(),
 				odfOperator.GetName(),
+				serviceMeshOperator.GetName(),
+				pipelinesOperator.GetName(),
+				authorinoOperator.GetName(),
+				nfdOperator.GetName(),
 			))
 		})
 
 		It("LSO isn't part of any bundle", func() {
-			bundles := manager.ListBundles()
+			filter := &featuresupport.SupportLevelFilters{
+				OpenshiftVersion: "4.14.0",
+				CPUArchitecture:  swag.String(models.ClusterCPUArchitectureX8664),
+			}
+
+			bundles := manager.ListBundles(filter, nil)
 			for _, bundle := range bundles {
 				Expect(bundle.Operators).NotTo(ContainElement(lso.Operator.Name))
 			}
 		})
 
 		It("Fails with incorrect bundle name", func() {
-			bundle, err := manager.GetBundle("invalid bundle")
+			bundle, err := manager.GetBundle("invalid bundle", nil)
 			Expect(err).To(HaveOccurred())
 			Expect(err).To(MatchError("bundle 'invalid bundle' is not supported"))
 			Expect(bundle).To(BeNil())
 		})
 
-		It("OpenShift AI NVIDIA bundle should have a description", func() {
-			bundle, err := manager.GetBundle(operatorscommon.BundleOpenShiftAINVIDIA.ID)
+		It("OpenShift AI bundle should have a description", func() {
+			bundle, err := manager.GetBundle(operatorscommon.BundleOpenShiftAI.ID, nil)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(bundle.Description).ToNot(BeEmpty())
 		})
 
-		It("OpenShift AI NVIDIA bundle should have a title", func() {
-			bundle, err := manager.GetBundle(operatorscommon.BundleOpenShiftAINVIDIA.ID)
-			Expect(err).ToNot(HaveOccurred())
-			Expect(bundle.Title).ToNot(BeEmpty())
-		})
-
-		It("OpenShift AI AMD bundle should have a description", func() {
-			bundle, err := manager.GetBundle(operatorscommon.BundleOpenShiftAIAMD.ID)
-			Expect(err).ToNot(HaveOccurred())
-			Expect(bundle.Description).ToNot(BeEmpty())
-		})
-
-		It("OpenShift AI AMD bundle should have a title", func() {
-			bundle, err := manager.GetBundle(operatorscommon.BundleOpenShiftAIAMD.ID)
+		It("OpenShift AI bundle should have a title", func() {
+			bundle, err := manager.GetBundle(operatorscommon.BundleOpenShiftAI.ID, nil)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(bundle.Title).ToNot(BeEmpty())
 		})
 
 		It("Virtualization bundle should have a description", func() {
-			bundle, err := manager.GetBundle(operatorscommon.BundleVirtualization.ID)
+			bundle, err := manager.GetBundle(operatorscommon.BundleVirtualization.ID, nil)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(bundle.Description).ToNot(BeEmpty())
 		})
 
 		It("Virtualization bundle should have a title", func() {
-			bundle, err := manager.GetBundle(operatorscommon.BundleVirtualization.ID)
+			bundle, err := manager.GetBundle(operatorscommon.BundleVirtualization.ID, nil)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(bundle.Title).ToNot(BeEmpty())
 		})
